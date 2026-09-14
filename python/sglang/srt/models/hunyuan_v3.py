@@ -702,6 +702,19 @@ class HYV3Attention(nn.Module):
                 self.attn.layer_id
             )
             kv_cache_dtype = self.kv_cache_dtype or k_buffer.dtype
+            # q is consumed directly by attention and never stored in the KV
+            # cache, so it must use the dtype the attention backend expects.
+            # That backend only casts q to the cache dtype when
+            # is_nmz_fp8(kv_cache_dtype) holds (gfx938 only); elsewhere it
+            # expects the model dtype, and handing it fp8 would be
+            # reinterpreted as bf16 and corrupt every value.
+            from sglang.srt.layers.attention.flashattention_backend import (
+                is_nmz_fp8,
+            )
+
+            q_output_dtype = (
+                kv_cache_dtype if is_nmz_fp8(kv_cache_dtype) else q.dtype
+            )
             q, k, v = rms_rotary_embedding_fuse_with_kv_store(
                 positions,
                 q,
@@ -716,7 +729,7 @@ class HYV3Attention(nn.Module):
                 is_neox=True,
                 weight_q=self.q_norm.weight,
                 weight_k=self.k_norm.weight,
-                output_dtype=kv_cache_dtype,
+                output_dtype=q_output_dtype,
                 residual_q=None,
                 residual_k=None,
                 k_scale=None,
