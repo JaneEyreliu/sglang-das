@@ -33,8 +33,14 @@ class IndexTopKShareState:
 
     @property
     def _seed_buf(self) -> Optional[torch.Tensor]:
+        # forward_batch.spec_info is None whenever speculative decoding is off,
+        # and plain prefill still satisfies is_extend(). Guard it the same way
+        # forward_dsa_indexer_for_mha does.
+        spec_info = self._forward_batch.spec_info
+        if spec_info is None:
+            return None
         if self._forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-            return self._forward_batch.spec_info.dsa_seed_topk_capture
+            return spec_info.dsa_seed_topk_capture
         return None
 
     @property
