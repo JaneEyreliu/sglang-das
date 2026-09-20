@@ -27,6 +27,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.model_config import dsa_layer_skips_topk, get_dsa_index_topk
 from sglang.srt.distributed import get_attn_tp_group, get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
@@ -56,6 +57,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
@@ -67,7 +69,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     AttnForwardMethod,
@@ -82,7 +84,7 @@ from sglang.srt.models.deepseek_v2 import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda
+from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
 
@@ -573,8 +575,7 @@ class HYV4DecoderLayer(nn.Module):
 class HYV4Model(nn.Module):
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
-        if get_pp_group().world_size != 1:
-            raise ValueError("HYV4 pipeline parallelism is not supported")
+        self.pp_group = get_pp_group()
         if is_dp_attention_enabled():
             # iHC replaces the flat (T, H) residual with a (T, hc_mult, H)
             # stream, which LayerCommunicator's scatter/gather modes cannot
@@ -609,58 +610,100 @@ class HYV4Model(nn.Module):
                     "which the iHC stream has no equivalent of."
                 )
         self.dp_attn_scattered = hyv4_dp_attn_scattered()
+        if self.dp_attn_scattered and self.pp_group.world_size != 1:
+            # PP alone is fine: the boundary carries one per-token tensor.
+            # DP attention alone is fine too. What is untested is the
+            # SCATTERED layer stack (attn_tp_size > 1) under PP: the proxy
+            # crosses the boundary in whatever layout the sending stage's last
+            # layer left it, and the receiving stage would have to agree on the
+            # same attn-tp token slice. Note this does NOT fire for DSA prefill
+            # CP, which forces enable_dp_attention=True but lands on
+            # attn_tp_size == 1 (SCATTERED == TP_ATTN_FULL, no split/gather).
+            raise ValueError(
+                "HYV4 does not support pipeline parallelism together with a "
+                "scattered DP-attention layer stack (attn_tp_size > 1); use "
+                "one or the other."
+            )
         self.config = config
-        self.start_layer = 0
-        self.end_layer = config.num_hidden_layers
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=add_prefix("embed_tokens", prefix),
-            params_dtype=(
-                torch.float16 if get_global_server_args().dtype == "float16" else None
-            ),
-            **get_embedding_tp_kwargs(),
-        )
+        self.hc_mult = config.hc_mult
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=add_prefix("embed_tokens", prefix),
+                params_dtype=(
+                    torch.float16
+                    if get_global_server_args().dtype == "float16"
+                    else None
+                ),
+                **get_embedding_tp_kwargs(),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
         self.alt_stream = (
             torch.cuda.Stream()
             if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
-        self.layers = nn.ModuleList(
-            [
-                HYV4DecoderLayer(
-                    config,
-                    i,
-                    quant_config,
-                    add_prefix(f"layers.{i}", prefix),
-                    self.alt_stream,
-                )
-                for i in range(config.num_hidden_layers)
-            ]
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: HYV4DecoderLayer(
+                config,
+                idx,
+                quant_config,
+                prefix,
+                self.alt_stream,
+            ),
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+            prefix=add_prefix("layers", prefix),
         )
-        self.hc_head = HYV4HCHeadLayer(config, add_prefix("hc_head", prefix))
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # hc_head collapses the 3D iHC stream back to (T, H); only the last
+        # stage produces a model output, so only it needs the head and norm.
+        if self.pp_group.is_last_rank:
+            self.hc_head = HYV4HCHeadLayer(config, add_prefix("hc_head", prefix))
+            self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        else:
+            self.hc_head = PPMissingLayer()
+            self.norm = PPMissingLayer()
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.cp_rank = get_parallel().attn_cp_rank
         self.cp_size = get_parallel().attn_cp_size
 
-    def _maybe_prepare_prefill_cp(self, input_ids, forward_batch):
+    def _dsa_forward_uses_topk(self) -> bool:
+        """Does this batch's attention backend consume DSA top-k indices?
+
+        Mirrors ``DeepseekV2Model._dsa_forward_uses_topk``: an MHA backend runs
+        dense attention and never asks the indexer for top-k, so there is
+        nothing to carry across a PP boundary.
+        """
+        backend = get_attn_backend()
+        backend = getattr(backend, "primary", backend)
+        return not getattr(backend, "use_mha", False)
+
+    def _maybe_prepare_prefill_cp(self, num_tokens, forward_batch):
         """Build the DSA CP metadata for this batch, mirroring DeepseekV4Model.
 
         The metadata has no producer outside the model: every CP-capable model
         sets it itself before its layer loop, and ``dsa_use_prefill_cp``
         returns False while it is None. Without this the CP split below is
         silently skipped.
+
+        ``num_tokens`` is the pre-split token count. Under PP the later stages
+        have no ``input_ids`` and their incoming hidden state is already
+        CP-split, so the caller derives it from ``extend_seq_lens_cpu``, which
+        is the full length on every rank. Every rank must run this: it also
+        rebuilds the attention/indexer metadata in round-robin mode.
         """
         if not (
             self.dsa_enable_prefill_cp
             and forward_batch.extend_seq_lens_cpu is not None
         ):
             return False
-        if not can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+        if not can_dsa_cp_split(num_tokens, self.cp_size, True, forward_batch):
             return False
         forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-            len(input_ids),
+            num_tokens,
             self.cp_rank,
             self.cp_size,
             forward_batch.seq_lens_cpu.tolist(),
@@ -681,16 +724,61 @@ class HYV4Model(nn.Module):
                 )
         return True
 
-    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
-        hidden_states = (
-            self.embed_tokens(input_ids) if input_embeds is None else input_embeds
-        )
+    def forward(
+        self,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        dsa_forward_uses_topk = self._dsa_forward_uses_topk()
+        if self.pp_group.is_first_rank:
+            hidden_states = (
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            )
+            initial_topk_indices = None
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            # The iHC stream crosses PP flattened to 2D (see the send side), so
+            # restore the (T, hc_mult, H) layout the layers expect.
+            if hidden_states.ndim == 2:
+                hidden_states = hidden_states.view(
+                    hidden_states.shape[0], self.hc_mult, self.config.hidden_size
+                )
+            initial_topk_indices = pp_proxy_tensors.tensors.get("topk_indices")
+        # Shared-indexer layers reuse the previous layer's topk, so carry it
+        # through the loop the same way DeepseekV2Model.forward does. Across a
+        # PP boundary the previous stage's last topk arrives via the proxy.
+        index_topk_share = IndexTopKShareState(forward_batch, initial_topk_indices)
+        if not self.pp_group.is_first_rank:
+            assert not (
+                not forward_batch.forward_mode.is_idle()
+                and hidden_states.shape[0] != 0
+                and dsa_forward_uses_topk
+                and dsa_layer_skips_topk(self.config, self.start_layer)
+                and index_topk_share.topk_indices is None
+            ), (
+                f"PP stage starting at layer {self.start_layer} requires DSA "
+                "topk_indices from the previous stage."
+            )
         # Prefill CP boundary sits at the model level on purpose. iHC carries a
         # 3D (T, hc_mult, H) residual between layers, which the 2D CP helpers
         # cannot describe, but both the embedding output and the hc_head output
         # are flat (T, H). Splitting here and gathering after hc_head keeps the
         # iHC stream entirely CP-local, so no per-layer CP metadata is needed.
-        self._maybe_prepare_prefill_cp(input_ids, forward_batch)
+        #
+        # Under PP only the first stage holds input_ids, and later stages
+        # receive an already-split hidden state, so take the pre-split length
+        # from extend_seq_lens_cpu -- it is the full length on every rank.
+        if input_ids is not None:
+            num_tokens = input_ids.shape[0]
+        elif forward_batch.extend_seq_lens_cpu is not None:
+            num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
+        else:
+            num_tokens = hidden_states.shape[0]
+        self._maybe_prepare_prefill_cp(num_tokens, forward_batch)
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         if use_cp:
             if not getattr(self, "_cp_logged", False):
@@ -700,21 +788,21 @@ class HYV4Model(nn.Module):
                     hidden_states.shape[0],
                     self.cp_size,
                 )
-            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            # The first stage splits and every later stage inherits that split,
+            # but positions arrive full-length on all of them.
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
         if self.dp_attn_scattered:
             # ScatterMode.model_input_output() is TP_ATTN_FULL, but the layer
             # stack runs SCATTERED. This split is a view, not a collective.
             hidden_states = hyv4_attn_tp_split(hidden_states)
         zero_allocator = BumpAllocator(
-            buffer_size=2 * len(self.layers),
+            buffer_size=2 * (self.end_layer - self.start_layer),
             dtype=torch.float32,
             device=hidden_states.device,
         )
-        # Shared-indexer layers reuse the previous layer's topk, so carry it
-        # through the loop the same way DeepseekV2Model.forward does.
-        index_topk_share = IndexTopKShareState(forward_batch, None)
-        for layer in self.layers:
+        for layer in self.layers[self.start_layer : self.end_layer]:
             hidden_states, topk_indices = layer(
                 positions,
                 hidden_states,
@@ -724,6 +812,31 @@ class HYV4Model(nn.Module):
             )
             index_topk_share.update(topk_indices)
         index_topk_share.publish()
+        if not self.pp_group.is_last_rank:
+            # Flatten the 3D iHC stream for PP IPC, as DeepseekV4Model does for
+            # its mHC stream: the transport buffers are 2D. This must precede
+            # the idle short-circuit below -- an idle batch still has to hand
+            # the next stage a proxy, not a model output.
+            proxy_tensors = {"hidden_states": hidden_states.flatten(1)}
+            if dsa_forward_uses_topk and dsa_layer_skips_topk(
+                self.config, self.end_layer
+            ):
+                topk_indices = index_topk_share.topk_indices
+                if (
+                    not forward_batch.forward_mode.is_idle()
+                    and hidden_states.shape[0] != 0
+                ):
+                    assert topk_indices is not None, (
+                        f"PP stage ending at layer {self.end_layer} must forward "
+                        "DSA topk_indices because the next stage starts on a "
+                        "skip-topk layer."
+                    )
+                if topk_indices is None:
+                    topk_indices = hidden_states.new_empty(
+                        (0, get_dsa_index_topk(self.config)), dtype=torch.int32
+                    )
+                proxy_tensors["topk_indices"] = topk_indices
+            return PPProxyTensors(proxy_tensors)
         if forward_batch.forward_mode.is_idle():
             # Collapse the 3D iHC stream to the 2D model output without running
             # hc_head / norm on a zero-token batch. Zero tokens means the two
@@ -756,7 +869,9 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             (
                 layer.mlp.num_fused_shared_experts
                 for layer in self.model.layers
-                if isinstance(layer.mlp, DeepseekV2MoE)
+                # Under PP, make_layers() pads self.layers with PPMissingLayer
+                # placeholders for the other stages' layers; those have no .mlp.
+                if isinstance(getattr(layer, "mlp", None), DeepseekV2MoE)
             ),
             default=0,
         )
@@ -772,13 +887,35 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
-    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+    def forward(
+        self,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
         hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds=input_embeds
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
+        if not self.pp_group.is_last_rank:
+            # Already a PPProxyTensors; the scheduler sends it to the next stage.
+            return hidden_states
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

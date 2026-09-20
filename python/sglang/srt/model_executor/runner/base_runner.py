@@ -367,7 +367,7 @@ class BaseRunner(ABC):
                 if mr.ngram_embedding_manager.enabled
                 else None
             ),
-            hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
+            hc_hidden_size=mr.get_pp_proxy_hidden_size(),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
             allocate_logits_buffer=allocate_logits_buffer,

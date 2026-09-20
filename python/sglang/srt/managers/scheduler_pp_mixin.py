@@ -732,8 +732,12 @@ class SchedulerPPMixin:
                     batch.global_num_tokens = global_num_tokens
                     batch.global_num_tokens_for_logprob = global_num_tokens
 
+                # Same width the PP proxy buffers use: hyper-connection models
+                # (DSV4 mHC, HYV4 iHC) flatten hc_mult * hidden_size across the
+                # boundary. Identical to hc_hidden_size for DSV4; HYV4 only gets
+                # a correct width through this accessor.
                 hs = (
-                    getattr(model_config, "hc_hidden_size", None)
+                    model_runner.get_pp_proxy_hidden_size()
                     or model_config.hidden_size
                 )
                 proxy_tensors = {

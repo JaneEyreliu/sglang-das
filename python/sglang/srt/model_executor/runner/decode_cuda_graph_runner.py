@@ -428,9 +428,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.use_ngram_embedding
                 else None
             ),
-            hc_hidden_size=getattr(
-                self.model_runner.model_config, "hc_hidden_size", None
-            ),
+            hc_hidden_size=self.model_runner.get_pp_proxy_hidden_size(),
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=(
                 self.model_runner.get_pp_proxy_residual_num_blocks()

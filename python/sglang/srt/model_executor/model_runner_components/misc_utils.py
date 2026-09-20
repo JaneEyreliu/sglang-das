@@ -90,3 +90,30 @@ def resolve_pp_proxy_residual_num_blocks(
     if block_size is None:
         return None
     return (start_layer + block_size - 1) // block_size
+
+
+def resolve_pp_proxy_hidden_size(
+    *, model_config: ModelConfig, pp_size: int
+) -> Optional[int]:
+    """Width of the flattened hidden state crossing a PP boundary, or None.
+
+    Hyper-connection models (DSV4's mHC, HYV4's iHC) carry a
+    ``(T, hc_mult, H)`` stream between layers and flatten it to
+    ``(T, hc_mult * H)`` for PP IPC, so their proxy buffer is hc_mult times
+    wider than ``hidden_size``. A non-None result also tells the buffer
+    allocator to skip the ``residual`` slot: these models fold the residual
+    into the hidden state and never send one.
+
+    This deliberately does NOT reuse ``model_config.hc_hidden_size``.
+    ``resolve_spec_hidden_size`` excludes HYV4 because HYV4 collapses back to
+    ``hidden_size`` before its MTP layer -- that is a statement about the
+    spec/draft boundary, not the PP boundary. ``hc_hidden_size`` also gates
+    ``return_hidden_states_before_norm`` for target-verify graph capture, which
+    would be wrong for HYV4.
+    """
+    if pp_size <= 1:
+        return None
+    hc_mult = getattr(model_config.hf_text_config, "hc_mult", 1)
+    if hc_mult <= 1:
+        return None
+    return model_config.hidden_size * hc_mult
