@@ -21,6 +21,7 @@
 #     (gated MLA) and learnable attention sinks.
 
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -34,7 +35,6 @@ from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
-    is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.communicator import (
@@ -69,7 +69,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+    register_attn_tp_sequence_sharded_predicate,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     AttnForwardMethod,
@@ -107,6 +111,18 @@ def hyv4_dp_attn_scattered() -> bool:
     are the same layout and no communication is needed at all.
     """
     return is_dp_attention_enabled() and get_parallel().attn_tp_size > 1
+
+
+def hyv4_shared_experts_fusion_disable_reason(config, quant_config):
+    # The fused MoE has a single activation limit for all expert slots, while
+    # HYV4's shared expert must remain unclamped. Keep it on the separate MLP
+    # path until fusion supports distinct routed/shared activation semantics.
+    if (
+        getattr(config, "swiglu_limit", None) is not None
+        and (getattr(config, "n_shared_experts", 0) or 0) > 0
+    ):
+        return "HYV4 SwiGLU clipping applies to routed experts only."
+    return None
 
 
 def hyv4_attn_tp_split(tensor: torch.Tensor) -> torch.Tensor:
@@ -178,6 +194,45 @@ def permute_hyv4_indexer_weight(name, loaded_weight, config):
         ),
         dim=1,
     ).reshape(shape)
+
+
+def adapt_hy4_native_weights(weights):
+    """把 hy4_w4a8_v1 的存储后缀剥掉，还原成 named_parameters() 的名字。
+
+    该格式给每个逻辑参数加一个角色后缀：量化的写成 ``<名字>.packed`` +
+    ``<名字>.scale``，保留的一律追加 ``.weight``（所以 norm 会变成
+    ``...input_layernorm.weight.weight``）。scale 本身已经是 [N, 1] 的
+    channel 形状，只需要改名。
+    """
+    for name, loaded_weight in weights:
+        if name.endswith(".weight.packed"):
+            if loaded_weight.dtype != torch.uint8 or loaded_weight.ndim != 2:
+                raise ValueError(f"Expected a rank-2 uint8 packed weight: {name}")
+            # 目标 buffer（MoE 的 w13/w2 和 shared_experts 的 weight）都是
+            # int8；这里只是改视图，字节不动。
+            yield name.removesuffix(".packed"), loaded_weight.view(torch.int8)
+        elif name.endswith(".weight.scale"):
+            if (
+                loaded_weight.dtype != torch.float32
+                or loaded_weight.ndim != 2
+                or loaded_weight.shape[-1] != 1
+            ):
+                raise ValueError(f"Invalid hy4 native channel scale: {name}")
+            yield name.removesuffix(".scale") + "_scale", loaded_weight
+        elif name.endswith(".weight"):
+            # 写入端给标量/非 linear 参数也追加了 .weight。
+            yield name.removesuffix(".weight"), loaded_weight
+        else:
+            yield name, loaded_weight
+
+
+def uses_hy4_native_format(model: nn.Module) -> bool:
+    from sglang.srt.layers.quantization.slimquant_w4a8_marlin import (
+        HY4_NATIVE_FORMAT,
+    )
+
+    quant_config = getattr(model, "quant_config", None)
+    return getattr(quant_config, "checkpoint_format", None) == HY4_NATIVE_FORMAT
 
 
 def hyv4_linear_scale_suffix(model: nn.Module) -> str:
@@ -414,6 +469,13 @@ class HYV4Attention(DeepseekV2AttentionMLA):
             prefix=prefix,
             alt_stream=alt_stream,
             is_nextn=is_nextn,
+            # DeepseekV2AttentionMLA only defines self.cp_size when one of the
+            # CP flavors is on, and rebuild_cp_kv_cache() reads it. DeepseekV2
+            # threads the flag Model -> DecoderLayer -> Attention; HYV4 has its
+            # own decoder layer (iHC, no layer_communicator), so read it here
+            # directly. HY4 is always DSA (is_deepseek_dsa whitelists
+            # HYV4ForCausalLM), hence mla_enable_prefill_cp is always False.
+            dsa_enable_prefill_cp=is_dsa_enable_prefill_cp(),
         )
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
@@ -625,6 +687,13 @@ class HYV4Model(nn.Module):
                 "one or the other."
             )
         self.config = config
+        # HYV4 keeps all tokens on every attn-TP rank unless DP attention
+        # scatters the iHC stream. The MoE padding mask must use that same
+        # layout; the predicate defaults to sharded, which makes plain TP
+        # mark real tokens as padding and drop their expert output.
+        register_attn_tp_sequence_sharded_predicate(
+            lambda num_tokens_per_dp: hyv4_dp_attn_scattered()
+        )
         self.hc_mult = config.hc_mult
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -709,19 +778,15 @@ class HYV4Model(nn.Module):
             forward_batch.seq_lens_cpu.tolist(),
             extend_seqs_len=forward_batch.extend_seq_lens_cpu,
         )
-        if is_dsa_prefill_cp_round_robin_split():
-            # In round-robin-split mode the CP metadata decides the local token
-            # order, so the attention/indexer metadata built before
-            # model.forward() must be rebuilt to match.
-            attn_backend = get_attn_backend()
-            metadata = attn_backend.forward_metadata
-            core_meta = metadata.core_attn_metadata
-            core_meta.apply_cp_reindex()
-            core_meta.init_flashmla_related(is_prefill=True)
-            if metadata.indexer_metadata is not None:
-                metadata.indexer_metadata = (
-                    attn_backend.init_forward_metadata_indexer(core_meta)
-                )
+        # NOTE: no metadata rebuild here, unlike DeepseekV4Model. That model runs
+        # on deepseek_v4_backend, whose DSV4AttnMetadata is built in global token
+        # order and needs an explicit apply_cp_reindex() after the CP metadata is
+        # known. HYV4 pins the sparse MLA path (dispatch_attn_forward_method), so
+        # it always runs on dsa_backend, whose init_forward_metadata already
+        # applies the round-robin split to seqlens_expanded / extend_seq_lens /
+        # cache_seqlens_int32 / page_table / cu_seqlens_k and to the indexer's
+        # ks/ke. Reindexing again would double-split, and DSAMetadata has no
+        # core_attn_metadata attribute to reindex through in the first place.
         return True
 
     def forward(
@@ -858,6 +923,9 @@ class HYV4Model(nn.Module):
 
 class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    shared_experts_fusion_disable_reason = staticmethod(
+        hyv4_shared_experts_fusion_disable_reason
+    )
 
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
@@ -928,6 +996,10 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         scale_suffix = hyv4_linear_scale_suffix(self)
+        native = uses_hy4_native_format(self)
+        if native:
+            # 先归一化，再让下面的规则去看 hc_fn / weight_scale。
+            weights = adapt_hy4_native_weights(weights)
 
         def mapped_weights():
             for name, loaded_weight in weights:
@@ -938,7 +1010,7 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 )
                 if name.endswith((".hc_fn", ".hc_head_fn")):
                     name += ".weight"
-                if name.endswith(".weight_scale"):
+                if not native and name.endswith(".weight_scale"):
                     name += scale_suffix
                 yield name, loaded_weight
 

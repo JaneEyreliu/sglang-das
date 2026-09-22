@@ -19,6 +19,9 @@ from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.model_executor.forward_batch_info import (
+    register_attn_tp_sequence_sharded_predicate,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -30,12 +33,15 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.models.hunyuan_v4 import (
     HYV4Attention,
+    adapt_hy4_native_weights,
     hyv4_attn_tp_gather,
     hyv4_attn_tp_reduce_scatter,
     hyv4_attn_tp_split,
     hyv4_dp_attn_scattered,
     hyv4_linear_scale_suffix,
+    hyv4_shared_experts_fusion_disable_reason,
     permute_hyv4_indexer_weight,
+    uses_hy4_native_format,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
@@ -44,7 +50,7 @@ from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda
 _is_cuda = is_cuda()
 
 
-def _mtp_quant_config(quant_config):
+def _mtp_quant_config(quant_config, config=None):
     """Re-point the checkpoint's MTP ignore entries at the draft decoder."""
     if quant_config is None:
         return None
@@ -52,13 +58,19 @@ def _mtp_quant_config(quant_config):
     quant_config = copy.deepcopy(quant_config)
     decoder_prefix = "model.decoder"
 
+    mtp_prefixes = [
+        "model.mtp.layers.0",
+        "model.mtp_layers.0",
+        "mtp.layers.0",
+        "mtp_layers.0",
+    ]
+    if config is not None:
+        # hy4_w4a8_v1 的模块名在 quant config 里已经归一化成
+        # model.layers.<num_hidden_layers>（和 nextn_layer_prefix 一致）。
+        mtp_prefixes.append(f"model.layers.{config.num_hidden_layers}")
+
     def normalize_name(name):
-        for mtp_prefix in (
-            "model.mtp.layers.0",
-            "model.mtp_layers.0",
-            "mtp.layers.0",
-            "mtp_layers.0",
-        ):
+        for mtp_prefix in mtp_prefixes:
             name = name.replace(mtp_prefix, decoder_prefix)
         return name
 
@@ -72,6 +84,13 @@ def _mtp_quant_config(quant_config):
     if ignored_modules is not None:
         quant_config.ignore = list(
             dict.fromkeys(normalize_name(name) for name in ignored_modules)
+        )
+
+    # hy4_w4a8_v1 用白名单而不是 ignore 列表，同样要重写。
+    quantized_modules = getattr(quant_config, "quantized_modules", None)
+    if quantized_modules is not None:
+        quant_config.quantized_modules = frozenset(
+            normalize_name(name) for name in quantized_modules
         )
 
     # Compressed-tensors applies this override before consulting its ignore list.
@@ -152,6 +171,12 @@ class HYV4MTPDecoderLayer(nn.Module):
 class HYV4ModelNextN(nn.Module):
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
+        # The draft MoE uses the same token layout as the HYV4 trunk.
+        # Register it here as well so a draft worker does not rely on
+        # trunk init order.
+        register_attn_tp_sequence_sharded_predicate(
+            lambda num_tokens_per_dp: hyv4_dp_attn_scattered()
+        )
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -224,6 +249,9 @@ class HYV4ModelNextN(nn.Module):
 
 class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    shared_experts_fusion_disable_reason = staticmethod(
+        hyv4_shared_experts_fusion_disable_reason
+    )
 
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
@@ -231,7 +259,9 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
         self.model = HYV4ModelNextN(
-            config, _mtp_quant_config(quant_config), prefix=add_prefix("model", prefix)
+            config,
+            _mtp_quant_config(quant_config, config),
+            prefix=add_prefix("model", prefix),
         )
         self.num_fused_shared_experts = self.model.decoder.mlp.num_fused_shared_experts
         self.lm_head = ParallelLMHead(
@@ -266,6 +296,9 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
         # it.
         layer_prefix = self._initialize_nextn_conf(True).nextn_layer_prefix
         scale_suffix = hyv4_linear_scale_suffix(self)
+        native = uses_hy4_native_format(self)
+        if native:
+            weights = adapt_hy4_native_weights(weights)
 
         def mapped_weights():
             for name, loaded_weight in weights:
@@ -279,7 +312,7 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
                 loaded_weight = permute_hyv4_indexer_weight(
                     name, loaded_weight, self.config
                 )
-                if name.endswith(".weight_scale"):
+                if not native and name.endswith(".weight_scale"):
                     name += scale_suffix
                 yield name, loaded_weight
 

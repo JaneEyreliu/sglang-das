@@ -42,6 +42,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
+    LinearMethodBase,
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
@@ -214,10 +215,14 @@ class MarlinMoeWorkspace:
         return self.workspace, self.global_reduce_buffer
 
 
-def repack_and_shuffle_w4a8(weight_data, E):
+def repack_and_shuffle_w4a8(weight_data, E, low_first: bool = False):
     """
     逐 expert 处理 [n, k_half]
     处理完直接写回 weight_data[i]
+
+    ``low_first`` 给 hy4_w4a8_v1 用：该格式把偶数 k 存在低 nibble，
+    而下面的解包按高 nibble 当元素 0（mxfp4_to_int4.py 的约定），
+    所以先换一次 nibble 再走原逻辑。
     """
     from aiter.ops.shuffle import w4a8_moe_layout_shuffle_gemm2
 
@@ -229,6 +234,8 @@ def repack_and_shuffle_w4a8(weight_data, E):
 
         # 2. repack 逻辑（连续 → blocked）
         w_u8 = expert.to(torch.uint8)
+        if low_first:
+            w_u8 = (w_u8 << 4) | (w_u8 >> 4)
 
         # 解包 1byte → 2个4bit
         w_unpacked = torch.stack([(w_u8 >> 4) & 0x0F, w_u8 & 0x0F], dim=-1).view(n, -1)
@@ -490,6 +497,84 @@ def _hf_architectures(hf_config) -> list[str]:
     return list(getattr(hf_config, "architectures", None) or [])
 
 
+# hy4_w4a8_v1: HYV4 的原生 GPTQ W4A8 checkpoint。和 mxfp4_to_int4.py 产出的
+# channel W4A8 有两处差别，都是在 node1 上对着真 checkpoint 实测出来的：
+#
+#   * 存的是**真** scale（区间对称 [-7, 7]）；mxfp4 那套是 [-8, 7] 且存
+#     scale/16。判据：HY4 用 7*scale 重建出的 per-row 幅度 1.41e-1 与同模型
+#     layer-0 bf16 dense 的 1.45e-1 吻合；而 GLM-5.2 同一层的 shared_experts
+#     是全宽 int8（真 scale），与同层 routed int4 的 scale 之比 14.98 ≈ 127/8。
+#   * nibble 顺序是 low-first（偶数 k 在低半字节），需要换成 aiter 的
+#     high-first。
+#
+# 注意两条 aiter 路径的 scale 约定**不同**，不要合并：
+#   - MoE（aiter_moe + MoeQuantType.W4A8）按存了 scale/16 的 checkpoint 标定，
+#     所以真 scale 要乘 HY4_NATIVE_SCALE_MUL。实测 cos=0.9997；不乘则输出
+#     |mean| 8.5e+1 vs 参考 1.5e-2（差 ~16x），cos 掉到 0.8178。
+#   - Linear（moe_op.fused_moe 单 expert）直接吃真 scale，乘 1/16 反而错。
+#     实测原样传入 cos=1.0000。
+#
+# quantized_modules 从 index 反推：attention / layer-0 dense / router gate /
+# 所有 norm / lm_head 都是 bf16，只有 routed + shared experts 是 int4。
+HY4_NATIVE_FORMAT = "hy4_w4a8_v1"
+HY4_NATIVE_SCALE_MUL = 1.0 / 16.0
+
+
+def _hy4_swap_nibbles(w: torch.Tensor) -> torch.Tensor:
+    """low-first -> high-first，换半字节顺序，数值语义不变。
+
+    hy4_w4a8_v1 把偶数 k 放在低半字节，而所有 repack 都假定高半字节在前
+    （见 _unpack_int8_to_uint4_int8_small: high4 -> 偶数 k）。那个 unpack 跑在
+    QQQ 的 pack_order 重排**之前**，且 pack_order 只搬运已解包的 int4、不再取
+    nibble，所以在 repack 之前 swap 一次和在里面加 low_first 等价 —— 三条
+    w4a8_weight_repack_impl 分支通吃。
+
+    只换位置，不做 ^0x88：QQQ/marlin kernel 吃补码，offset-8 是 Triton 专属。
+    """
+    u = w.to(torch.uint8)
+    return (((u & 0x0F) << 4) | ((u >> 4) & 0x0F)).to(torch.int8).contiguous()
+
+
+def _hy4_native_quantized_modules(checkpoint_index: str) -> frozenset:
+    """从 hy4-checkpoint.index.json 里读出被量化的模块前缀。"""
+    import json
+    import re
+    from pathlib import Path
+
+    index_path = Path(checkpoint_index)
+    with index_path.open() as source:
+        index = json.load(source)
+    if index.get("format") != HY4_NATIVE_FORMAT or index.get("complete") is not True:
+        raise ValueError(
+            f"Expected a complete {HY4_NATIVE_FORMAT} checkpoint index at "
+            f"{checkpoint_index}"
+        )
+    with (index_path.parent / "config.json").open() as source:
+        mtp_start = json.load(source)["num_hidden_layers"]
+
+    modules = set()
+    for name, entry in index["parameters"].items():
+        if entry.get("kind") != "quantized":
+            continue
+        # MTP 在 checkpoint 里叫 mtp_layers.N，在 sglang 里是 layers.<78+N>；
+        # 之后 _mtp_quant_config 再把它重写成 model.decoder。
+        name = re.sub(
+            r"^model\.mtp_layers\.(\d+)\.",
+            lambda m: f"model.layers.{mtp_start + int(m[1])}.",
+            name,
+        )
+        name = name.removesuffix(".weight")
+        if re.search(r"\.experts\.\d+\.", name):
+            # FusedMoE 每层只建一次，不是每个 expert 一个。
+            modules.add(name.split(".experts.")[0] + ".experts")
+            continue
+        # gate_proj / up_proj 合并成一个 MergedColumnParallelLinear。
+        name = name.replace(".gate_proj", ".gate_up_proj")
+        name = name.replace(".up_proj", ".gate_up_proj")
+        modules.add(name)
+    return frozenset(modules)
+
+
 class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
     """Config class for W4A8 Int8 Quantization.
     - Weight: static, per-channel, symmetric
@@ -500,12 +585,22 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         self,
         ignore: Optional[list[str]] = None,
         experts_only_linear: bool = False,
+        checkpoint_format: Optional[str] = None,
+        quantized_modules: Optional[frozenset] = None,
     ):
         super().__init__()
         self.ignore = ignore
         # Qwen3.8 Flash-Next ChannelWise W4A8 quantizes MoE experts only;
         # DeepSeek / Kimi still quantize dense Linear unless listed in ignore.
         self.experts_only_linear = experts_only_linear
+        # hy4_w4a8_v1 走白名单（quantized_modules）而不是黑名单（ignore）：
+        # 该 checkpoint 里 bf16 的模块远多于 int4 的。
+        self.checkpoint_format = checkpoint_format
+        self.quantized_modules = quantized_modules
+
+    @property
+    def is_hy4_native(self) -> bool:
+        return self.checkpoint_format == HY4_NATIVE_FORMAT
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -525,6 +620,15 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, any]) -> "SlimQuantW4A8Int8MarlinConfig":
+        if config.get("checkpoint_format") == HY4_NATIVE_FORMAT:
+            # config.json 里没有 quantization_config，靠
+            # --json-model-override-args 把 checkpoint_index 传进来。
+            return cls(
+                checkpoint_format=HY4_NATIVE_FORMAT,
+                quantized_modules=_hy4_native_quantized_modules(
+                    config["checkpoint_index"]
+                ),
+            )
         archs = _hf_architectures(config.get("hf_config"))
         experts_only_linear = any(arch in _QWEN4_EXP_ARCHS for arch in archs)
         return cls(
@@ -552,6 +656,15 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         if isinstance(layer, LinearBase):
+            if self.is_hy4_native:
+                # shared_experts 是唯一走 Linear 的量化模块，其余（attention、
+                # layer-0 dense、gate、lm_head）都是 bf16。按子串判定而不是查
+                # 白名单：白名单的 key 来自 checkpoint index，MTP 在那里叫
+                # layers.<78+N>，而 NEXTN draft 建模块时用的是 model.decoder.*，
+                # 精确匹配会漏掉它并静默把 INT4 字节当 bf16 加载。
+                if ".mlp.shared_experts." not in prefix:
+                    return UnquantizedLinearMethod()
+                return HYV4PackedLinearMethod(self)
             # Kimi-K3 INT4 (from mxfp4_to_int4.py) only quantizes the routed
             # experts; dense layers stay in BF16 and are listed in the
             # checkpoint's ignore list (native compressed-tensors style, with
@@ -602,6 +715,53 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+
+class HYV4PackedLinearMethod(SlimQuantW4A8Int8LinearMethod):
+    """hy4_w4a8_v1 的 INT4 shared_experts Linear，复用现成的 INT8 GEMM。
+
+    把每个 nibble 展开成一个 INT8 是无损的，所以不需要专门的 W4A8 kernel：
+    按 packed 字节数建 buffer（K 折半），加载后再解包回全宽 INT8，
+    激活仍走基类的 per-token 动态 INT8 量化。
+
+    checkpoint 存的是真 per-channel scale，直接用，不做 /16 —— 那是 MoE
+    那条路（kernel 内部补 x16）的约定，两者不能混。
+    """
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        if input_size_per_partition % 2:
+            raise ValueError(
+                "hy4_w4a8_v1 INT4 needs an even local input dim, got "
+                f"{input_size_per_partition}"
+            )
+        # 加载期按 packed 宽度建 buffer，process_weights_after_loading 再展开。
+        super().create_weights(
+            layer,
+            input_size_per_partition // 2,
+            output_partition_sizes,
+            input_size // 2,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # hy4_w4a8_v1 是 low-first：偶数 k 在低 nibble，值为二补码。
+        # 用算术右移做符号扩展，还原成 [..., 2*K_packed] 的 INT8。
+        packed = layer.weight.data.view(torch.int8)
+        low = (packed << 4) >> 4
+        high = packed >> 4
+        layer.weight.data = torch.stack((low, high), dim=-1).flatten(-2)
+        super().process_weights_after_loading(layer)
 
 
 class SlimQuantW4A8Int8MarlinMoEMethod:
@@ -702,16 +862,27 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         build_hcu_int4_mega_moe_experts_weights(layer)
         if not _use_lightop_w4a8_marlin_moe:
             if self.use_deepep:
+                # hipc kernel 的口径是 high-first nibble + scale/16（kernel
+                # 内部补回 x16），mxfp4_to_int4.py 那套 checkpoint 正好原样
+                # 满足，所以 legacy 不用动；hy4_w4a8_v1 两处都不一样，要先
+                # 归一化过去。
                 from deepgemm import pack_w4a8_moe_hipc_weight
+
+                low_first = self.quant_config.is_hy4_native
+                w13 = layer.w13_weight.data
+                w2 = layer.w2_weight.data
+                if low_first:
+                    w13 = _hy4_swap_nibbles(w13)
+                    w2 = _hy4_swap_nibbles(w2)
                 layer.w13_weight = Parameter(
-                    pack_w4a8_moe_hipc_weight(layer.w13_weight.data),
+                    pack_w4a8_moe_hipc_weight(w13),
                     requires_grad=False,
                 )
                 layer.w2_weight = Parameter(
-                    pack_w4a8_moe_hipc_weight(layer.w2_weight.data),
+                    pack_w4a8_moe_hipc_weight(w2),
                     requires_grad=False,
                 )
-                scale_mul = 16.0
+                scale_mul = HY4_NATIVE_SCALE_MUL if low_first else 1.0
                 layer.w13_weight_scale = Parameter(
                     layer.w13_weight_scale.data * scale_mul,
                     requires_grad=False,
@@ -738,15 +909,18 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
 
                 if _use_aiter_moe:
                     E = layer.w13_weight.shape[0]
+                    low_first = self.quant_config.is_hy4_native
                     layer.w13_weight = Parameter(
-                        repack_and_shuffle_w4a8(layer.w13_weight.data, E),
+                        repack_and_shuffle_w4a8(layer.w13_weight.data, E, low_first),
                         requires_grad=False,
                     )
                     layer.w2_weight = Parameter(
-                        repack_and_shuffle_w4a8(layer.w2_weight.data, E),
+                        repack_and_shuffle_w4a8(layer.w2_weight.data, E, low_first),
                         requires_grad=False,
                     )
-                    scale_mul = 1.0
+                    # hy4_w4a8_v1 存真 scale；mxfp4_to_int4.py 那套存 scale/16，
+                    # 而 aiter 按后者标定，所以只有前者要补 1/16。
+                    scale_mul = HY4_NATIVE_SCALE_MUL if low_first else 1.0
                     layer.w13_weight_scale = Parameter(
                         layer.w13_weight_scale.data * scale_mul,
                         requires_grad=False,
@@ -773,21 +947,34 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
                     )
         else:
             # Legacy lightop path: repack into the Marlin W4A8 layout.
+            #
+            # 这条路是给 mxfp4_to_int4.py / GLM channel-int4 写的，它们存
+            # scale/16 且 nibble high-first，所以 scale 原样传（kernel 内部补
+            # 回 x16）。hy4_w4a8_v1 两处都不一样，要先归一化到该约定：
+            #   - nibble low-first -> high-first
+            #   - 真 scale -> scale/16
+            # 判据见 HY4_NATIVE_FORMAT 上方的注释（GLM 同层 int8/int4 scale
+            # 之比实测 14.98 ~ 16，坐实 GLM 存的是 scale/16）。
+            low_first = self.quant_config.is_hy4_native
+            w13 = layer.w13_weight.data
+            w2 = layer.w2_weight.data
+            if low_first:
+                w13 = _hy4_swap_nibbles(w13)
+                w2 = _hy4_swap_nibbles(w2)
             layer.w13_weight = Parameter(
-                w4a8_weight_repack_impl(
-                    layer.w13_weight, use_deepep=self.use_deepep
-                ),
+                w4a8_weight_repack_impl(w13, use_deepep=self.use_deepep),
                 requires_grad=False,
             )
             layer.w2_weight = Parameter(
-                w4a8_weight_repack_impl(layer.w2_weight, use_deepep=self.use_deepep),
+                w4a8_weight_repack_impl(w2, use_deepep=self.use_deepep),
                 requires_grad=False,
             )
+            scale_mul = HY4_NATIVE_SCALE_MUL if low_first else 1.0
             layer.w13_weight_scale = Parameter(
-                layer.w13_weight_scale.data, requires_grad=False
+                layer.w13_weight_scale.data * scale_mul, requires_grad=False
             )
             layer.w2_weight_scale = Parameter(
-                layer.w2_weight_scale.data, requires_grad=False
+                layer.w2_weight_scale.data * scale_mul, requires_grad=False
             )
 
     def create_moe_runner(
@@ -1380,19 +1567,24 @@ class SlimQuantW4A8Int8AiterMoEMethod:
             return
 
         E = layer.w13_weight.shape[0]
+        low_first = self.quant_config.is_hy4_native
         layer.w13_weight = Parameter(
-            repack_and_shuffle_w4a8(layer.w13_weight.data, E), requires_grad=False
+            repack_and_shuffle_w4a8(layer.w13_weight.data, E, low_first),
+            requires_grad=False,
         )
         layer.w2_weight = Parameter(
-            repack_and_shuffle_w4a8(layer.w2_weight.data, E), requires_grad=False
+            repack_and_shuffle_w4a8(layer.w2_weight.data, E, low_first),
+            requires_grad=False,
         )
         self._ep_use_marlin = False
 
+        # hy4_w4a8_v1 存真 scale，aiter 按存了 scale/16 的 checkpoint 标定。
+        scale_mul = HY4_NATIVE_SCALE_MUL if low_first else 1.0
         layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data, requires_grad=False
+            layer.w13_weight_scale.data * scale_mul, requires_grad=False
         )
         layer.w2_weight_scale = Parameter(
-            layer.w2_weight_scale.data, requires_grad=False
+            layer.w2_weight_scale.data * scale_mul, requires_grad=False
         )
 
     def create_moe_runner(
