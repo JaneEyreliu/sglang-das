@@ -230,8 +230,13 @@ class HYV4HCPreLayer(nn.Module):
         fused = None
         if use_tilelang:
             fused = try_tilelang_ihc_pre(
-                hidden_states, self.hc_fn.weight, self.hc_scale, self.hc_base,
-                self.rms_norm_eps, self.hc_eps, self.magnitude,
+                hidden_states,
+                self.hc_fn.weight,
+                self.hc_scale,
+                self.hc_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.magnitude,
             )
         if fused is not None:
             reduced, post = fused
@@ -671,8 +676,7 @@ class HYV4Model(nn.Module):
         metadata split; the model owns only the data split below.
         """
         if not (
-            self.dsa_enable_prefill_cp
-            and forward_batch.extend_seq_lens_cpu is not None
+            self.dsa_enable_prefill_cp and forward_batch.extend_seq_lens_cpu is not None
         ):
             return False
         if not can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
@@ -811,6 +815,16 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 yield name, loaded_weight
 
         self.do_load_weights(mapped_weights())
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.n_routed_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = [HYV4ForCausalLM]

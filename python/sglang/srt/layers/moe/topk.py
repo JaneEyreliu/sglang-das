@@ -2444,7 +2444,22 @@ def _post_process_topk_ids(
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
         if remap_info is not None and not hip_deepep_postprocessed:
-            topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info)
+            if use_per_rank_shared_slots and not _use_aiter:
+                # The dispatch table contains routed experts only. A fused
+                # shared column holds a placeholder ID (num_logical_experts),
+                # which is out of bounds for that table. Match the CUDA path:
+                # remap routed columns, then assign the shared home-rank slots
+                # below using the physical routed-expert count.
+                # Aiter appends shared columns below, so all its current
+                # columns are routed and must go through the full remap.
+                shared_cols = topk_ids[:, -num_fused_shared_experts:]
+                routed_cols = topk_ids_logical_to_physical(
+                    topk_ids[:, :-num_fused_shared_experts], remap_info
+                )
+                topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
+                recorder_topk_ids = routed_cols
+            else:
+                topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info)
         # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a
