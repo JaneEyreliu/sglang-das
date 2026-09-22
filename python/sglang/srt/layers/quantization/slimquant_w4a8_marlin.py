@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
 import logging
 import os
 from typing import Dict, List, Optional
@@ -31,6 +30,7 @@ from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_moe_a2a_backend,
 )
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     W4A8_TPMOE_BACKEND_AITER,
     W4A8_TPMOE_BACKEND_AUTO,
@@ -50,7 +50,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 from sglang.srt.layers.quantization.slimquant_w4a8 import SlimQuantW4A8Int8LinearMethod
 from sglang.srt.layers.quantization.w4a8_utils import w4a8_weight_repack_impl
 from sglang.srt.utils import get_bool_env_var, set_weight_attrs
-from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
 # from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,24 @@ get_aiter_moe_config = None
 w4a8_moe_layout_shuffle_gemm2 = None
 
 
+def _hipc_weight_scale_multiplier() -> float:
+    """Convert legacy scale/16 weights to the selected DeepGEMM HIPC ABI.
+
+    ``legacy`` restores true scales for older kernels. ``kernel_x16`` keeps
+    scale/16 for kernels that apply the factor internally (20260915 image).
+    This is an explicit deployment setting, not a checkpoint-format guess.
+    """
+    convention = envs.SGLANG_W4A8_HIPC_SCALE_CONVENTION.get()
+    if convention == "legacy":
+        return 16.0
+    if convention == "kernel_x16":
+        return 1.0
+    raise ValueError(
+        "SGLANG_W4A8_HIPC_SCALE_CONVENTION must be legacy or kernel_x16, "
+        f"got {convention!r}"
+    )
+
+
 def _ensure_lightop_w4a8_marlin_available() -> None:
     global _lmslim_w4a8_marlin_available
     global fused_experts_impl_w4a8_marlin
@@ -78,11 +96,11 @@ def _ensure_lightop_w4a8_marlin_available() -> None:
     if _lmslim_w4a8_marlin_available:
         return
     try:
-        from lightop.moe import (
-            fused_experts_impl_w4a8_marlin as _fused_experts_impl_w4a8_marlin,
-        )
         from lightop._lmslim_native.layers.fused_moe import (
             w4a8_marlin as _lightop_w4a8_marlin,
+        )
+        from lightop.moe import (
+            fused_experts_impl_w4a8_marlin as _fused_experts_impl_w4a8_marlin,
         )
     except Exception as e:
         raise RuntimeError(
@@ -179,9 +197,13 @@ def _resolve_w4a8_tpmoe_backend(
         _ensure_aiter_w4a8_marlin_available()
     return backend
 
+
 _use_aiter_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE", default="true")
-_use_lightop_w4a8_marlin_moe = get_bool_env_var("SGLANG_USE_LIGHTOP_W4A8_MARLIN_MOE", default="true")
+_use_lightop_w4a8_marlin_moe = get_bool_env_var(
+    "SGLANG_USE_LIGHTOP_W4A8_MARLIN_MOE", default="true"
+)
 _use_int4_w4a8 = get_bool_env_var("SGLANG_USE_INT4_W4A8")
+
 
 class MarlinMoeWorkspace:
     """
@@ -707,6 +729,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         if not _use_lightop_w4a8_marlin_moe:
             if self.use_deepep:
                 from deepgemm import pack_w4a8_moe_hipc_weight
+
                 layer.w13_weight = Parameter(
                     pack_w4a8_moe_hipc_weight(layer.w13_weight.data),
                     requires_grad=False,
@@ -715,7 +738,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
                     pack_w4a8_moe_hipc_weight(layer.w2_weight.data),
                     requires_grad=False,
                 )
-                scale_mul = 16.0
+                scale_mul = _hipc_weight_scale_multiplier()
                 layer.w13_weight_scale = Parameter(
                     layer.w13_weight_scale.data * scale_mul,
                     requires_grad=False,
@@ -735,9 +758,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
                 #   - restore the true per-channel scale (x16)
                 def _to_triton_layout(w: torch.Tensor) -> torch.Tensor:
                     u = w.data.to(torch.uint8)
-                    u = ((((u & 0x0F) << 4) | ((u >> 4) & 0x0F)) ^ 0x88).to(
-                        torch.int8
-                    )
+                    u = ((((u & 0x0F) << 4) | ((u >> 4) & 0x0F)) ^ 0x88).to(torch.int8)
                     return u.contiguous()
 
                 if _use_aiter_moe:
@@ -778,9 +799,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         else:
             # Legacy lightop path: repack into the Marlin W4A8 layout.
             layer.w13_weight = Parameter(
-                w4a8_weight_repack_impl(
-                    layer.w13_weight, use_deepep=self.use_deepep
-                ),
+                w4a8_weight_repack_impl(layer.w13_weight, use_deepep=self.use_deepep),
                 requires_grad=False,
             )
             layer.w2_weight = Parameter(
@@ -1356,8 +1375,8 @@ class SlimQuantW4A8Int8AiterMoEMethod:
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.use_deepep:
-            # DeepEP grouped GEMM consumes the HIPC pack + x16 scale, not the
-            # Aiter TP shuffle layout. Matching SlimQuantW4A8Int8MarlinMoEMethod.
+            # DeepEP uses the HIPC pack and its selected scale convention, not
+            # the Aiter TP shuffle layout. Match the Marlin DeepEP path.
             from deepgemm import pack_w4a8_moe_hipc_weight
 
             layer.w13_weight = Parameter(
@@ -1368,7 +1387,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
                 pack_w4a8_moe_hipc_weight(layer.w2_weight.data),
                 requires_grad=False,
             )
-            scale_mul = 16.0
+            scale_mul = _hipc_weight_scale_multiplier()
             layer.w13_weight_scale = Parameter(
                 layer.w13_weight_scale.data * scale_mul, requires_grad=False
             )
@@ -1596,9 +1615,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
             )
             valid = ~invalid
             if not valid.any():
-                return torch.zeros(
-                    orig_m, k, device=x.device, dtype=torch.bfloat16
-                )
+                return torch.zeros(orig_m, k, device=x.device, dtype=torch.bfloat16)
             # DeepEP pads unused top-k slots with a dummy global id. aiter_moe
             # has no skip mask, so compact to valid (token, expert) pairs with
             # topk=1 and scatter-add. Dummy traffic must not run as expert 0.
@@ -1676,8 +1693,6 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         )
         if scatter_idx is None:
             return output
-        combined = torch.zeros(
-            orig_m, k, device=output.device, dtype=output.dtype
-        )
+        combined = torch.zeros(orig_m, k, device=output.device, dtype=output.dtype)
         combined.index_add_(0, scatter_idx, output)
         return combined

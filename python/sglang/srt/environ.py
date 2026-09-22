@@ -964,6 +964,9 @@ class Envs:
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     # Global SlimQuant W4A8 TP-MoE backend selection.
     SGLANG_W4A8_TPMOE_BACKEND = EnvStr("auto")
+    # Legacy HIPC expects true scales; newer kernels multiply scale/16 by 16.
+    # Select explicitly to avoid changing existing installations silently.
+    SGLANG_W4A8_HIPC_SCALE_CONVENTION = EnvStr("legacy")
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)

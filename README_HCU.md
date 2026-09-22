@@ -251,6 +251,22 @@ curl -X POST http://localhost:30002/v1/completions \
   }'
 ```
 
+## W4A8 DeepGEMM HIPC scale 兼容
+
+`SGLANG_W4A8_HIPC_SCALE_CONVENTION` 显式选择 DeepGEMM HIPC 的权重 scale
+约定，仅影响 SlimQuant Marlin/Aiter 的 DeepEP HIPC 加载路径：
+
+- `legacy`（默认）：加载时将内部的 scale/16 乘回 16，保留旧内核行为。
+- `kernel_x16`：加载时保留 scale/16，供内部执行 ×16 的新版 HIPC 内核使用。
+  源适配针对 20260915 镜像；部署时应确认所装 DeepGEMM 内核确实采用此约定。
+
+```bash
+export SGLANG_W4A8_HIPC_SCALE_CONVENTION=kernel_x16
+```
+
+在加载模型前设置，并在使用该 HIPC 路径的所有 worker 上保持一致。此选项不改变
+checkpoint 格式，也不改变非 HIPC 后端；HY4 checkpoint 格式转换由加载器独立完成。
+
 ## Known Issue
 - 无
 
