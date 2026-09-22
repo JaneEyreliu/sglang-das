@@ -53,6 +53,7 @@ from sglang.srt.disaggregation.utils import (
     get_kv_class,
     is_aborted,
     is_dsv4_c128_online_enabled,
+    is_external_kv_load_failure,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_pp,
@@ -356,12 +357,14 @@ class PrefillBootstrapQueue:
         )
         layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
         layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
+        cp_cache_layer_split = getattr(self.token_to_kv_pool, "requires_descriptor_matched_transfer", False)
         transfer_draft_cache = (
             (self.pp_size <= 1 or self.pp_rank == self.pp_size - 1)
             and (
                 not layer_shard_enabled
                 or layer_shard_rank == layer_shard_size - 1
             )
+            and (not cp_cache_layer_split or self.token_to_kv_pool.cp_rank == self.token_to_kv_pool.cp_size - 1)
         )
         kv_args.prefill_start_layer = (
             getattr(
@@ -472,6 +475,9 @@ class PrefillBootstrapQueue:
         )
 
         if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            from sglang.srt.mem_cache.cp_cache_layer_split.transfer import configure_v4_transfer
+
+            configure_v4_transfer(kv_args, self.token_to_kv_pool, draft_kv_pool)
             # V4's KVCache is organized by compression-ratio
             # buckets rather than by layer.
             kv_args.mla_compression_ratios = list(
@@ -1568,6 +1574,25 @@ class SchedulerDisaggregationPrefillMixin:
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):
                     self.optimistic_release_and_requeue(req)
+                    advance_logprob_pt(i, req)
+                    continue
+
+                # KV this forward consumed never arrived, so it must not be
+                # sent on: finish here as handle_bootstrap_failure does. Kept
+                # narrower than is_aborted() because a user abort already
+                # reaches decode via its own AbortReq.
+                if is_external_kv_load_failure(req):
+                    req.update_finish_state()
+                    self.clear_pending_chunk_send(req)
+                    if req.disagg_kv_sender is not None:
+                        req.disagg_kv_sender.abort()
+                    maybe_release_metadata_buffer(
+                        req, self.req_to_metadata_buffer_idx_allocator
+                    )
+                    req.pending_bootstrap = False
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.set_completion_time()
+                    self.output_streamer.stream_output([req], req.return_logprob)
                     advance_logprob_pt(i, req)
                     continue
 

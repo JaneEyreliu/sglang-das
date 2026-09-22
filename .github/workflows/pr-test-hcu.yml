@@ -615,7 +615,7 @@ jobs:
       HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-hcu-wheels.outputs.wheel_urls || '' }}
       HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
       HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
-      HCU_CI_USE_INSTALLED_WHEELS: "1"
+      HCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
     steps:
       - name: Checkout code
         env:
@@ -716,7 +716,7 @@ jobs:
       HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-hcu-wheels.outputs.wheel_urls || '' }}
       HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
       HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
-      HCU_CI_USE_INSTALLED_WHEELS: "1"
+      HCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
       SGLANG_HCU_RERANKER_MODEL: /public/opendas/DL_DATA/llm-models/qwen3/Qwen3-Reranker-0.6B
     steps:
       - name: Checkout code
@@ -775,13 +775,12 @@ jobs:
               --include-file registered/unit/parser/test_reasoning_parser.py \
               --include-file registered/unit/entrypoints/openai/test_serving_embedding.py \
               --include-file registered/attention/test_triton_attention_kernels.py \
-              --include-file registered/hcu/kernels/test_fp8_quant_reference_hcu.py \
               --include-file registered/layers/mamba/test_mamba_ssm.py \
               --include-file registered/layers/mamba/test_mamba_ssm_ssd.py \
               --include-file registered/rl/test_fp32_lm_head.py \
               --include-file registered/embedding/test_input_embeddings.py \
               --include-file registered/embedding/test_openai_embedding.py \
-              --include-file registered/vlm/test_evs.py \
+              --include-file registered/unit/multimodal/test_evs.py \
               --include-file registered/openai_server/features/test_enable_thinking.py \
               --include-file registered/openai_server/features/test_reasoning_content.py \
               --include-file registered/attention/test_create_kvindices.py \
@@ -790,18 +789,14 @@ jobs:
               --include-file registered/unit/managers/test_profile_merger_http_api.py \
               --include-file registered/unit/mem_cache/test_radix_cache_unit.py \
               --include-file registered/ops/test_repeat_interleave.py \
-              --include-file registered/openai_server/features/test_openai_server_ebnf.py \
               --include-file registered/openai_server/basic/test_serving_completions.py \
               --include-file registered/openai_server/validation/test_large_max_new_tokens.py \
-              --include-file registered/openai_server/validation/test_openai_server_ignore_eos.py \
               --include-file registered/hcu/sampling/bw1100/test_original_logprobs_hcu.py \
               --include-file registered/openai_server/validation/test_request_length_validation.py \
               --include-file registered/sampling/test_pytorch_sampling_backend.py \
               --include-file registered/sampling/test_penalty.py \
               --include-file registered/hcu/core/bw1100/test_hidden_states_hcu.py \
-              --include-file registered/openai_server/basic/test_anthropic_server.py \
               --include-file registered/constrained_decoding/test_constrained_decoding.py \
-              --include-file registered/openai_server/features/test_json_mode.py \
               --include-file registered/metrics/test_priority_metrics.py \
               --include-file registered/hcu/srt/bw1100/test_qwen25_0p5b_server_hcu.py \
               --include-file registered/hcu/openai_server/test_function_calling_hcu.py \

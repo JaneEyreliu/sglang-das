@@ -604,13 +604,16 @@ class HYV4DecoderLayer(nn.Module):
                 hidden_states, forward_batch, self.self_attn.prepare_qkv_latent
             )
         )
-        hidden_states = self.self_attn(
-            positions,
-            hidden_states,
-            forward_batch,
-            zero_allocator,
-            prev_topk_indices=prev_topk_indices,
-        )
+        try:
+            hidden_states = self.self_attn(
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                prev_topk_indices=prev_topk_indices,
+            )
+        finally:
+            get_attn_tp_context().clear_attn_inputs()
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:

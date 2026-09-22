@@ -684,6 +684,8 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return SlimQuantW4A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if get_moe_a2a_backend().is_megamoe():
+                return SlimQuantW4A8Int8MarlinMoEMethod(self)
             dspark_backend_override = get_dspark_w4a8_tpmoe_backend_override()
             if dspark_backend_override is None:
                 requested_backend = envs.SGLANG_W4A8_TPMOE_BACKEND.get()
@@ -855,11 +857,13 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sglang.srt.layers.moe.mega_moe import (
-            build_hcu_int4_mega_moe_experts_weights,
-        )
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                build_hcu_w4a8_mega_moe_experts_weights,
+            )
 
-        build_hcu_int4_mega_moe_experts_weights(layer)
+            build_hcu_w4a8_mega_moe_experts_weights(layer)
+            return
         if not _use_lightop_w4a8_marlin_moe:
             if self.use_deepep:
                 # hipc kernel 的口径是 high-first nibble + scale/16（kernel
@@ -1538,11 +1542,6 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sglang.srt.layers.moe.mega_moe import (
-            build_hcu_int4_mega_moe_experts_weights,
-        )
-
-        build_hcu_int4_mega_moe_experts_weights(layer)
         if self.use_deepep:
             # DeepEP grouped GEMM consumes the HIPC pack + x16 scale, not the
             # Aiter TP shuffle layout. Matching SlimQuantW4A8Int8MarlinMoEMethod.

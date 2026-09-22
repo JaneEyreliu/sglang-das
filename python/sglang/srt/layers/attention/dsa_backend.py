@@ -203,6 +203,11 @@ def _check_attn_sink_supported(
 ) -> None:
     if attn_sink is None:
         return
+    # HCU's native flash_mla_with_kvcache (dsa impl "flashmla_kv") accepts the
+    # per-head attn_sink argument directly, so it can host HYV4's learnable
+    # sinks with an fp8 KV cache. The plumbing lives in _forward_flashmla_kv.
+    if dsa_impl == "flashmla_kv" and _is_hcu:
+        return
     if dsa_impl not in _ATTN_SINK_SUPPORTED_IMPLS:
         raise NotImplementedError(
             f"learnable attention sinks (HYV4) are only implemented for DSA impls "
@@ -2100,6 +2105,15 @@ class DeepseekSparseAttnBackend(
                     topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
                 topk_indices_offset = metadata.topk_indices_offset
                 assert topk_indices_offset is not None
+                if topk_indices_offset.shape[0] < topk_indices.shape[0]:
+                    # CP/MTP may pad query rows beyond the real ragged metadata.
+                    # _pad_topk_indices marks those rows -1, so zero offsets
+                    # preserve the invalid indices while aligning the shapes.
+                    padded_offsets = topk_indices_offset.new_zeros(
+                        (topk_indices.shape[0], *topk_indices_offset.shape[1:])
+                    )
+                    padded_offsets[: topk_indices_offset.shape[0]] = topk_indices_offset
+                    topk_indices_offset = padded_offsets
                 mask = topk_indices != -1
                 topk_indices_offset = (
                     topk_indices_offset.unsqueeze(1)
@@ -2294,6 +2308,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
                 forward_batch=forward_batch,
+                attn_sink=attn_sink,
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -2454,6 +2469,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
                 forward_batch=forward_batch,
+                attn_sink=attn_sink,
             )
         elif self.dsa_decode_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -2985,6 +3001,7 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
         forward_batch: ForwardBatch,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         flash_mla_with_kvcache = get_flashmla_op(
             "flash_mla_with_kvcache", is_hcu=_is_hcu
@@ -3038,6 +3055,13 @@ class DeepseekSparseAttnBackend(
         if needs_repad and num_valid == 0:
             o = q_input.new_zeros((0, 1, target_q_heads, v_head_dim))
         else:
+            attn_sink_kv = attn_sink
+            if attn_sink_kv is not None and target_q_heads != num_q_heads:
+                # Match the padded q-head count; the padded heads' output is
+                # trimmed after the kernel, so the pad sink value is inert.
+                sink_padded = attn_sink_kv.new_zeros(target_q_heads)
+                sink_padded[:num_q_heads] = attn_sink_kv
+                attn_sink_kv = sink_padded
             o, _ = flash_mla_with_kvcache(
                 q=q_input,
                 k_cache=kv_cache,
@@ -3052,6 +3076,7 @@ class DeepseekSparseAttnBackend(
                     (q_input.shape[0], 0), dtype=torch.int32, device=q_input.device
                 ),
                 is_fp8_kvcache=True,
+                attn_sink=attn_sink_kv,
             )
 
         if needs_repad:
@@ -3561,7 +3586,7 @@ class DeepseekSparseAttnBackend(
         if not self.use_mha and self.enable_auto_select_prefill_impl:
             if self.dsa_kv_cache_store_fp8:
                 if (
-                    is_blackwell()
+                    (is_blackwell() or _is_hcu())
                     and forward_batch is not None
                     and effective_forward_mode(forward_batch) == ForwardMode.EXTEND
                 ):
