@@ -23,10 +23,13 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import (
     _tag_groups_for_flashinfer_allreduce_only,
+    get_hyv4_gate_tp_group,
+    initialize_hyv4_gate_tp,
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
@@ -275,6 +278,49 @@ def _init_parallel_groups(
         max_world_size=server_args.max_ep_size,
     )
     _tag_groups_for_flashinfer_allreduce_only()
+    if server_args.hyv4_linear_gate_tp_size > 1:
+        if model_config.hf_config.architectures != ["HYV4ForCausalLM"]:
+            raise ValueError(
+                "--hyv4-linear-gate-tp-size is only supported for HYV4ForCausalLM"
+            )
+        if attn_cp_size != 1 or dcp_size != 1 or backend != "nccl":
+            raise ValueError("HYV4 gate TP requires NCCL/RCCL with CP=DCP=1")
+        gate_graph_enabled = (
+            server_args.cuda_graph_config.decode.backend == Backend.FULL
+        )
+        initialize_hyv4_gate_tp(
+            server_args.hyv4_linear_gate_tp_size,
+            backend,
+            use_pynccl=gate_graph_enabled,
+        )
+        # Materialize subgroup transport resources before the KV memory profile.
+        gate_group = get_hyv4_gate_tp_group()
+        hf_config = model_config.hf_config
+        warmup = torch.zeros(
+            (gate_group.world_size, hf_config.hidden_size // gate_group.world_size),
+            dtype=torch.bfloat16,
+            device=f"cuda:{gpu_id}",
+        )
+        received = torch.empty_like(warmup)
+        dist.all_to_all_single(received, warmup, group=gate_group.device_group)
+        partial_gate = torch.zeros(
+            (
+                gate_group.world_size,
+                hf_config.num_attention_heads * hf_config.v_head_dim,
+            ),
+            dtype=torch.float32,
+            device=f"cuda:{gpu_id}",
+        )
+        dist.all_reduce(partial_gate, group=gate_group.device_group)
+        if gate_graph_enabled:
+            comm = gate_group.pynccl_comm
+            if comm is None or not comm.available:
+                raise RuntimeError("HYV4 gate CUDA graph requires PyNCCL/RCCL")
+            # Materialize P2P connections before memory profiling and capture.
+            with comm.change_state(enable=True):
+                comm.all_to_all_single(received.view(-1), warmup.view(-1))
+                comm.all_reduce(partial_gate)
+        torch.cuda.synchronize(gpu_id)
     initialize_dp_attention(
         server_args=server_args,
         model_config=model_config,

@@ -54,6 +54,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.hyv4_gate_tp import GateTPGraphPlan
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -227,6 +228,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- core state ------------------------------------------------
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
+        self.hyv4_gate_tp = (
+            getattr(model_runner.server_args, "hyv4_linear_gate_tp_size", 1) > 1
+            and not model_runner.is_draft_worker
+        )
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_mlp_tp_gather = require_mlp_tp_gather(
             model_runner.server_args
@@ -335,6 +340,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.captured_req_width
         )
+        if self.hyv4_gate_tp:
+            # Local request-pool limits can trim buckets differently. Detect
+            # mismatches before any peer starts capturing collectives.
+            signature = (self.capture_bs, self.captured_req_width, self.dsa_dual_graph)
+            signatures = [None] * model_runner.tp_group.world_size
+            torch.distributed.all_gather_object(
+                signatures, signature, group=model_runner.tp_group.cpu_group
+            )
+            if any(other != signature for other in signatures):
+                raise ValueError(
+                    f"HYV4 gate CUDA graph capture layouts differ: {signatures}"
+                )
+            logger.info(
+                "HYV4 gate TP CUDA graph: synchronized DP buckets=%s; "
+                "graph/eager and DSA variant selection coordinated across %d ranks",
+                self.capture_bs,
+                model_runner.tp_group.world_size,
+            )
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
@@ -562,6 +585,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         the sparse (full indexer) graph. Returns None when dual-graph is off."""
         if not getattr(self, "dsa_dual_graph", False):
             return None
+        plan = getattr(forward_batch, "hyv4_gate_tp_graph_plan", None)
+        if getattr(self, "hyv4_gate_tp", False) and plan is not None:
+            return plan.dsa_variant
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
             # Host-side mirror (maintained incrementally for plain decode) — no
@@ -651,6 +677,44 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         return max(request_counts)
 
+    def prepare_hyv4_gate_graph(
+        self, forward_batch: ForwardBatch, *, reuse_prepared: bool = False
+    ) -> bool:
+        # EAGLE prepares verify buffers on the plan stream, BEFORE model.forward.
+        # Its gate plan must already select the common bucket at load_batch;
+        # changing that bucket afterwards would reuse buffers of the wrong size.
+        plan = getattr(forward_batch, "hyv4_gate_tp_graph_plan", None)
+        if (
+            reuse_prepared
+            and plan is not None
+            and not forward_batch.needs_forward_metadata_init()
+        ):
+            return plan.can_run and self.can_run_graph(forward_batch)
+        # Called for EVERY forward mode, before branching to graph or eager.
+        # Otherwise an idle peer could enter a collective that an EXTEND peer
+        # skipped. Clear any previous plan before checking local eligibility.
+        forward_batch.hyv4_gate_tp_graph_plan = None
+        local_can_run = (
+            forward_batch.forward_mode.is_cuda_graph()
+            and self.can_run_graph(forward_batch)
+        )
+        plan = GateTPGraphPlan.synchronize(
+            forward_batch.batch_size,
+            local_can_run,
+            self._resolve_dsa_variant(forward_batch),
+            self.model_runner.tp_group,
+        )
+        forward_batch.hyv4_gate_tp_graph_plan = plan
+        return plan.can_run and self.can_run_graph(forward_batch)
+
+    def _decode_graph_batch_size(self, forward_batch: ForwardBatch) -> int:
+        plan = getattr(forward_batch, "hyv4_gate_tp_graph_plan", None)
+        if getattr(self, "hyv4_gate_tp", False) and plan is not None:
+            return plan.batch_size
+        if self.require_mlp_tp_gather:
+            return self._max_dp_batch_size(forward_batch)
+        return forward_batch.batch_size
+
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -677,10 +741,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
-        if self.require_mlp_tp_gather:
-            cuda_graph_bs = self._max_dp_batch_size(forward_batch)
-        else:
-            cuda_graph_bs = forward_batch.batch_size
+        cuda_graph_bs = self._decode_graph_batch_size(forward_batch)
 
         graph_key = self._make_graph_key(
             cuda_graph_bs,
@@ -1324,11 +1385,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
         else:
             raw_num_token = raw_bs * self.captured_req_width
-            if self.require_mlp_tp_gather:
-                max_batch_size = self._max_dp_batch_size(forward_batch)
-                bs = self._pad_to_bucket(max_batch_size, self.capture_bs)
-            else:
-                bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+            bs = self._pad_to_bucket(
+                self._decode_graph_batch_size(forward_batch), self.capture_bs
+            )
             padded_num_tokens = bs * self.captured_req_width
             graph_size_key = self._capture_graph_size(
                 bs=bs, num_tokens=padded_num_tokens

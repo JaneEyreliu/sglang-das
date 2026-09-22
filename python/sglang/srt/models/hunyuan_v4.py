@@ -28,6 +28,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_attn_tp_group, get_pp_group
+from sglang.srt.distributed.parallel_state import get_hyv4_gate_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
@@ -51,8 +52,13 @@ from sglang.srt.layers.hy4_ihc_tilelang import (
     try_tilelang_ihc_post,
     try_tilelang_ihc_pre,
 )
+from sglang.srt.layers.hyv4_gate_tp import GateTPBatch
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.utils.cp_utils import (
@@ -68,6 +74,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     AttnForwardMethod,
 )
@@ -230,8 +237,13 @@ class HYV4HCPreLayer(nn.Module):
         fused = None
         if use_tilelang:
             fused = try_tilelang_ihc_pre(
-                hidden_states, self.hc_fn.weight, self.hc_scale, self.hc_base,
-                self.rms_norm_eps, self.hc_eps, self.magnitude,
+                hidden_states,
+                self.hc_fn.weight,
+                self.hc_scale,
+                self.hc_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.magnitude,
             )
         if fused is not None:
             reduced, post = fused
@@ -421,20 +433,54 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         )
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
-        self.linear_gate = ColumnParallelLinear(
-            config.hidden_size,
-            config.num_attention_heads * config.v_head_dim,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("linear_gate", prefix),
+        # Keep the trunk input-sharded, but the single MTP gate DP-local.
+        # This costs 168 MiB/rank more than sharding that one BF16 gate and
+        # avoids adding gate collectives to the draft/extend graph runners.
+        # Resolve per layer: target and draft share the same ServerArgs.
+        target_gate_tp_size = getattr(
+            get_global_server_args(), "hyv4_linear_gate_tp_size", 1
         )
+        self.gate_tp_size = 1 if is_nextn else target_gate_tp_size
+        if is_nextn and target_gate_tp_size > 1:
+            logger.info(
+                "HYV4 MTP gate layout: target TP%d, draft TP1", target_gate_tp_size
+            )
+        if self.gate_tp_size > 1:
+            if attn_tp_size != 1:
+                raise ValueError("HYV4 gate TP requires attention TP1")
+            gate_group = get_hyv4_gate_tp_group()
+            if gate_group.world_size != self.gate_tp_size:
+                raise ValueError(
+                    "HYV4 gate TP group does not match the configured size"
+                )
+            self.linear_gate = RowParallelLinear(
+                config.hidden_size,
+                config.num_attention_heads * config.v_head_dim,
+                bias=False,
+                input_is_parallel=True,
+                reduce_results=False,
+                quant_config=quant_config,
+                tp_rank=gate_group.rank_in_group,
+                tp_size=gate_group.world_size,
+                prefix=add_prefix("linear_gate", prefix),
+            )
+            gate_width = self.linear_gate.output_size
+        else:
+            self.linear_gate = ColumnParallelLinear(
+                config.hidden_size,
+                config.num_attention_heads * config.v_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=add_prefix("linear_gate", prefix),
+            )
+            gate_width = self.linear_gate.output_size_per_partition
         self.local_gate_width = self.num_local_heads * config.v_head_dim
-        if self.linear_gate.output_size_per_partition != self.local_gate_width:
+        if gate_width != self.local_gate_width:
             raise ValueError(
                 "HYV4 attention gate shard width must match the local attention "
-                f"output width: {self.linear_gate.output_size_per_partition} != "
+                f"output width: {gate_width} != "
                 f"{self.local_gate_width}"
             )
         self.learnable_sink_param = nn.Parameter(
@@ -449,7 +495,13 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         start = get_parallel().attn_tp_rank * heads
         param.data.copy_(loaded_weight[start : start + heads].float())
 
-    def prepare_attention_output_gate(self, hidden_states):
+    def prepare_attention_output_gate(self, hidden_states, gate_tp_batch=None):
+        if self.gate_tp_size > 1:
+            if gate_tp_batch is None:
+                raise RuntimeError(
+                    "HYV4 TP gate must be computed before the empty-attention shortcut"
+                )
+            return gate_tp_batch.project(hidden_states, self.linear_gate)
         return self.linear_gate(hidden_states)[0]
 
     def apply_attention_output_gate(self, attn_out, gate):
@@ -530,6 +582,7 @@ class HYV4DecoderLayer(nn.Module):
         forward_batch,
         zero_allocator,
         prev_topk_indices=None,
+        gate_tp_batch=None,
     ):
         # The iHC stream (and therefore ``residual``) stays in whatever layout
         # the layer received: SCATTERED when attn_tp_size > 1, otherwise the DP
@@ -541,6 +594,15 @@ class HYV4DecoderLayer(nn.Module):
         if self.dp_attn_scattered:
             # Attention needs every token of the DP rank (TP_ATTN_FULL).
             hidden_states = hyv4_attn_tp_gather(hidden_states)
+        attention_kwargs = {}
+        if self.self_attn.gate_tp_size > 1:
+            # All node-local peers participate even when this rank has no tokens.
+            # The parent attention short-circuits empty inputs, so run gate first.
+            attention_kwargs["attention_output_gate"] = (
+                self.self_attn.prepare_attention_output_gate(
+                    hidden_states, gate_tp_batch
+                )
+            )
         get_attn_tp_context().set_attn_inputs(
             AttentionInputs(
                 hidden_states, forward_batch, self.self_attn.prepare_qkv_latent
@@ -553,6 +615,7 @@ class HYV4DecoderLayer(nn.Module):
                 forward_batch,
                 zero_allocator,
                 prev_topk_indices=prev_topk_indices,
+                **attention_kwargs,
             )
         finally:
             get_attn_tp_context().clear_attn_inputs()
@@ -671,8 +734,7 @@ class HYV4Model(nn.Module):
         metadata split; the model owns only the data split below.
         """
         if not (
-            self.dsa_enable_prefill_cp
-            and forward_batch.extend_seq_lens_cpu is not None
+            self.dsa_enable_prefill_cp and forward_batch.extend_seq_lens_cpu is not None
         ):
             return False
         if not can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
@@ -719,6 +781,13 @@ class HYV4Model(nn.Module):
         # Shared-indexer layers reuse the previous layer's topk, so carry it
         # through the loop the same way DeepseekV2Model.forward does.
         index_topk_share = IndexTopKShareState(forward_batch, None)
+        gate_tp_batch = None
+        if getattr(get_global_server_args(), "hyv4_linear_gate_tp_size", 1) > 1:
+            gate_tp_batch = GateTPBatch.create(
+                hidden_states.shape[0],
+                get_hyv4_gate_tp_group(),
+                capture=get_is_capture_mode(),
+            )
         for layer in self.layers:
             hidden_states, topk_indices = layer(
                 positions,
@@ -726,6 +795,7 @@ class HYV4Model(nn.Module):
                 forward_batch,
                 zero_allocator,
                 prev_topk_indices=index_topk_share.topk_indices,
+                gate_tp_batch=gate_tp_batch,
             )
             index_topk_share.update(topk_indices)
         index_topk_share.publish()

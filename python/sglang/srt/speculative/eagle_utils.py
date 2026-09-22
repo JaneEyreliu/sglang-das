@@ -629,16 +629,17 @@ def eagle_prepare_for_verify(
     )
 
     # Run attention backend plan and cuda graph preparation
-    can_run_cuda_graph = bool(
-        target_worker.model_runner.decode_cuda_graph_runner
-        and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
-            verify_forward_batch
+    graph_runner = target_worker.model_runner.decode_cuda_graph_runner
+    if graph_runner is not None and getattr(graph_runner, "hyv4_gate_tp", False):
+        # Gate peers must agree before load_batch sizes the static verify
+        # buffers. ModelRunner reuses this plan when metadata is already ready.
+        can_run_cuda_graph = graph_runner.prepare_hyv4_gate_graph(verify_forward_batch)
+    else:
+        can_run_cuda_graph = bool(
+            graph_runner and graph_runner.can_run_graph(verify_forward_batch)
         )
-    )
     if can_run_cuda_graph:
-        target_worker.model_runner.decode_cuda_graph_runner.load_batch(
-            verify_forward_batch
-        )
+        graph_runner.load_batch(verify_forward_batch)
         verify_forward_batch.mark_forward_metadata_ready()
     # Non-cuda-graph: defer init to forward_extend, which runs after
     # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing

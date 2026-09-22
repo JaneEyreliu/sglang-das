@@ -303,6 +303,7 @@ class DeepseekMLAForwardMixin:
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        attention_output_gate: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
@@ -678,7 +679,13 @@ class DeepseekMLAForwardMixin:
             # Only models that own the MLA output gate (currently HYV4) emit
             # this extra slot, so every other caller keeps the 10-tuple.
             *(
-                (self.prepare_attention_output_gate(hidden_states),)
+                (
+                    (
+                        attention_output_gate
+                        if attention_output_gate is not None
+                        else self.prepare_attention_output_gate(hidden_states)
+                    ),
+                )
                 if hasattr(self, "prepare_attention_output_gate")
                 else ()
             ),
