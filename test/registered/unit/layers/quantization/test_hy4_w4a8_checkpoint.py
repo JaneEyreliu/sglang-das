@@ -168,5 +168,73 @@ def test_manifest_selects_format_without_hf_quantization_config(tmp_path, fmt):
         assert get_quant_config(model, SimpleNamespace(), {}).checkpoint_format == fmt
 
 
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
+@pytest.mark.parametrize("projection", ["gate_up", "down"])
+def test_shared_weights_load_real_tp_shards(monkeypatch, tp_size, projection):
+    from sglang.srt.layers import linear as linear_module
+
+    monkeypatch.setattr(linear_module, "_disable_hip_linear_quant", False)
+    # Strategy 3 retains the row-major INT8 layout without kernel autotuning.
+    monkeypatch.setenv("W8A8_SUPPORT_METHODS", "3")
+    config = SlimQuantW4A8Int8MarlinConfig(checkpoint_format="hy4_w4a8_v1")
+    input_size, output_size = (16, 32) if projection == "gate_up" else (32, 16)
+    parts = 2 if projection == "gate_up" else 1
+    weights = [
+        (
+            (
+                torch.arange(output_size * input_size).view(output_size, input_size)
+                + 3 * shard
+            )
+            % 16
+            - 8
+        ).to(torch.int8)
+        for shard in range(parts)
+    ]
+    scales = [
+        torch.arange(1, output_size + 1, dtype=torch.float32).view(-1, 1) / 8 + shard
+        for shard in range(parts)
+    ]
+    for rank in range(tp_size):
+        common = dict(bias=False, quant_config=config, tp_rank=rank, tp_size=tp_size)
+        prefix = "model.layers.0.mlp.shared_experts."
+        if projection == "gate_up":
+            layer = linear_module.MergedColumnParallelLinear(
+                input_size,
+                [output_size, output_size],
+                prefix=prefix + "gate_up_proj",
+                **common,
+            )
+        else:
+            layer = linear_module.RowParallelLinear(
+                input_size,
+                output_size,
+                prefix=prefix + "down_proj",
+                **common,
+            )
+        assert isinstance(layer.quant_method, HYV4SharedExpertLinearMethod)
+        for shard, (values, scale) in enumerate(zip(weights, scales)):
+            packed = (values[:, ::2].to(torch.uint8) & 15) | (
+                (values[:, 1::2].to(torch.uint8) & 15) << 4
+            )
+            args = (shard,) if projection == "gate_up" else ()
+            layer.weight.weight_loader(layer.weight, packed.view(torch.int8), *args)
+            layer.weight_scale.weight_loader(layer.weight_scale, scale, *args)
+        layer.quant_method.process_weights_after_loading(layer)
+        if projection == "gate_up":
+            span = slice(
+                rank * output_size // tp_size, (rank + 1) * output_size // tp_size
+            )
+            expected_weight = torch.cat([w[span] for w in weights])
+            expected_scale = torch.cat([s[span] for s in scales])
+        else:
+            span = slice(
+                rank * input_size // tp_size, (rank + 1) * input_size // tp_size
+            )
+            expected_weight = weights[0][:, span]
+            expected_scale = scales[0]
+        torch.testing.assert_close(layer.weight, expected_weight)
+        torch.testing.assert_close(layer.weight_scale, expected_scale)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
