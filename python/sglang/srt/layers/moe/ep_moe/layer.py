@@ -1052,8 +1052,9 @@ class DeepEPMoE(FusedMoE):
                     f"{num_recv_tokens_per_expert}"
                 )
 
-            # Both HIPC kernels consume the true scale restored by
-            # process_weights_after_loading; no forward-time rescaling is needed.
+            # 两个 HIPC kernel 内部都补 x16，所以权重侧交给它们的是
+            # high-first nibble + scale/16（见 slimquant_w4a8_marlin.py 的
+            # hipc 分支）；forward 期不再做任何 rescale。
 
             # DeepEP normal dispatch is token-major. Scatter it into contiguous
             # expert segments and retain output_index for the weighted gather.
