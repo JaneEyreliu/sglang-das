@@ -106,6 +106,18 @@ def hyv4_dp_attn_scattered() -> bool:
     return is_dp_attention_enabled() and get_parallel().attn_tp_size > 1
 
 
+def hyv4_shared_experts_fusion_disable_reason(config, quant_config):
+    # The fused MoE has a single activation limit for all expert slots, while
+    # HYV4's shared expert must remain unclamped. Keep it on the separate MLP
+    # path until fusion supports distinct routed/shared activation semantics.
+    if (
+        getattr(config, "swiglu_limit", None) is not None
+        and (getattr(config, "n_shared_experts", 0) or 0) > 0
+    ):
+        return "HYV4 SwiGLU clipping applies to routed experts only."
+    return None
+
+
 def hyv4_attn_tp_split(tensor: torch.Tensor) -> torch.Tensor:
     """TP_ATTN_FULL -> SCATTERED along the token dim. A view, no communication.
 
@@ -140,6 +152,34 @@ def hyv4_attn_tp_reduce_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
     output = hyv4_attn_tp_split(hidden_states)
     attn_tp_reduce_scatter_tensor(output, hidden_states)
     return output
+
+
+def normalize_hyv4_weight_name(name: str) -> str:
+    """Accept component-suffixed HYV4 exports alongside original weight names.
+
+    This changes names only; packed INT4 bytes and scales are not converted.
+    Direct Parameter attributes must not acquire a Linear-style weight suffix.
+    """
+    for source, target in (
+        (".weight.weight", ".weight"),
+        (".bias.weight", ".bias"),
+        (".weight.packed", ".weight"),
+        (".weight.scale", ".weight_scale"),
+    ):
+        if name.endswith(source):
+            return name.removesuffix(source) + target
+    if name.endswith(
+        (
+            ".learnable_sink_param.weight",
+            ".e_score_correction_bias.weight",
+            ".hc_base.weight",
+            ".hc_scale.weight",
+            ".hc_head_base.weight",
+            ".hc_head_scale.weight",
+        )
+    ):
+        return name.removesuffix(".weight")
+    return name
 
 
 def permute_hyv4_indexer_weight(name, loaded_weight, config):
@@ -230,8 +270,13 @@ class HYV4HCPreLayer(nn.Module):
         fused = None
         if use_tilelang:
             fused = try_tilelang_ihc_pre(
-                hidden_states, self.hc_fn.weight, self.hc_scale, self.hc_base,
-                self.rms_norm_eps, self.hc_eps, self.magnitude,
+                hidden_states,
+                self.hc_fn.weight,
+                self.hc_scale,
+                self.hc_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.magnitude,
             )
         if fused is not None:
             reduced, post = fused
@@ -671,8 +716,7 @@ class HYV4Model(nn.Module):
         metadata split; the model owns only the data split below.
         """
         if not (
-            self.dsa_enable_prefill_cp
-            and forward_batch.extend_seq_lens_cpu is not None
+            self.dsa_enable_prefill_cp and forward_batch.extend_seq_lens_cpu is not None
         ):
             return False
         if not can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
@@ -750,6 +794,9 @@ class HYV4Model(nn.Module):
 
 class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    shared_experts_fusion_disable_reason = staticmethod(
+        hyv4_shared_experts_fusion_disable_reason
+    )
 
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
@@ -801,6 +848,7 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             for name, loaded_weight in weights:
                 if name.startswith("model.mtp_layers."):
                     continue
+                name = normalize_hyv4_weight_name(name)
                 loaded_weight = permute_hyv4_indexer_weight(
                     name, loaded_weight, self.config
                 )
