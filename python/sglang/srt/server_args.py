@@ -1220,6 +1220,15 @@ class ServerArgs:
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
         NS("parallel"),
     ] = False
+    # HYV4 gate-only TP leaves the attention/KV data parallel layout intact.
+    hyv4_linear_gate_tp_size: A[
+        int,
+        Arg(
+            help="HYV4 linear_gate tensor parallel size within one node (DP decode; eager or full CUDA graph).",
+            choices=[1, 8],
+        ),
+        NS("parallel"),
+    ] = 1
     # DP attention
     enable_dp_attention: A[
         bool,
@@ -10078,7 +10087,78 @@ class ServerArgs:
                 "(DeepSeek-V4 non-EP DP TBO path)."
             )
 
+    def _check_hyv4_gate_tp(self):
+        if self.hyv4_linear_gate_tp_size not in (1, 8):
+            raise ValueError("--hyv4-linear-gate-tp-size supports 1 or 8")
+        if self.hyv4_linear_gate_tp_size > 1:
+            if not self.enable_dp_attention or self.dp_size != self.tp_size:
+                raise ValueError(
+                    "HYV4 gate TP requires DP attention with dp_size == tp_size"
+                )
+            if self.pp_size != 1 or self.attn_cp_size != 1:
+                raise ValueError("HYV4 gate TP requires pp_size=1 and attn_cp_size=1")
+            if (
+                self.nnodes <= 0
+                or self.tp_size % self.nnodes
+                or self.tp_size // self.nnodes != 8
+            ):
+                raise ValueError("HYV4 gate TP8 requires exactly 8 ranks per node")
+            if self.disaggregation_mode != "decode":
+                raise ValueError(
+                    "HYV4 gate TP currently supports the decode server only"
+                )
+            # Explicit per-phase graph settings can override the legacy flag.
+            if (
+                self.cuda_graph_config is None
+                or self.cuda_graph_config.decode.backend
+                not in (Backend.DISABLED, Backend.FULL)
+                or self.cuda_graph_config.prefill.backend != Backend.DISABLED
+                or self.enable_torch_compile
+            ):
+                raise ValueError(
+                    "HYV4 gate TP supports full decode CUDA graph or eager; "
+                    "prefill CUDA graph and torch.compile must be disabled"
+                )
+            if (
+                self.cuda_graph_config.decode.backend == Backend.FULL
+                and self.disable_cuda_graph_padding
+            ):
+                raise ValueError("HYV4 gate CUDA graph requires batch padding")
+            if self.enable_two_batch_overlap:
+                raise ValueError("HYV4 gate TP does not support two-batch overlap")
+            if self.speculative_algorithm is not None:
+                # NEXTN resolves to EAGLE. Support the embedded, fixed-width
+                # HYV4 MTP chain; other speculative workers need their own
+                # gate graph planning integration before they can be enabled.
+                if self.speculative_algorithm not in ("NEXTN", "EAGLE"):
+                    raise ValueError("HYV4 gate TP supports NEXTN/EAGLE MTP only")
+                if self.speculative_draft_model_path not in (None, self.model_path):
+                    raise ValueError(
+                        "HYV4 gate TP MTP requires the embedded draft from --model-path"
+                    )
+                if (
+                    self.speculative_eagle_topk != 1
+                    or self.speculative_num_steps is None
+                    or self.speculative_num_steps < 1
+                    or self.speculative_num_draft_tokens
+                    != self.speculative_num_steps + 1
+                    or self.speculative_adaptive
+                ):
+                    raise ValueError(
+                        "HYV4 gate TP MTP requires fixed topk=1, num_steps>=1, "
+                        "num_draft_tokens=num_steps+1 and no speculative-adaptive"
+                    )
+                if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
+                    raise ValueError(
+                        "HYV4 gate TP MTP requires SGLANG_RAGGED_VERIFY_MODE=static"
+                    )
+            if self.enable_pdmux or self.ep_join_mode is not None or self.enable_lora:
+                raise ValueError(
+                    "HYV4 gate TP does not support PD multiplexing, elastic join or LoRA"
+                )
+
     def check_server_args(self):
+        self._check_hyv4_gate_tp()
         # Check parallel size constraints
         if self.ep_join_mode != "scale":
             assert (

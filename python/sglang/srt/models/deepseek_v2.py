@@ -2137,6 +2137,7 @@ class DeepseekV2AttentionMLA(
         layer_scatter_modes: LayerScatterModes = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        attention_output_gate: Optional[torch.Tensor] = None,
     ):
         s = self.forward_prepare(
             positions=positions,
@@ -2146,6 +2147,11 @@ class DeepseekV2AttentionMLA(
             layer_scatter_modes=layer_scatter_modes,
             llama_4_scaling=llama_4_scaling,
             prev_topk_indices=prev_topk_indices,
+            **(
+                {"attention_output_gate": attention_output_gate}
+                if attention_output_gate is not None
+                else {}
+            ),
         )
         return self.forward_core(s)
 
@@ -2158,6 +2164,7 @@ class DeepseekV2AttentionMLA(
         layer_scatter_modes: LayerScatterModes = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        attention_output_gate: Optional[torch.Tensor] = None,
     ):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
@@ -2183,6 +2190,11 @@ class DeepseekV2AttentionMLA(
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        if attention_output_gate is not None and attn_forward_method not in (
+            AttnForwardMethod.MLA,
+            AttnForwardMethod.MLA_ROCM,
+        ):
+            raise ValueError("Precomputed attention gate requires MLA or MLA_ROCM")
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
@@ -2203,6 +2215,11 @@ class DeepseekV2AttentionMLA(
                 zero_allocator,
                 llama_4_scaling,
                 prev_topk_indices,
+                **(
+                    {"attention_output_gate": attention_output_gate}
+                    if attention_output_gate is not None
+                    else {}
+                ),
             )
         elif attn_forward_method == AttnForwardMethod.MHA_ROCM:
             inner_state = self.forward_normal_rocm_prepare(
@@ -2220,6 +2237,11 @@ class DeepseekV2AttentionMLA(
                 zero_allocator,
                 llama_4_scaling,
                 prev_topk_indices,
+                **(
+                    {"attention_output_gate": attention_output_gate}
+                    if attention_output_gate is not None
+                    else {}
+                ),
             )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_ROCM:
             inner_state = self.forward_absorb_fused_mla_rope_prepare(

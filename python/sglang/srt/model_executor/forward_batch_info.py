@@ -73,6 +73,7 @@ from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+    from sglang.srt.layers.hyv4_gate_tp import GateTPGraphPlan
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
@@ -465,6 +466,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For DP attention
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
+    # Filled on the forward thread before graph/eager selection; never captured.
+    hyv4_gate_tp_graph_plan: Optional[GateTPGraphPlan] = None
     can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 

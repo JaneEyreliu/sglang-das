@@ -516,11 +516,7 @@ class GroupCoordinator:
 
             # aiter+fabric silently landing on disabled=True is treated as a
             # strict-Fabric failure.
-            if (
-                self.ca_comm is not None
-                and strict_fabric
-                and self.ca_comm.disabled
-            ):
+            if self.ca_comm is not None and strict_fabric and self.ca_comm.disabled:
                 raise RuntimeError(
                     f"[AR] Strict Fabric requested but aiter CA is disabled "
                     f"(ranks={self.ranks}). AITER_AR_TRANSPORT=fabric must not "
@@ -556,9 +552,7 @@ class GroupCoordinator:
                 if self.ca_comm is not None
                 else "n/a"
             )
-            disabled = (
-                True if self.ca_comm is None else self.ca_comm.disabled
-            )
+            disabled = True if self.ca_comm is None else self.ca_comm.disabled
             logger.info(
                 "[AR] custom_all_reduce_backend=%s requested_transport=%s "
                 "selected_transport=%s disabled=%s tp_ranks=%s world_size=%s",
@@ -1161,7 +1155,9 @@ class GroupCoordinator:
                         ca_comm.reduce_scatter(
                             input,
                             output,
-                            registered=getattr(ca_comm, "enable_register_for_capturing", False),
+                            registered=getattr(
+                                ca_comm, "enable_register_for_capturing", False
+                            ),
                         )
                         return output
                 else:
@@ -1252,9 +1248,8 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                if (
-                    envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-                    or not getattr(ca_comm, "enable_register_for_capturing", True)
+                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get() or not getattr(
+                    ca_comm, "enable_register_for_capturing", True
                 ):
                     ca_comm.reduce_scatter(input, output, registered=False)
                 else:
@@ -1397,7 +1392,11 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    if (_is_hcu or envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get() or not getattr(ca_comm, "enable_register_for_capturing", True)):
+                    if (
+                        _is_hcu
+                        or envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                        or not getattr(ca_comm, "enable_register_for_capturing", True)
+                    ):
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
                         ca_comm.all_gather_reg(input, out=output, dim=0)
@@ -2125,6 +2124,7 @@ def init_model_parallel_group(
 
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
+_HYV4_GATE_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
@@ -2148,6 +2148,54 @@ def get_tp_group() -> GroupCoordinator:
         return _PDMUX_PREFILL_TP_GROUP
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
+
+
+def get_hyv4_gate_tp_group() -> GroupCoordinator:
+    assert _HYV4_GATE_TP is not None, "HYV4 gate TP group is not initialized"
+    return _HYV4_GATE_TP
+
+
+def initialize_hyv4_gate_tp(
+    group_size: int, backend: str, *, use_pynccl: bool = False
+) -> None:
+    """Create independent node-local groups once, in the same order on all ranks."""
+    import socket
+
+    global _HYV4_GATE_TP
+    if _HYV4_GATE_TP is not None:
+        raise RuntimeError("HYV4 gate TP group is already initialized")
+    world = get_world_group()
+    if group_size < 2 or world.world_size % group_size:
+        raise ValueError("HYV4 gate TP group size must divide the world size")
+    groups = [
+        list(range(start, start + group_size))
+        for start in range(0, world.world_size, group_size)
+    ]
+    placements = [None] * world.world_size
+    torch.distributed.all_gather_object(
+        placements,
+        (socket.gethostname(), world.local_rank),
+        group=world.cpu_group,
+    )
+    # Check every subgroup on every rank before any rank starts creating groups.
+    for ranks in groups:
+        hosts = {placements[rank][0] for rank in ranks}
+        devices = {placements[rank][1] for rank in ranks}
+        if len(hosts) != 1 or len(devices) != group_size:
+            raise ValueError(
+                f"HYV4 gate group {ranks} must contain distinct GPUs on one host"
+            )
+    _HYV4_GATE_TP = init_model_parallel_group(
+        groups,
+        world.local_rank,
+        backend,
+        use_pynccl=use_pynccl,
+        use_custom_allreduce=False,
+        use_mscclpp_allreduce=False,
+        use_torch_symm_mem_allreduce=False,
+        group_name="hyv4_gate_tp",
+    )
+    logger.info("HYV4 gate TP enabled: ranks=%s", _HYV4_GATE_TP.ranks)
 
 
 def get_attn_tp_group() -> GroupCoordinator:
@@ -2290,7 +2338,7 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _ATTN_TP, _MOE_EP, _MOE_TP):
+            for group in (_DCP, _ATTN_TP, _MOE_EP, _MOE_TP, _HYV4_GATE_TP):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -3131,6 +3179,10 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    global _HYV4_GATE_TP
+    if _HYV4_GATE_TP is not None:
+        _HYV4_GATE_TP.destroy()
+    _HYV4_GATE_TP = None
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()

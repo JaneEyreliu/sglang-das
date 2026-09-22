@@ -1701,11 +1701,24 @@ class ModelRunner:
                 if self.device == "cpu"
                 else forward_batch.forward_mode.is_cuda_graph
             )
-            can_run_graph = bool(
-                mode_check()
-                and self.decode_cuda_graph_runner
-                and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
-            )
+            if (
+                self.decode_cuda_graph_runner is not None
+                and self.server_args.hyv4_linear_gate_tp_size > 1
+                and not self.is_draft_worker
+            ):
+                can_run_graph = self.decode_cuda_graph_runner.prepare_hyv4_gate_graph(
+                    forward_batch,
+                    reuse_prepared=(
+                        forward_batch.spec_info is not None
+                        and forward_batch.spec_info.is_verify_input()
+                    ),
+                )
+            else:
+                can_run_graph = bool(
+                    mode_check()
+                    and self.decode_cuda_graph_runner
+                    and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
+                )
 
             if (
                 forward_batch.forward_mode.is_decode()
