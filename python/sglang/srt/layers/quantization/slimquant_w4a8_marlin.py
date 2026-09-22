@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
 import logging
 import os
 from typing import Dict, List, Optional
@@ -31,6 +30,7 @@ from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_moe_a2a_backend,
 )
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     W4A8_TPMOE_BACKEND_AITER,
     W4A8_TPMOE_BACKEND_AUTO,
@@ -50,7 +50,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 from sglang.srt.layers.quantization.slimquant_w4a8 import SlimQuantW4A8Int8LinearMethod
 from sglang.srt.layers.quantization.w4a8_utils import w4a8_weight_repack_impl
 from sglang.srt.utils import get_bool_env_var, set_weight_attrs
-from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
 # from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
 
 logger = logging.getLogger(__name__)
@@ -78,11 +78,11 @@ def _ensure_lightop_w4a8_marlin_available() -> None:
     if _lmslim_w4a8_marlin_available:
         return
     try:
-        from lightop.moe import (
-            fused_experts_impl_w4a8_marlin as _fused_experts_impl_w4a8_marlin,
-        )
         from lightop._lmslim_native.layers.fused_moe import (
             w4a8_marlin as _lightop_w4a8_marlin,
+        )
+        from lightop.moe import (
+            fused_experts_impl_w4a8_marlin as _fused_experts_impl_w4a8_marlin,
         )
     except Exception as e:
         raise RuntimeError(
@@ -179,9 +179,13 @@ def _resolve_w4a8_tpmoe_backend(
         _ensure_aiter_w4a8_marlin_available()
     return backend
 
+
 _use_aiter_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE", default="true")
-_use_lightop_w4a8_marlin_moe = get_bool_env_var("SGLANG_USE_LIGHTOP_W4A8_MARLIN_MOE", default="true")
+_use_lightop_w4a8_marlin_moe = get_bool_env_var(
+    "SGLANG_USE_LIGHTOP_W4A8_MARLIN_MOE", default="true"
+)
 _use_int4_w4a8 = get_bool_env_var("SGLANG_USE_INT4_W4A8")
+
 
 class MarlinMoeWorkspace:
     """
@@ -500,12 +504,18 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         self,
         ignore: Optional[list[str]] = None,
         experts_only_linear: bool = False,
+        checkpoint_format: Optional[str] = None,
     ):
         super().__init__()
         self.ignore = ignore
         # Qwen3.8 Flash-Next ChannelWise W4A8 quantizes MoE experts only;
         # DeepSeek / Kimi still quantize dense Linear unless listed in ignore.
         self.experts_only_linear = experts_only_linear
+        if checkpoint_format not in (None, "hy4_w4a8_v1"):
+            raise ValueError(
+                f"Unsupported W4A8 checkpoint format: {checkpoint_format!r}"
+            )
+        self.checkpoint_format = checkpoint_format
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -530,7 +540,24 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         return cls(
             ignore=config.get("ignore"),
             experts_only_linear=experts_only_linear,
+            checkpoint_format=config.get("checkpoint_format"),
         )
+
+    def normalize_checkpoint_weights(self, layer: torch.nn.Module) -> None:
+        """Convert HY4 v1 local expert shards to the existing backend contract.
+
+        HY4 v1 stores signed INT4 with even K in the LOW nibble and true
+        per-channel scales. The legacy loaders expect even K in the HIGH
+        nibble and scale/16. Normalize after EP/TP slicing, so every rank
+        converts only its own routed and fused shared experts. Execution backends
+        retain their own scale conversion after this format normalization.
+        """
+        if self.checkpoint_format != "hy4_w4a8_v1":
+            return
+        for name in ("w13_weight", "w2_weight"):
+            packed = getattr(layer, name).data.view(torch.uint8)
+            packed.copy_((packed << 4) | (packed >> 4))
+            getattr(layer, name + "_scale").data.div_(16.0)
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
@@ -552,6 +579,12 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         if isinstance(layer, LinearBase):
+            if self.checkpoint_format == "hy4_w4a8_v1":
+                if ".mlp.shared_experts." in prefix:
+                    return HYV4SharedExpertLinearMethod(self)
+                # This export quantizes experts only. Preserve the pre-existing
+                # architecture/ignore rules for all other checkpoint formats.
+                return UnquantizedLinearMethod()
             # Kimi-K3 INT4 (from mxfp4_to_int4.py) only quantizes the routed
             # experts; dense layers stay in BF16 and are listed in the
             # checkpoint's ignore list (native compressed-tensors style, with
@@ -604,6 +637,46 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+
+class HYV4SharedExpertLinearMethod(SlimQuantW4A8Int8LinearMethod):
+    """Load HY4's signed INT4 shared weights into the existing INT8 GEMM.
+
+    Expanding each nibble to an INT8 value is lossless. Keep the checkpoint's
+    true per-channel scales, and retain dynamic INT8 activation quantization.
+    Only shared experts take this path; routed experts keep packed INT4 GEMM.
+    """
+
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        if input_size_per_partition % 2:
+            raise ValueError("HY4 packed INT4 requires an even local input width")
+        super().create_weights(
+            layer,
+            input_size_per_partition // 2,
+            output_partition_sizes,
+            input_size // 2,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def process_weights_after_loading(self, layer):
+        # HY4 v1 stores even K in the low nibble, with signed two's-complement
+        # values. Do not use the fused MoE's scale/16 normalization here.
+        packed = layer.weight.data.view(torch.int8)
+        low = (packed << 4) >> 4
+        high = packed >> 4
+        layer.weight.data = torch.stack((low, high), dim=-1).flatten(-2)
+        super().process_weights_after_loading(layer)
 
 
 class SlimQuantW4A8Int8MarlinMoEMethod:
@@ -697,6 +770,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.quant_config.normalize_checkpoint_weights(layer)
         if get_moe_a2a_backend().is_megamoe():
             from sglang.srt.layers.moe.mega_moe import (
                 build_hcu_w4a8_mega_moe_experts_weights,
@@ -707,6 +781,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         if not _use_lightop_w4a8_marlin_moe:
             if self.use_deepep:
                 from deepgemm import pack_w4a8_moe_hipc_weight
+
                 layer.w13_weight = Parameter(
                     pack_w4a8_moe_hipc_weight(layer.w13_weight.data),
                     requires_grad=False,
@@ -735,9 +810,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
                 #   - restore the true per-channel scale (x16)
                 def _to_triton_layout(w: torch.Tensor) -> torch.Tensor:
                     u = w.data.to(torch.uint8)
-                    u = ((((u & 0x0F) << 4) | ((u >> 4) & 0x0F)) ^ 0x88).to(
-                        torch.int8
-                    )
+                    u = ((((u & 0x0F) << 4) | ((u >> 4) & 0x0F)) ^ 0x88).to(torch.int8)
                     return u.contiguous()
 
                 if _use_aiter_moe:
@@ -778,9 +851,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         else:
             # Legacy lightop path: repack into the Marlin W4A8 layout.
             layer.w13_weight = Parameter(
-                w4a8_weight_repack_impl(
-                    layer.w13_weight, use_deepep=self.use_deepep
-                ),
+                w4a8_weight_repack_impl(layer.w13_weight, use_deepep=self.use_deepep),
                 requires_grad=False,
             )
             layer.w2_weight = Parameter(
@@ -1104,6 +1175,7 @@ class SlimQuantW4A8Int8TritonMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.quant_config.normalize_checkpoint_weights(layer)
         layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
         layer.w13_weight_scale = Parameter(
@@ -1355,6 +1427,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.quant_config.normalize_checkpoint_weights(layer)
         if self.use_deepep:
             # DeepEP grouped GEMM consumes the HIPC pack + x16 scale, not the
             # Aiter TP shuffle layout. Matching SlimQuantW4A8Int8MarlinMoEMethod.
@@ -1596,9 +1669,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
             )
             valid = ~invalid
             if not valid.any():
-                return torch.zeros(
-                    orig_m, k, device=x.device, dtype=torch.bfloat16
-                )
+                return torch.zeros(orig_m, k, device=x.device, dtype=torch.bfloat16)
             # DeepEP pads unused top-k slots with a dummy global id. aiter_moe
             # has no skip mask, so compact to valid (token, expert) pairs with
             # topk=1 and scatter-add. Dummy traffic must not run as expert 0.
@@ -1676,8 +1747,6 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         )
         if scatter_idx is None:
             return output
-        combined = torch.zeros(
-            orig_m, k, device=output.device, dtype=output.dtype
-        )
+        combined = torch.zeros(orig_m, k, device=output.device, dtype=output.dtype)
         combined.index_add_(0, scatter_idx, output)
         return combined

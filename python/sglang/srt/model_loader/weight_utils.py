@@ -332,6 +332,29 @@ def get_quant_config(
     else:
         hf_folder = model_name_or_path
 
+    # HY4's component-suffixed INT4 export has no HF quantization_config.
+    # Its small assets manifest identifies the packing/scale convention; do
+    # not infer that convention from the model path or the quantization name.
+    if (
+        quant_cls.get_name() == "slimquant_w4a8_marlin"
+        and getattr(model_config.hf_config, "model_type", None) == "hy_v4"
+    ):
+        hy4_assets_path = os.path.join(hf_folder, "hy4-assets.json")
+        if os.path.isfile(hy4_assets_path):
+            with open(hy4_assets_path) as f:
+                hy4_assets = json.load(f)
+            checkpoint_format = hy4_assets.get("format")
+            if checkpoint_format != "hy4_w4a8_v1":
+                raise ValueError(
+                    f"Unsupported HY4 checkpoint format: {checkpoint_format!r}"
+                )
+            return quant_cls.from_config(
+                {
+                    "checkpoint_format": checkpoint_format,
+                    "packed_modules_mapping": packed_modules_mapping,
+                }
+            )
+
     possible_config_filenames = quant_cls.get_config_filenames()
 
     # If the quantization config is not found, use the default config.
@@ -1168,9 +1191,7 @@ def fastsafetensors_weights_iterator(
     # the whole load with "submit_io: submit_nogds_read failed, err=-1".
     # Shrink the bounce buffer (tunable via env) and retry the transient
     # failure once with a fresh loader.
-    bbuf_size_kb = int(
-        os.getenv("SGLANG_FASTSAFETENSORS_BBUF_KB", str(16 * 1024))
-    )
+    bbuf_size_kb = int(os.getenv("SGLANG_FASTSAFETENSORS_BBUF_KB", str(16 * 1024)))
     max_threads = int(os.getenv("SGLANG_FASTSAFETENSORS_MAX_THREADS", "8"))
 
     for f_list in tqdm(

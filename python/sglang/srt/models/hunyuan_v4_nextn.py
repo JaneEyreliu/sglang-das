@@ -16,7 +16,6 @@ from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -35,9 +34,10 @@ from sglang.srt.models.hunyuan_v4 import (
     hyv4_attn_tp_split,
     hyv4_dp_attn_scattered,
     hyv4_linear_scale_suffix,
+    hyv4_shared_experts_fusion_disable_reason,
+    normalize_hyv4_weight_name,
     permute_hyv4_indexer_weight,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda
 
@@ -224,6 +224,9 @@ class HYV4ModelNextN(nn.Module):
 
 class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    shared_experts_fusion_disable_reason = staticmethod(
+        hyv4_shared_experts_fusion_disable_reason
+    )
 
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
@@ -271,6 +274,7 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
             for name, loaded_weight in weights:
                 if not name.startswith("model.mtp_layers.0."):
                     continue
+                name = normalize_hyv4_weight_name(name)
                 name = name.replace("model.mtp_layers.0", layer_prefix)
                 if name.endswith(".final_layernorm.weight"):
                     name = name.replace(
