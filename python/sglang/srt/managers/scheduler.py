@@ -3699,10 +3699,38 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
+        # Completed requests may already have released req.kv while still
+        # present in running_batch. Filter before any decode-memory estimate,
+        # including the HY4 retraction pre-check below.
         batch.filter_batch()
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
+
+        hy4_snapshot = getattr(
+            self.token_to_kv_pool_allocator, "snapshot_mtp_retraction_state", None
+        )
+        if hy4_snapshot is not None and (
+            not batch.check_decode_mem()
+            or (TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0)
+        ):
+            # A retraction snapshot must agree with committed output_ids. In
+            # overlap mode the last verify may still be awaiting CPU processing.
+            # Drain it before copying caches and preserve the loop's queue/last
+            # batch invariant so it will not process that result a second time.
+            if self.enable_overlap and self.result_queue:
+                while self.result_queue:
+                    previous_batch, previous_result = self.result_queue.popleft()
+                    self.process_batch_result(previous_batch, previous_result)
+                self.last_batch = None
+            self.device_module.synchronize()
+
+            # Processing pending verify results can finish more requests and
+            # free their KV. Filter again before estimating or snapshotting.
+            batch.filter_batch()
+            if batch.is_empty():
+                batch.batch_is_full = False
+                return batch
 
         # Check if decode out of memory
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
@@ -3718,6 +3746,8 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
+            if hy4_snapshot is not None:
+                hy4_snapshot(batch, self.future_map)
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
             )

@@ -193,7 +193,18 @@ class PrefillServerInfo:
     required_dst_info_num: Optional[int] = None
     required_prefill_response_num: Optional[int] = None
 
+    # HY4 prefill revisions advertise this optional field even for the
+    # standard layout (null). Accept that wire format without claiming
+    # support for their named, revision-specific KV layouts.
+    kv_cache_layout: Optional[str] = None
+
     def __post_init__(self):
+        if self.kv_cache_layout is not None:
+            raise ValueError(
+                "Unsupported prefill KV cache layout for this decode revision: "
+                f"kv_cache_layout={self.kv_cache_layout!r}. "
+                "Use matching P/D revisions with support for that layout."
+            )
         self.attn_tp_size = int(self.attn_tp_size)
         self.attn_cp_size = int(self.attn_cp_size)
         self.dp_size = int(self.dp_size)

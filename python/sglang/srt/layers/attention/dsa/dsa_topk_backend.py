@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum, IntEnum, auto
+from functools import lru_cache
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -48,6 +49,12 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.is_sgl_kernel():
+            if (
+                _is_hcu
+                and envs.SGLANG_DSA_HCU_LIGHTOP_TOPK.get()
+                and _can_use_lightop_raw_topk(score, lengths, topk, row_starts)
+            ):
+                return _lightop_raw_topk(score, lengths, topk, row_starts)
             from sgl_kernel import fast_topk_v2
 
             return fast_topk_v2(score, lengths, topk, row_starts=row_starts)
@@ -225,6 +232,65 @@ class DSATopKBackend(Enum):
             raise RuntimeError(f"Unsupported {topk_transform_method = }.")
 
         raise RuntimeError(f"Unsupported {self = } for SGLANG_DSA_FUSE_TOPK.")
+
+
+def _can_use_lightop_raw_topk(score, lengths, topk, row_starts) -> bool:
+    # This adapter consumes fully materialized logits and returns logical IDs.
+    # Sparse-mask logits must keep using their dedicated mask-aware consumer.
+    return (
+        topk == 2048
+        and score.is_cuda
+        and score.dtype == torch.float32
+        and score.ndim == 2
+        and score.stride(1) == 1
+        and lengths.device == score.device
+        and lengths.dtype == torch.int32
+        and lengths.ndim == 1
+        and lengths.shape[0] == score.shape[0]
+        and lengths.is_contiguous()
+        and (
+            row_starts is None
+            or (
+                row_starts.device == score.device
+                and row_starts.dtype == torch.int32
+                and row_starts.ndim == 1
+                and row_starts.shape[0] == score.shape[0]
+                and row_starts.is_contiguous()
+            )
+        )
+    )
+
+
+@lru_cache(maxsize=None)
+def _lightop_topk_zero_offsets(device_index: int, capacity: int) -> torch.Tensor:
+    # Keep power-of-two buffers alive across graph captures. Initialize with a
+    # blocking H2D copy during warmup so later consumers on ANY stream see zeros,
+    # without adding a memset or event wait to every layer / graph replay.
+    with torch.cuda.device(device_index):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Warm up LightOp DSA top-k before graph capture")
+        return torch.zeros(capacity, dtype=torch.int32, device="cpu").to(
+            device=torch.device("cuda", device_index), non_blocking=False
+        )
+
+
+def _lightop_raw_topk(score, lengths, topk, row_starts):
+    from lightop import op
+
+    rows = score.shape[0]
+    output = torch.empty((rows, topk), dtype=torch.int32, device=score.device)
+    if rows == 0:
+        return output
+    capacity = 1 << (rows - 1).bit_length()
+    offsets = _lightop_topk_zero_offsets(score.device.index, capacity)[:rows]
+    # The ragged kernel emits (window-relative ID + offset), preserving -1 for
+    # padding. Zero offsets thus expose raw IDs even for nonzero row_starts.
+    # Leave page lookup / DCP ownership filtering to transform_index_page_table;
+    # IndexTopKShareState must continue carrying logical, not rank-local IDs.
+    op.fast_topk_transform_ragged_interface(
+        score, lengths, output, offsets, row_starts
+    )
+    return output
 
 
 def _topk_unfused(

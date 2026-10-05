@@ -48,6 +48,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_n_heads,
     get_dsa_index_topk,
     is_deepseek_dsa,
+    is_hy_v4,
 )
 from sglang.srt.distributed import (
     divide,
@@ -481,9 +482,13 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
+        self.router_fp32 = is_hy_v4(config) and getattr(config, "router_fp32", False)
         self.is_deepseek_v4 = is_deepseek_v4
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size),
+                dtype=torch.float32 if self.router_fp32 else None,
+            )
         )
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
@@ -512,6 +517,8 @@ class MoEGate(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         forward_batch: ForwardBatch = None,
     ):
+        if self.router_fp32:
+            return F.linear(hidden_states.float(), self.weight, None)
         if use_intel_amx_backend(self):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,

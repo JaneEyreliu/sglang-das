@@ -74,6 +74,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_fast_hadamard_transform = get_bool_env_var("SGLANG_USE_FAST_HADAMARD_TRANSFORM")
+_use_tuned_hadamard_transform = get_bool_env_var("HYV4_HADAMARD_TUNING")
 
 if _is_hcu:
     from lightop import attention as lightop_attention
@@ -260,6 +261,15 @@ def rotate_activation(x: torch.Tensor, apply_scale: bool = True) -> torch.Tensor
         hidden_size & (hidden_size - 1)
     ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
     scale = hidden_size**-0.5 if apply_scale else 1.0
+    if (
+        _is_hcu
+        and _use_tuned_hadamard_transform
+        and hidden_size == 128
+        and x.dtype == torch.bfloat16
+    ):
+        from sglang.srt.layers.hyv4_tuned_hadamard import hadamard128
+
+        return hadamard128(x, scale=scale)
     if _is_hcu and _use_fast_hadamard_transform:
         return hcu_fast_hadamard_transform(x, scale=scale)
     if _is_hcu:
@@ -1001,9 +1011,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         packed_cache = self._get_index_k_read_buffer(pool, layer_id)
         assert packed_cache.dtype == torch.uint8
         assert packed_cache.dim() == 2
-        assert packed_cache.shape[1] == pool.page_size * (self.head_dim + 4)
+        assert packed_cache.shape[1] == pool.index_page_size * (self.head_dim + 4)
         return packed_cache.view(torch.int8).view(
-            packed_cache.shape[0], pool.page_size, 1, self.head_dim + 4
+            packed_cache.shape[0], pool.index_page_size, 1, self.head_dim + 4
         )
 
     def _prepare_hcu_int8_paged_query(

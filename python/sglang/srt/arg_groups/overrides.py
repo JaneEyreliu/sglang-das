@@ -1305,6 +1305,24 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
+@_register_for("HYV4ForCausalLM", "HYV4ForCausalLMNextN")
+def _hyv4_dsa_backend_overrides(server_args: Any, hf_config: Any) -> dict:
+    """Default HY4 to this branch's sink-aware FlashMLA KV implementation.
+
+    HY4 is outside _DEEPSEEK_FAMILY_ARCHS, so the generic DSA split-backend
+    resolver never fills its unset fields. Preserve explicit choices; the
+    HY4 launch validator still rejects implementations without sink support.
+    """
+    overrides = {
+        name: "flashmla_kv"
+        for name in ("dsa_prefill_backend", "dsa_decode_backend")
+        if getattr(server_args, name) is None
+    }
+    if overrides:
+        logger.info("HYV4 DSA backend defaults: %s", overrides)
+    return overrides
+
+
 @_register_for(
     "InklingForConditionalGeneration",
     "InklingForConditionalGenerationMTP",

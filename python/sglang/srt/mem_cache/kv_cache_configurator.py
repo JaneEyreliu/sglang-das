@@ -22,6 +22,7 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
     is_deepseek_dsa,
     is_deepseek_v4,
+    is_hy_v4,
     is_minimax_sparse,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
@@ -94,13 +95,20 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
-def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
+def _should_elide_dsa_index_k(*, is_draft_worker: bool, hf_config=None) -> bool:
     memory_config = get_memory()
     return (
         not memory_config.enable_hisparse
         and not is_draft_worker
         and not memory_config.enable_hierarchical_cache
-        and get_disagg().disaggregation_mode == "null"
+        and (
+            get_disagg().disaggregation_mode == "null"
+            or (
+                hf_config is not None
+                and is_hy_v4(hf_config)
+                and envs.SGLANG_HY4_COMPACT_PD_INDEX_K.get()
+            )
+        )
     )
 
 
@@ -1362,7 +1370,9 @@ class KVCacheConfigurator:
             self.layer_info.start_layer,
             self.layer_info.end_layer,
         )
-        if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
+        if _should_elide_dsa_index_k(
+            is_draft_worker=self.is_draft_worker, hf_config=self.model_config.hf_config
+        ):
             indexer_layer_ids = full_indexer_layer_ids
         else:
             indexer_layer_ids = list(
@@ -1374,12 +1384,29 @@ class KVCacheConfigurator:
             pool_kwargs["indexer_prefetch_layer_ids"] = full_indexer_layer_ids
         if not get_memory().enable_hisparse:
             pool_kwargs["indexer_layer_ids"] = indexer_layer_ids
+        if is_hy_v4(self.model_config.hf_config):
+            # The allocator reserves virtual page 0 (64 * DCP slots). Index-K
+            # indexes raw virtual locs on both the target and replicated draft.
+            pool_kwargs["index_padding_capacity"] = (
+                get_schedule().page_size * get_parallel().attn_dcp_size
+            )
         if self.is_draft_worker and self.loc_space_scale > 1:
             # The replicated draft stores global virtual token ids, so its KV
             # page spans DCP ranks. HCU DSA indexer kernels still consume
             # physical page-64 index-K storage indexed by those raw ids.
             pool_kwargs["index_page_size"] = get_schedule().page_size
             pool_kwargs["index_buf_size"] = max_total_num_tokens
+            if is_hy_v4(self.model_config.hf_config):
+                # Keep target/draft index-K ABIs identical for P/D transfer.
+                # Only the draft KV pool uses virtual pages; INT8 index-K
+                # allocation, stores and reads use physical page-64 storage.
+                pool_kwargs["allow_int8_virtual_index_pages"] = True
+                logger.info(
+                    "HYV4 DCP draft uses independent index-K pages: KV page_size=%d, "
+                    "index_page_size=%d; index-K format follows the target setting.",
+                    self.pool_page_size,
+                    get_schedule().page_size,
+                )
         if self.graph_kv_padding_capacity > self.pool_page_size:
             pool_kwargs["padding_capacity"] = self.graph_kv_padding_capacity
         token_to_kv_pool = PoolCls(
@@ -1809,7 +1836,19 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
                     else:
-                        token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                        allocator_cls = PagedTokenToKVPoolAllocator
+                        allocator_kwargs = {}
+                        if (
+                            is_hy_v4(self.model_config.hf_config)
+                            and get_parallel().dcp_enabled
+                        ):
+                            from sglang.srt.mem_cache.allocator.hyv4 import (
+                                HYV4DCPAllocator,
+                            )
+
+                            allocator_cls = HYV4DCPAllocator
+                            allocator_kwargs["dcp_rank"] = get_parallel().attn_dcp_rank
+                        token_to_kv_pool_allocator = allocator_cls(
                             sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
                             page_size=get_schedule().page_size
                             * get_parallel().attn_dcp_size,
@@ -1817,6 +1856,7 @@ class KVCacheConfigurator:
                             device=self.device,
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
+                            **allocator_kwargs,
                         )
 
             if get_memory().enable_hisparse and is_dsv4_model:
@@ -1858,6 +1898,14 @@ class KVCacheConfigurator:
                     token_to_kv_pool.register_mapping(
                         swa_allocator.full_to_swa_index_mapping
                     )
+        if (
+            self.is_draft_worker
+            and is_hy_v4(self.model_config.hf_config)
+            and get_parallel().dcp_enabled
+        ):
+            # The shared allocator owns retraction of both pools, including the
+            # replicated draft state whose slots will otherwise be reused.
+            token_to_kv_pool_allocator.register_draft_pool(token_to_kv_pool)
         return token_to_kv_pool_allocator
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:

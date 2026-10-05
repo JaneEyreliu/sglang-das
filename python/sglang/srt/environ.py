@@ -1495,11 +1495,16 @@ class Envs:
     SGLANG_INKLING_RS_MM_PREPROCESS = EnvBool(True)
 
     # ===================================================================
+    SGLANG_OPT_HY4_IHC_TILELANG = EnvBool(False)
+    SGLANG_HY4_COMPACT_PD_INDEX_K = EnvBool(False)
+
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )
+    # HCU raw Top2048 via LightOp; page lookup / DCP mapping stays unfused.
+    SGLANG_DSA_HCU_LIGHTOP_TOPK = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(

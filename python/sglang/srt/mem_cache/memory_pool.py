@@ -4671,6 +4671,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         indexer_layer_ids: Optional[Sequence[int]] = None,
         index_page_size: Optional[int] = None,
         padding_capacity: Optional[int] = None,
+        allow_int8_virtual_index_pages: bool = False,
+        index_padding_capacity: Optional[int] = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -4726,6 +4728,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 parallel.attn_dcp_size if parallel.dcp_enabled else 1
             )
         self.index_buf_size = index_buf_size
+        # HY4 supplies the allocator's virtual dummy-page width. Keep the
+        # historical allocation for other models when no override is supplied.
+        self.index_padding_capacity = index_padding_capacity
+        self.index_num_pages = (
+            (index_buf_size + self.index_page_size + 1) // self.index_page_size
+            if index_padding_capacity is None
+            else (index_buf_size + index_padding_capacity + self.index_page_size - 1)
+            // self.index_page_size
+        )
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
         self.index_k_cache_mode = resolve_index_k_cache_mode(
@@ -4758,9 +4769,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
         else:
             assert self.index_page_size == 64
             if self.index_page_size != self.page_size:
-                assert self.index_k_cache_mode is IndexKCacheMode.BF16, (
-                    "Virtual DCP draft pages require the BF16 index-K cache; "
-                    "scaled index-K layouts must match the KV pool page size."
+                # Only HY4 opts into independent INT8 index pages. FP8 accessors
+                # still require index and KV page widths to coincide.
+                assert self.index_k_cache_mode is IndexKCacheMode.BF16 or (
+                    allow_int8_virtual_index_pages
+                    and _is_hcu
+                    and self.index_k_cache_mode is IndexKCacheMode.INT8_SCALED
+                ), (
+                    "Virtual DCP draft pages require BF16 index-K or the "
+                    "HY4 HCU INT8 virtual-index-page opt-in."
                 )
         self.index_key_cache = self._create_index_key_cache()
         self._initialize_int8_index_k_workspace()
@@ -4811,9 +4828,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 remote_buffer
             )
 
-        num_pages = (
-            self.index_buf_size + self.index_page_size + 1
-        ) // self.index_page_size
+        num_pages = self.index_num_pages
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -4834,9 +4849,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             )
 
     def _create_index_k_buffer(self):
-        num_pages = (
-            self.index_buf_size + self.index_page_size + 1
-        ) // self.index_page_size
+        num_pages = self.index_num_pages
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -5024,7 +5037,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             index_k,
             self.index_key_cache.buffer[cache_index],
             loc,
-            page_size=self.page_size,
+            page_size=self.index_page_size,
             int8_k=int8_k,
             fp32_scales=fp32_scales,
         )

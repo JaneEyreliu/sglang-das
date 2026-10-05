@@ -230,6 +230,12 @@ def rocm_absorb_v_bmm(
                 attn.w_vc.to(torch.bfloat16) * attn.w_scale,
             )
 
+    if hasattr(attn, "prepare_attention_output_gate"):
+        return (
+            _bmm_buf.flatten(1, 2) if _bmm_buf is not None
+            else attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        )
+
     if _bmm_buf is not None:
         # _bmm_buf is already (batch, heads, dim) contiguous
         if attn.o_proj.weight.dtype == torch.uint8:
@@ -619,6 +625,11 @@ class DeepseekMLARocmForwardMixin:
             positions,
             topk_indices,
             llama_4_scaling,
+            *(
+                (self.prepare_attention_output_gate(hidden_states),)
+                if hasattr(self, "prepare_attention_output_gate")
+                else ()
+            ),
         )
 
     def forward_absorb_rocm_core(
@@ -632,6 +643,7 @@ class DeepseekMLARocmForwardMixin:
         positions,
         topk_indices,
         llama_4_scaling,
+        attention_output_gate=None,
     ):
         save_kv_cache = True
 
@@ -853,6 +865,10 @@ class DeepseekMLARocmForwardMixin:
         elif is_kv_b_lora_active(self):
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
+            )
+        if attention_output_gate is not None:
+            attn_bmm_output = self.apply_attention_output_gate(
+                attn_bmm_output, attention_output_gate
             )
         output, _ = self.o_proj(attn_bmm_output)
 

@@ -30,6 +30,7 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
     is_deepseek_dsa,
     is_deepseek_v4,
+    is_hy_v4,
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
@@ -188,6 +189,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self._fixed_overhead_bytes = self._compute_graph_padding_overhead(
             kvc, num_layers
         )
+        if is_hy_v4(kvc.model_config.hf_config):
+            self._fixed_overhead_bytes += self._compute_hyv4_index_padding_overhead(
+                kvc, num_layers
+            )
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None
@@ -230,6 +235,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_kv_size = int(
                         target_kv_size * draft_num_layers / target_kv_num_layers
                     )
+                    if (
+                        is_hy_v4(kvc.model_config.hf_config)
+                        and get_parallel().dcp_enabled
+                    ):
+                        # HY4's draft pool stores all allocator virtual slots
+                        # on each rank (_derive_pool_sizes multiplies by DCP).
+                        draft_kv_size *= get_parallel().attn_dcp_size
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,
@@ -269,6 +281,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=draft_cell_size,
                 )
+
+    def _compute_hyv4_index_padding_overhead(self, kvc, num_layers):
+        # One allocator page is reserved at address zero. Index-K uses global
+        # virtual addresses, so charge DCP physical index pages, not just one.
+        page = kvc.page_size
+        overhead = page * self._compute_dsa_indexer_cell_size(
+            kvc=kvc, num_layers=num_layers
+        )
+        if not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle():
+            draft_layers = int(kvc.spec_aux_config.eagle_draft_num_layers or 0)
+            if draft_layers:
+                overhead += page * self._compute_dsa_indexer_cell_size(
+                    kvc=kvc, num_layers=draft_layers, allocate_all_layers=True
+                )
+        return overhead
 
     def _compute_graph_padding_overhead(
         self, kvc: KVCacheConfigurator, num_layers: int
@@ -492,7 +519,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if allocate_all_layers:
             num_indexer_layers = num_layers
         else:
-            if _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker):
+            if _should_elide_dsa_index_k(
+                is_draft_worker=kvc.is_draft_worker,
+                hf_config=kvc.model_config.hf_config,
+            ):
                 active_indexer_layers = get_dsa_full_indexer_layer_ids(
                     kvc.model_config.hf_config,
                     kvc.layer_info.start_layer,
@@ -531,9 +561,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )
         # INT8 dequant workspace and page-claim arrays are sized from the same
         # replicated global index buffer as persistent index-K storage.
-        workspace_bytes = (
-            index_k_workspace_bytes_per_token(cache_mode) * indexer_ratio
-        )
+        workspace_bytes = index_k_workspace_bytes_per_token(cache_mode) * indexer_ratio
         return math.ceil(persistent_bytes + workspace_bytes)
 
     def calculate_pool_sizes(

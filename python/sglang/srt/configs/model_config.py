@@ -127,11 +127,25 @@ def is_deepseek_dsa(config) -> bool:
             "GlmMoeDsaForCausalLMNextN",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
+            "HYV4ForCausalLM",
+            "HYV4ForCausalLMNextN",
             "Dots3NoteForCausalLM",
             "Dots3NoteForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
     )
+
+
+def is_hy_v4(config) -> bool:
+    return _hf_arch(config) in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN")
+
+
+def resolve_spec_hidden_size(hf_config, hidden_size: int, hc_mult: int):
+    # HYV4 collapses iHC before passing hidden states to its plain MTP layer.
+    # Other HC models retain their existing flattened recurrent-state contract.
+    if hc_mult <= 1 or is_hy_v4(hf_config):
+        return hidden_size, None
+    return hidden_size * hc_mult, hidden_size * hc_mult
 
 
 def is_kimi_k3(config) -> bool:
@@ -217,6 +231,10 @@ def get_dsa_index_topk(config: PretrainedConfig) -> int:
 def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     """Return whether a DSA layer reuses the previous layer's top-k indices."""
     assert is_deepseek_dsa(config)
+
+    if is_hy_v4(config):
+        indexer_types = config.indexer_types
+        return layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
 
     # LongCat computes fresh top-k indices every cli_factor layers.
     cli_factor = getattr(config, "cli_factor", 1)
@@ -788,6 +806,11 @@ class ModelConfig:
             self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and self.hf_config.architectures[0] == "HYV4ForCausalLM":
+            if getattr(self.hf_config, "num_nextn_predict_layers", 0) != 1:
+                raise ValueError("HYV4 MTP requires exactly one checkpoint MTP layer")
+            self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
+
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         self.is_hybrid_swa = (
@@ -851,6 +874,8 @@ class ModelConfig:
         attention.  Not every hybrid-SWA model uses them.
         """
         archs = self.hf_config.architectures or []
+        if is_hy_v4(self.hf_config):
+            return bool(getattr(self.hf_text_config, "learnable_sink", False))
         if any(a in SWA_SINK_ARCHS for a in archs):
             return True
 
@@ -923,7 +948,8 @@ class ModelConfig:
             setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
         # FIXME: temporary special judge for MLA architecture
         if (
-            "DeepseekV2ForCausalLM" in self.hf_config.architectures
+            is_hy_v4(self.hf_config)
+            or "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
@@ -1085,12 +1111,9 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
-        self.spec_hidden_size = (
-            self.hidden_size * hc_mult if hc_mult > 1 else self.hidden_size
+        self.spec_hidden_size, self.hc_hidden_size = resolve_spec_hidden_size(
+            self.hf_text_config, self.hidden_size, hc_mult
         )
-        # mHC-flattened hidden size; None when not running an mHC model
-        # (e.g. non-DeepSeek-V4 configs without ``hc_mult``).
-        self.hc_hidden_size = self.spec_hidden_size if hc_mult > 1 else None
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:

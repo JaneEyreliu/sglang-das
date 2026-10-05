@@ -171,6 +171,8 @@ class DeepseekMLAForwardMixin:
         # dispatch, this fusion is on by default on that surface.
         if not is_graph_dsa_split_op_surface(forward_batch):
             return False
+        if hasattr(self, "prepare_attention_output_gate"):
+            return False
         if not self.use_dsa:
             return False
         if self.use_deep_gemm_bmm:
@@ -672,6 +674,11 @@ class DeepseekMLAForwardMixin:
             topk_indices,
             llama_4_scaling,
             fusion_plan,
+            *(
+                (self.prepare_attention_output_gate(hidden_states),)
+                if hasattr(self, "prepare_attention_output_gate")
+                else ()
+            ),
         )
 
     def forward_absorb_core(
@@ -686,6 +693,7 @@ class DeepseekMLAForwardMixin:
         topk_indices,
         llama_4_scaling,
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
+        attention_output_gate=None,
     ):
         save_kv_cache = True
 
@@ -901,6 +909,10 @@ class DeepseekMLAForwardMixin:
         elif is_kv_b_lora_active(self):
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
+            )
+        if attention_output_gate is not None:
+            attn_bmm_output = self.apply_attention_output_gate(
+                attn_bmm_output, attention_output_gate
             )
         output, _ = self.o_proj(attn_bmm_output)
 
