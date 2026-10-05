@@ -46,6 +46,7 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.hy4_dcp import validate_hyv4_launch
 from sglang.srt.layers.hy4_ihc_tilelang import (
     try_tilelang_ihc_head,
     try_tilelang_ihc_post,
@@ -67,7 +68,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     AttnForwardMethod,
 )
@@ -76,6 +76,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_v2 import (
     DeepseekV2AttentionMLA,
+    DeepseekV2ForCausalLM,
     DeepseekV2MLP,
     DeepseekV2MoE,
 )
@@ -137,9 +138,39 @@ def hyv4_attn_tp_reduce_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
     to complete before the iHC post gate, which is non-linear -- that is why
     HYV4 cannot instead fold the reduction into a later dp_gather.
     """
-    output = hyv4_attn_tp_split(hidden_states)
+    # Collective input and output must not alias (NCCL/RCCL reduce-scatter).
+    output = torch.empty_like(hyv4_attn_tp_split(hidden_states))
     attn_tp_reduce_scatter_tensor(output, hidden_states)
     return output
+
+
+def normalize_hyv4_weight_name(name: str) -> str:
+    """Accept component-suffixed HYV4 exports alongside original weight names.
+
+    This changes names only; packed INT4 bytes and scales are not converted.
+    Direct Parameter attributes must not acquire a Linear-style weight suffix.
+    """
+    name = name.replace(".self_attn.g_proj.", ".self_attn.linear_gate.")
+    for source, target in (
+        (".weight.weight", ".weight"),
+        (".bias.weight", ".bias"),
+        (".weight.packed", ".weight"),
+        (".weight.scale", ".weight_scale"),
+    ):
+        if name.endswith(source):
+            return name.removesuffix(source) + target
+    if name.endswith(
+        (
+            ".learnable_sink_param.weight",
+            ".e_score_correction_bias.weight",
+            ".hc_base.weight",
+            ".hc_scale.weight",
+            ".hc_head_base.weight",
+            ".hc_head_scale.weight",
+        )
+    ):
+        return name.removesuffix(".weight")
+    return name
 
 
 def permute_hyv4_indexer_weight(name, loaded_weight, config):
@@ -230,8 +261,13 @@ class HYV4HCPreLayer(nn.Module):
         fused = None
         if use_tilelang:
             fused = try_tilelang_ihc_pre(
-                hidden_states, self.hc_fn.weight, self.hc_scale, self.hc_base,
-                self.rms_norm_eps, self.hc_eps, self.magnitude,
+                hidden_states,
+                self.hc_fn.weight,
+                self.hc_scale,
+                self.hc_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.magnitude,
             )
         if fused is not None:
             reduced, post = fused
@@ -437,19 +473,38 @@ class HYV4Attention(DeepseekV2AttentionMLA):
                 f"output width: {self.linear_gate.output_size_per_partition} != "
                 f"{self.local_gate_width}"
             )
+        # Replicating these small logits avoids a per-layer DCP all-gather.
+        # The much larger output gate remains attention-TP column-sharded.
         self.learnable_sink_param = nn.Parameter(
-            torch.empty(self.num_local_heads, dtype=torch.float32)
+            torch.empty(config.num_attention_heads, dtype=torch.float32)
         )
         self.learnable_sink_param.weight_loader = self._sink_weight_loader
+        self.attn_mqa.hyv4_sink_getter = self.get_local_attention_sink
+        if get_parallel().dcp_enabled:
+            self.attn_mqa_for_dcp_decode.hyv4_sink_getter = self.get_dcp_attention_sink
 
     @staticmethod
     def _sink_weight_loader(param, loaded_weight):
-        attn_tp_size = get_parallel().attn_tp_size
-        heads = loaded_weight.shape[0] // attn_tp_size
-        start = get_parallel().attn_tp_rank * heads
-        param.data.copy_(loaded_weight[start : start + heads].float())
+        if param.shape != loaded_weight.shape:
+            raise ValueError("HYV4 sink weights must contain one logit per head")
+        param.data.copy_(loaded_weight.float())
+
+    def get_local_attention_sink(self):
+        start = get_parallel().attn_tp_rank * self.num_local_heads
+        return self.learnable_sink_param[start : start + self.num_local_heads]
+
+    def get_dcp_attention_sink(self):
+        parallel = get_parallel()
+        heads = self.num_local_heads * parallel.attn_dcp_size
+        start = (parallel.attn_tp_rank // parallel.attn_dcp_size) * heads
+        return self.learnable_sink_param[start : start + heads]
 
     def prepare_attention_output_gate(self, hidden_states):
+        from sglang.srt.layers.hyv4_tuned_gate import try_tuned_gate
+
+        tuned = try_tuned_gate(self.linear_gate, hidden_states)
+        if tuned is not None:
+            return tuned
         return self.linear_gate(hidden_states)[0]
 
     def apply_attention_output_gate(self, attn_out, gate):
@@ -461,15 +516,9 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         return attn_out * torch.sigmoid(gate)
 
     def dispatch_attn_forward_method(self, forward_batch: ForwardBatch):
-        # The DSA handler picks MHA_ONE_SHOT vs MLA off ``use_mha`` on the live
-        # backend. HYV4 only has the sparse MLA path, so pin it.
-        backend = get_attn_backend()
-        backend = getattr(backend, "primary", backend)
-        if getattr(backend, "use_mha", False) is not False:
-            backend.use_mha = False
+        # The backend disables dense fallback before building HYV4 metadata.
         method = super().dispatch_attn_forward_method(forward_batch)
-        # if method != AttnForwardMethod.MLA:
-        if method != AttnForwardMethod.MLA and method != AttnForwardMethod.MLA_ROCM:
+        if method not in (AttnForwardMethod.MLA, AttnForwardMethod.MLA_ROCM):
             raise RuntimeError(
                 f"HYV4 requires the sparse MLA attention path, got {method}"
             )
@@ -671,8 +720,7 @@ class HYV4Model(nn.Module):
         metadata split; the model owns only the data split below.
         """
         if not (
-            self.dsa_enable_prefill_cp
-            and forward_batch.extend_seq_lens_cpu is not None
+            self.dsa_enable_prefill_cp and forward_batch.extend_seq_lens_cpu is not None
         ):
             return False
         if not can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
@@ -756,6 +804,17 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "slimquant_w4a8_marlin"
+            and getattr(quant_config, "checkpoint_format", None) != "hy4_w4a8_v1"
+        ):
+            raise ValueError(
+                "HY4 W4A8 requires quantization_config.checkpoint_format="
+                "hy4_w4a8_v1 (low-nibble-even INT4 with true channel scales)"
+            )
+        validate_hyv4_launch(get_global_server_args(), get_parallel())
+        get_attn_tp_context().init_context(config.q_lora_rank, True)
         self.model = HYV4Model(config, quant_config, add_prefix("model", prefix))
         self.num_fused_shared_experts = max(
             (
@@ -775,6 +834,7 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        self.logits_processor.use_fp32_lm_head = config.enable_lm_head_fp32
 
     @torch.no_grad()
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
@@ -794,12 +854,33 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
 
+    prepare_context_parallel_metadata_for_dcp = (
+        DeepseekV2ForCausalLM.prepare_context_parallel_metadata_for_dcp
+    )
+    get_model_config_for_expert_location = classmethod(
+        DeepseekV2ForCausalLM.get_model_config_for_expert_location.__func__
+    )
+
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        return "HYV4 SwiGLU clipping applies to routed experts only."
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         scale_suffix = hyv4_linear_scale_suffix(self)
 
         def mapped_weights():
             for name, loaded_weight in weights:
-                if name.startswith("model.mtp_layers."):
+                if (
+                    name.endswith(".weight.packed")
+                    and getattr(self.quant_config, "checkpoint_format", None)
+                    != "hy4_w4a8_v1"
+                ):
+                    raise ValueError(
+                        "Packed HY4 weights require quantization_config."
+                        "checkpoint_format=hy4_w4a8_v1; do not infer nibble order"
+                    )
+                name = normalize_hyv4_weight_name(name)
+                if name.startswith(("model.mtp_layers.", "model.mtp.layers.")):
                     continue
                 loaded_weight = permute_hyv4_indexer_weight(
                     name, loaded_weight, self.config
@@ -811,6 +892,9 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 yield name, loaded_weight
 
         self.do_load_weights(mapped_weights())
+        from sglang.srt.layers.hyv4_tuned_gate import prepare_model_gates
+
+        prepare_model_gates(self)
 
 
 EntryClass = [HYV4ForCausalLM]

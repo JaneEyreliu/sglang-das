@@ -171,6 +171,8 @@ class DeepseekMLAForwardMixin:
         # dispatch, this fusion is on by default on that surface.
         if not is_graph_dsa_split_op_surface(forward_batch):
             return False
+        if hasattr(self, "prepare_attention_output_gate"):
+            return False
         if not self.use_dsa:
             return False
         if self.use_deep_gemm_bmm:
@@ -706,7 +708,13 @@ class DeepseekMLAForwardMixin:
         # HYV4 carries a per-head learnable attention sink logit that the
         # sparse backend folds into the softmax denominator.
         sink_args = (
-            dict(attn_sink=self.learnable_sink_param)
+            dict(
+                attn_sink=(
+                    self.get_local_attention_sink()
+                    if hasattr(self, "get_local_attention_sink")
+                    else self.learnable_sink_param
+                )
+            )
             if getattr(self, "learnable_sink_param", None) is not None
             else {}
         )

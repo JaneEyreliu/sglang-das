@@ -631,9 +631,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Whether the forward path may re-plan this batch when its shapes no
     # longer match the plan record. Only mark sites where the forward
     # path's own init_forward_metadata is equivalent to the pre-plan
-    # (same backend object, no special context) may opt in; multi-step
-    # wrapper plans and view-context plans must keep this False — a
-    # forward-path re-plan would clobber their metadata.
+    # (same active backend object) may opt in. Multi-step wrappers may
+    # opt in only if each step can independently rebuild its metadata
+    # from the live batch; other wrapper/view-context plans keep False.
     forward_metadata_replan_equivalent: bool = False
 
     def mark_forward_metadata_ready(self, replan_equivalent: bool = False):

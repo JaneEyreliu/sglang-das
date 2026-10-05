@@ -52,7 +52,9 @@ def _unsupported(x, fn, scale, base):
         return "D must be a positive multiple of 64"
     if fn.shape != (8, 4 * x.shape[2]) or scale.numel() != 2 or base.shape != (8,):
         return "expected weight [8,4D], scale with 2 values, base [8]"
-    if x.dtype != torch.bfloat16 or any(t.dtype != torch.float32 for t in (fn, scale, base)):
+    if x.dtype != torch.bfloat16 or any(
+        t.dtype != torch.float32 for t in (fn, scale, base)
+    ):
         return "expected BF16 residual and FP32 weight/scale/base"
     if any(t.device != x.device for t in (fn, scale, base)):
         return "all tensors must share a device"
@@ -82,8 +84,13 @@ def try_tilelang_ihc_pre(x, fn, scale, base, rms_eps, hc_eps, magnitude):
         return None
     with torch.cuda.device(x.device):
         result = kernel(
-            x.contiguous(), fn.contiguous(), scale.contiguous().view(2),
-            base.contiguous(), float(rms_eps), float(hc_eps), float(magnitude),
+            x.contiguous(),
+            fn.contiguous(),
+            scale.contiguous().view(2),
+            base.contiguous(),
+            float(rms_eps),
+            float(hc_eps),
+            float(magnitude),
         )
     _log_success()
     return result
@@ -93,12 +100,17 @@ def try_tilelang_ihc_post(x, residual, post):
     """Return TileLang post result, or None for the eager caller."""
     if not envs.SGLANG_OPT_HY4_IHC_TILELANG.get():
         return None
-    if (x.ndim != 2 or residual.ndim != 3 or residual.shape[1] != 4
-            or x.shape != (residual.shape[0], residual.shape[2])
-            or post.shape != (residual.shape[0], 4)
-            or x.dtype != torch.bfloat16 or residual.dtype != torch.bfloat16
-            or post.dtype != torch.float32
-            or any(t.device != residual.device for t in (x, post))):
+    if (
+        x.ndim != 2
+        or residual.ndim != 3
+        or residual.shape[1] != 4
+        or x.shape != (residual.shape[0], residual.shape[2])
+        or post.shape != (residual.shape[0], 4)
+        or x.dtype != torch.bfloat16
+        or residual.dtype != torch.bfloat16
+        or post.dtype != torch.float32
+        or any(t.device != residual.device for t in (x, post))
+    ):
         _warn("ihc_post input contract is unsupported")
         return None
     if residual.shape[2] <= 0 or residual.shape[2] % 64:
@@ -125,18 +137,24 @@ def try_tilelang_ihc_head(residual, head_fn, head_scale, head_base, rms_eps, hc_
     """Return TileLang head result, or None for the eager caller."""
     if not envs.SGLANG_OPT_HY4_IHC_TILELANG.get():
         return None
-    if (residual.ndim != 3 or residual.shape[1] != 4
-            or head_fn.shape != (4, 4 * residual.shape[2])
-            or head_base.shape != (4,) or head_scale.numel() != 1
-            or residual.dtype != torch.bfloat16
-            or any(t.dtype != torch.float32 for t in (head_fn, head_scale, head_base))
-            or any(t.device != residual.device for t in (head_fn, head_scale, head_base))):
+    if (
+        residual.ndim != 3
+        or residual.shape[1] != 4
+        or head_fn.shape != (4, 4 * residual.shape[2])
+        or head_base.shape != (4,)
+        or head_scale.numel() != 1
+        or residual.dtype != torch.bfloat16
+        or any(t.dtype != torch.float32 for t in (head_fn, head_scale, head_base))
+        or any(t.device != residual.device for t in (head_fn, head_scale, head_base))
+    ):
         _warn("ihc_head input contract is unsupported")
         return None
     if residual.shape[2] <= 0 or residual.shape[2] % 64:
         _warn("ihc_head requires hidden size divisible by 64")
         return None
-    if torch.is_grad_enabled() and any(t.requires_grad for t in (residual, head_fn, head_scale, head_base)):
+    if torch.is_grad_enabled() and any(
+        t.requires_grad for t in (residual, head_fn, head_scale, head_base)
+    ):
         _warn("ihc_head is inference-only")
         return None
     if torch.version.hip is None or residual.device.type != "cuda":
@@ -148,6 +166,13 @@ def try_tilelang_ihc_head(residual, head_fn, head_scale, head_base, rms_eps, hc_
     if kernel is None:
         return None
     with torch.cuda.device(residual.device):
-        result = kernel(residual.contiguous(), head_fn.contiguous(), head_scale.contiguous(), head_base.contiguous(), float(rms_eps), float(hc_eps))
+        result = kernel(
+            residual.contiguous(),
+            head_fn.contiguous(),
+            head_scale.contiguous(),
+            head_base.contiguous(),
+            float(rms_eps),
+            float(hc_eps),
+        )
     _log_success("ihc_head")
     return result

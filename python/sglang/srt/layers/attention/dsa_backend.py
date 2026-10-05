@@ -145,6 +145,7 @@ def _validate_dsa_dcp_launch(
     index_share_for_mtp_iteration: bool,
     decode_cuda_graph_backend: str,
     decode_cuda_graph_max_bs: Optional[int],
+    is_hy_v4_model: bool = False,
 ) -> None:
     """Reject DSA-DCP combinations outside the validated first phase."""
     if not dcp_enabled:
@@ -220,10 +221,18 @@ def _validate_dsa_dcp_launch(
                 f"enable_dp_attention={enable_dp_attention}."
             )
         if index_share_for_mtp_iteration:
-            raise ValueError(
-                "DSA DCP EAGLE does not support index_share_for_mtp_iteration "
-                "in the first phase."
-            )
+            # HY4 carries full-token draft indices through IndexTopKShareState;
+            # only the topk=1 chain preserves row order across draft steps.
+            # Keep the existing launch contract for all other architectures.
+            if not is_hy_v4_model:
+                raise ValueError(
+                    "DSA DCP EAGLE does not support index_share_for_mtp_iteration "
+                    "in the first phase."
+                )
+            if speculative_eagle_topk != 1:
+                raise ValueError(
+                    "HYV4 DCP MTP index sharing requires speculative_eagle_topk=1."
+                )
         if decode_cuda_graph_backend not in ("disabled", "full"):
             raise ValueError(
                 "DSA DCP EAGLE only supports disabled or full decode CUDA Graph; "
@@ -241,9 +250,14 @@ def _validate_dsa_dcp_launch(
             "DSA DCP does not support fused DSA top-k in the first phase; set "
             "SGLANG_DSA_FUSE_TOPK=false."
         )
-    if dcp_comm_backend != "ag_rs":
+    # HYV4 applies its sink and converts FlashMLA LSE to base-2 before
+    # the MLA core merges partial outputs. The existing A2A core consumes
+    # that same output/LSE contract. Keep this opt-in scoped to HCU HYV4;
+    # other DSA models retain the first-phase ag_rs-only contract.
+    allow_hyv4_a2a = is_hcu_platform and is_hy_v4_model and dcp_comm_backend == "a2a"
+    if dcp_comm_backend != "ag_rs" and not allow_hyv4_a2a:
         raise ValueError(
-            "DSA DCP first-phase support requires the ag_rs communication backend; "
+            "DSA DCP requires the ag_rs communication backend, or a2a for HCU HYV4; "
             f"got {dcp_comm_backend}."
         )
 
@@ -491,6 +505,9 @@ class DeepseekSparseAttnBackend(
         self.num_splits = (
             1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
+        from sglang.srt.configs.model_config import is_hy_v4
+
+        self.is_hy_v4 = is_hy_v4(model_runner.model_config.hf_config)
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
         self.dsa_kv_cache_store_fp8 = (
@@ -513,7 +530,7 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        self.supports_mha_one_shot: bool = True
+        self.supports_mha_one_shot: bool = not self.is_hy_v4
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
@@ -587,6 +604,7 @@ class DeepseekSparseAttnBackend(
         self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
         self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
         _validate_dsa_dcp_launch(
+            is_hy_v4_model=self.is_hy_v4,
             dcp_enabled=self.dcp_enabled,
             dcp_size=self.dcp_size,
             is_hcu_platform=_is_hcu,
@@ -932,8 +950,10 @@ class DeepseekSparseAttnBackend(
         # that dispatches to `_topk_transform_v2_paged` -- decode AND MTP
         # target-verify / draft-extend, whose expanded row count is exactly what v2
         # sees -- otherwise the helper's plan-present assertion fires. None only
-        # when the SGL v2 path is disabled; such metadata is never dispatched to v2.
-        if not self.dsa_topk_backend.should_use_topk_v2():
+        # when fused top-k or the SGL v2 path is disabled; such metadata is never
+        # dispatched to v2. In particular, DCP uses unfused top-k and must not
+        # import/compile the unused CUDA-only v2 planner on HCU.
+        if not self.use_fused_topk or not self.dsa_topk_backend.should_use_topk_v2():
             return None
         from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
@@ -3209,6 +3229,10 @@ class DeepseekSparseAttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # HY4 applies its sink once to both output and LSE below. Do not also
+        # fold it into FlashMLA's native denominator (or count it per rank).
+        if getattr(layer, "hyv4_sink_getter", None) is not None:
+            attn_sink = None
         if return_lse and attn_sink is not None:
             raise NotImplementedError(
                 "DCP attention sinks require model-specific output/LSE correction"
@@ -3324,8 +3348,31 @@ class DeepseekSparseAttnBackend(
                 self.get_device_int32_arange(batch_size + 1),
                 max_seq_len=1,
             )
+            sink_getter = getattr(layer, "hyv4_sink_getter", None)
+            if sink_getter is not None:
+                from sglang.srt.layers.hy4_dcp import apply_hyv4_sink
+
+                o, lse = apply_hyv4_sink(
+                    o,
+                    lse,
+                    sink_getter(),
+                    local_kv_counts,
+                    dcp_size=self.dcp_size,
+                    lse_base2=True,
+                )
             return o, lse
 
+        sink_getter = getattr(layer, "hyv4_sink_getter", None)
+        if sink_getter is not None:
+            from sglang.srt.layers.hy4_dcp import apply_hyv4_sink
+
+            o, _ = apply_hyv4_sink(
+                o.squeeze(1),
+                lse.squeeze(-1),
+                sink_getter(),
+                (page_table_1 >= 0).sum(dim=-1),
+            )
+            o = o.unsqueeze(1)
         return o
 
     def _forward_standard_mha(
@@ -3903,6 +3950,10 @@ class DeepseekSparseAttnBackend(
 
 
 class DeepseekSparseAttnMultiStepBackend:
+
+    # Each step's eager metadata is derived solely from the live ForwardBatch.
+    # It can be rebuilt independently after DP/TP padding changes the shapes.
+    supports_eager_metadata_replan: bool = True
 
     # Per-step draft decode replays from precomputed GPU metadata; opt out so
     # decide_needs_cpu_seq_lens' OR over the backends stays False.

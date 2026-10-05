@@ -12,11 +12,15 @@ from typing import Iterable, Tuple
 import torch
 from torch import nn
 
+from sglang.srt.configs.hy_v4_mtp import (
+    normalize_hyv4_mtp_weight_name,
+    validate_hyv4_mtp_metadata,
+)
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.hy4_dcp import validate_hyv4_launch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -30,6 +34,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.models.hunyuan_v4 import (
     HYV4Attention,
+    HYV4ForCausalLM,
     hyv4_attn_tp_gather,
     hyv4_attn_tp_reduce_scatter,
     hyv4_attn_tp_split,
@@ -59,7 +64,10 @@ def _mtp_quant_config(quant_config):
             "mtp.layers.0",
             "mtp_layers.0",
         ):
+            for special in ("enorm", "hnorm", "eh_proj", "shared_head.norm"):
+                name = name.replace(mtp_prefix + "." + special, "model." + special)
             name = name.replace(mtp_prefix, decoder_prefix)
+        name = name.replace(".self_attn.g_proj", ".self_attn.linear_gate")
         return name
 
     ignored_layers = getattr(quant_config, "ignored_layers", None)
@@ -130,13 +138,16 @@ class HYV4MTPDecoderLayer(nn.Module):
                 hidden_states, forward_batch, self.self_attn.prepare_qkv_latent
             )
         )
-        hidden_states = self.self_attn(
-            positions,
-            hidden_states,
-            forward_batch,
-            zero_allocator,
-            prev_topk_indices=prev_topk_indices,
-        )
+        try:
+            hidden_states = self.self_attn(
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                prev_topk_indices=prev_topk_indices,
+            )
+        finally:
+            get_attn_tp_context().clear_attn_inputs()
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
@@ -184,15 +195,22 @@ class HYV4ModelNextN(nn.Module):
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
         if hidden_states.shape[0] > 0:
-            hidden_states = self.eh_proj(
-                torch.cat(
-                    (
-                        self.enorm(hidden_states),
-                        self.hnorm(forward_batch.spec_info.hidden_states),
-                    ),
-                    dim=-1,
+            if forward_batch.spec_info.hidden_states.shape != hidden_states.shape:
+                raise ValueError(
+                    "HYV4 MTP requires token-aligned D-dimensional hidden states"
                 )
+            mtp_input = torch.cat(
+                (
+                    self.enorm(hidden_states),
+                    self.hnorm(forward_batch.spec_info.hidden_states),
+                ),
+                dim=-1,
             )
+            from sglang.srt.layers.hyv4_tuned_mtp import try_tuned_mtp_input
+
+            hidden_states = try_tuned_mtp_input(self.eh_proj, mtp_input)
+            if hidden_states is None:
+                hidden_states = self.eh_proj(mtp_input)
         zero_allocator = BumpAllocator(
             buffer_size=2,
             dtype=torch.float32,
@@ -228,10 +246,22 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
         self.config = config
-        self.quant_config = quant_config
+        self.quant_config = _mtp_quant_config(quant_config)
+        quant_config = self.quant_config
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "slimquant_w4a8_marlin"
+            and getattr(quant_config, "checkpoint_format", None) != "hy4_w4a8_v1"
+        ):
+            raise ValueError("HYV4 MTP W4A8 requires checkpoint_format=hy4_w4a8_v1")
         self.pp_group = get_pp_group()
+        validate_hyv4_launch(get_global_server_args(), get_parallel())
+        # Both index-share modes use EagleDraftWorker's existing lifecycle:
+        # false recomputes per step; true carries draft-extend top-k through
+        # the draft chain (and recomputes if no seed is available).
+        get_attn_tp_context().init_context(config.q_lora_rank, True)
         self.model = HYV4ModelNextN(
-            config, _mtp_quant_config(quant_config), prefix=add_prefix("model", prefix)
+            config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.num_fused_shared_experts = self.model.decoder.mlp.num_fused_shared_experts
         self.lm_head = ParallelLMHead(
@@ -242,6 +272,7 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        self.logits_processor.use_fp32_lm_head = config.enable_lm_head_fp32
 
     @torch.no_grad()
     def forward(self, input_ids, positions, forward_batch):
@@ -259,6 +290,16 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
 
+    prepare_context_parallel_metadata_for_dcp = (
+        HYV4ForCausalLM.prepare_context_parallel_metadata_for_dcp
+    )
+    get_model_config_for_expert_location = classmethod(
+        HYV4ForCausalLM.get_model_config_for_expert_location.__func__
+    )
+    shared_experts_fusion_disable_reason = classmethod(
+        HYV4ForCausalLM.shared_experts_fusion_disable_reason.__func__
+    )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # The HYV4 checkpoint names the draft layer "model.mtp_layers.0", while
         # do_load_weights maps a "model.layers.<nextn_layer_id>" prefix onto
@@ -266,24 +307,37 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
         # it.
         layer_prefix = self._initialize_nextn_conf(True).nextn_layer_prefix
         scale_suffix = hyv4_linear_scale_suffix(self)
+        metadata = {}
 
         def mapped_weights():
             for name, loaded_weight in weights:
-                if not name.startswith("model.mtp_layers.0."):
+                relative = normalize_hyv4_mtp_weight_name(name)
+                if relative is None:
                     continue
-                name = name.replace("model.mtp_layers.0", layer_prefix)
-                if name.endswith(".final_layernorm.weight"):
-                    name = name.replace(
-                        ".final_layernorm.weight", ".shared_head.norm.weight"
-                    )
+                if relative in metadata:
+                    raise ValueError(f"Duplicate HYV4 MTP weight: {relative}")
+                metadata[relative] = {
+                    "shape": list(loaded_weight.shape),
+                    "dtype": str(loaded_weight.dtype),
+                }
+                name = layer_prefix + "." + relative
                 loaded_weight = permute_hyv4_indexer_weight(
                     name, loaded_weight, self.config
                 )
                 if name.endswith(".weight_scale"):
                     name += scale_suffix
                 yield name, loaded_weight
+            validate_hyv4_mtp_metadata(
+                vars(self.config),
+                metadata,
+                packed_experts=getattr(self.quant_config, "checkpoint_format", None)
+                == "hy4_w4a8_v1",
+            )
 
         self.do_load_weights(mapped_weights(), is_nextn=True)
+        from sglang.srt.layers.hyv4_tuned_mtp import prepare_mtp_input
+
+        prepare_mtp_input(self)
 
     def post_load_weights(self, is_nextn=True, weight_names=None):
         super().post_load_weights(is_nextn=True, weight_names=weight_names)

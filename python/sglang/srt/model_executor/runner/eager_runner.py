@@ -41,6 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_attn_backend,
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
@@ -224,7 +225,10 @@ class EagerRunner(BaseRunner):
             return model_runner.decode_attn_backend, forward_context(
                 ForwardContext(attn_backend=model_runner.decode_attn_backend)
             )
-        return model_runner.attn_backend, contextlib.nullcontext()
+        # EAGLE publishes its current draft-step backend in ForwardContext;
+        # model_runner.attn_backend may still point at draft-extend. Re-plan
+        # the same backend the model will read after eager DP/TP padding.
+        return get_attn_backend(), contextlib.nullcontext()
 
     def _execute_decode(
         self,
@@ -281,10 +285,17 @@ class EagerRunner(BaseRunner):
             or cp_v2_active
             or forward_batch.forward_mode.is_target_verify()
         ):
-            if model_runner.ps.attn_dcp_size > 1 and hasattr(
-                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            if (
+                model_runner.ps.attn_dcp_size > 1
+                and not forward_batch.forward_mode.is_target_verify()
+                and hasattr(
+                    model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+                )
             ):
-                # prepare kv cache buffer for dcp to gather kv cache
+                # Prepare gathered prefix KV only for ordinary extend paths.
+                # Target verify uses decode-style DCP attention and has no
+                # extend_prefix_lens. Its attention metadata is still planned
+                # below from the live speculative batch.
                 forward_batch.attn_dcp_metadata = (
                     model_runner.model.prepare_context_parallel_metadata_for_dcp(
                         forward_batch.seq_lens,

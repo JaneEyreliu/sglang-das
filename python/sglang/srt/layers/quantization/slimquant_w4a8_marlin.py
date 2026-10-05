@@ -500,12 +500,18 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         self,
         ignore: Optional[list[str]] = None,
         experts_only_linear: bool = False,
+        checkpoint_format: Optional[str] = None,
     ):
         super().__init__()
         self.ignore = ignore
-        # Qwen3.8 Flash-Next ChannelWise W4A8 quantizes MoE experts only;
-        # DeepSeek / Kimi still quantize dense Linear unless listed in ignore.
         self.experts_only_linear = experts_only_linear
+        self.checkpoint_format = checkpoint_format
+        if checkpoint_format == "hy4_w4a8_v1":
+            logger.info(
+                "[slimquant_w4a8_marlin] checkpoint_format=hy4_w4a8_v1: "
+                "convert low-nibble-even INT4 and true scales to the legacy "
+                "high-nibble-even / scale-divided-by-16 convention before repacking"
+            )
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -530,6 +536,7 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         return cls(
             ignore=config.get("ignore"),
             experts_only_linear=experts_only_linear,
+            checkpoint_format=config.get("checkpoint_format"),
         )
 
     @classmethod
@@ -552,6 +559,10 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         if isinstance(layer, LinearBase):
+            if self.checkpoint_format == "hy4_w4a8_v1":
+                if ".mlp.shared_experts." in prefix:
+                    return HYV4SharedExpertLinearMethod(self)
+                return UnquantizedLinearMethod()
             # Kimi-K3 INT4 (from mxfp4_to_int4.py) only quantizes the routed
             # experts; dense layers stay in BF16 and are listed in the
             # checkpoint's ignore list (native compressed-tensors style, with
@@ -602,8 +613,65 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
             return quant_method
         return None
 
+    def normalize_checkpoint_weights(self, layer: torch.nn.Module) -> None:
+        """Convert HY4 v1 local expert shards to the existing backend contract.
+
+        HY4 v1 stores signed INT4 with even K in the LOW nibble and true
+        per-channel scales. The legacy loaders expect even K in the HIGH
+        nibble and scale/16. Normalize after EP/TP slicing, so every rank
+        converts only its own routed and fused shared experts. DeepGEMM HIPC
+        in the 20260915 image consumes these divided scales directly; other
+        backends retain their own scale conversion.
+        """
+        if self.checkpoint_format != "hy4_w4a8_v1":
+            return
+        for name in ("w13_weight", "w2_weight"):
+            packed = getattr(layer, name).data.view(torch.uint8)
+            packed.copy_((packed << 4) | (packed >> 4))
+            getattr(layer, name + "_scale").data.div_(16.0)
+
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+
+class HYV4SharedExpertLinearMethod(SlimQuantW4A8Int8LinearMethod):
+    """Load HY4's signed INT4 shared weights into the existing INT8 GEMM.
+
+    Expanding each nibble to an INT8 value is lossless. Keep the checkpoint's
+    true per-channel scales, and retain dynamic INT8 activation quantization.
+    Only shared experts take this path; routed experts keep packed INT4 GEMM.
+    """
+
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        if input_size_per_partition % 2:
+            raise ValueError("HY4 packed INT4 requires an even local input width")
+        super().create_weights(
+            layer,
+            input_size_per_partition // 2,
+            output_partition_sizes,
+            input_size // 2,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def process_weights_after_loading(self, layer):
+        # HY4 v1 stores even K in the low nibble, with signed two's-complement
+        # values. Do not use the fused MoE's scale/16 normalization here.
+        packed = layer.weight.data.view(torch.int8)
+        low = (packed << 4) >> 4
+        high = packed >> 4
+        layer.weight.data = torch.stack((low, high), dim=-1).flatten(-2)
+        super().process_weights_after_loading(layer)
 
 
 class SlimQuantW4A8Int8MarlinMoEMethod:
@@ -697,6 +765,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.quant_config.normalize_checkpoint_weights(layer)
         if get_moe_a2a_backend().is_megamoe():
             from sglang.srt.layers.moe.mega_moe import (
                 build_hcu_w4a8_mega_moe_experts_weights,
@@ -715,7 +784,13 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
                     pack_w4a8_moe_hipc_weight(layer.w2_weight.data),
                     requires_grad=False,
                 )
-                scale_mul = 16.0
+                # HY4 normalization already produces scale/16.
+                # DeepGEMM HIPC kernels supply x16, so keep that normalized
+                # scale for both contiguous and masked GEMM. Other checkpoint
+                # formats retain their existing conversion.
+                scale_mul = (
+                    1.0 if self.quant_config.checkpoint_format == "hy4_w4a8_v1" else 16.0
+                )
                 layer.w13_weight_scale = Parameter(
                     layer.w13_weight_scale.data * scale_mul,
                     requires_grad=False,
@@ -1104,6 +1179,7 @@ class SlimQuantW4A8Int8TritonMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.quant_config.normalize_checkpoint_weights(layer)
         layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
         layer.w13_weight_scale = Parameter(
@@ -1355,6 +1431,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.quant_config.normalize_checkpoint_weights(layer)
         if self.use_deepep:
             # DeepEP grouped GEMM consumes the HIPC pack + x16 scale, not the
             # Aiter TP shuffle layout. Matching SlimQuantW4A8Int8MarlinMoEMethod.
@@ -1368,7 +1445,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
                 pack_w4a8_moe_hipc_weight(layer.w2_weight.data),
                 requires_grad=False,
             )
-            scale_mul = 16.0
+            scale_mul = 1.0 if self.quant_config.checkpoint_format == "hy4_w4a8_v1" else 16.0
             layer.w13_weight_scale = Parameter(
                 layer.w13_weight_scale.data * scale_mul, requires_grad=False
             )

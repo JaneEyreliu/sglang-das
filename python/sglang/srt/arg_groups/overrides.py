@@ -1305,8 +1305,8 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
-@_register_for("HYV4ForCausalLM")
-def _hy_v4_overrides(server_args: Any, hf_config: Any) -> dict:
+@_register_for("HYV4ForCausalLM", "HYV4ForCausalLMNextN")
+def _hyv4_dsa_backend_overrides(server_args: Any, hf_config: Any) -> dict:
     """Hunyuan-V4 (Hy4-preview) defaults, ported from an internal fork's
     ``_handle_hyv4_adjustments``: DSA attention backend, the learnable-sink
     KV-cache dtype restriction, and the prefill-CP topology requirements.
@@ -1324,6 +1324,16 @@ def _hy_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         logger.info("Use dsa attention backend for HYV4.")
     overrides["page_size"] = 64
     logger.warning("Setting page size to 64 for HYV4 DSA.")
+
+    if getattr(server_args, "dcp_size", 1) > 1:
+        # DCP needs the output/LSE contract and model-specific sink correction.
+        # Preserve explicit backends for the launch validator to check.
+        overrides.update({
+            name: "flashmla_kv"
+            for name in ("dsa_prefill_backend", "dsa_decode_backend")
+            if getattr(server_args, name) is None
+        })
+        return overrides
 
     # The checkpoint's config.json has "learnable_sink": true. The sink is
     # folded in from the softmax LSE. On the bf16 flashmla_sparse path this

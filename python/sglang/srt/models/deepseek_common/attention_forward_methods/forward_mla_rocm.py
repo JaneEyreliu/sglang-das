@@ -264,6 +264,12 @@ def rocm_absorb_v_bmm(
                 _scaled_bmm_weight(attn.w_vc, attn.w_scale),
             )
 
+    if hasattr(attn, "prepare_attention_output_gate"):
+        return (
+            _bmm_buf.flatten(1, 2) if _bmm_buf is not None
+            else attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        )
+
     if _bmm_buf is not None:
         # _bmm_buf is already (batch, heads, dim) contiguous
         if attn.o_proj.weight.dtype == torch.uint8:
@@ -679,7 +685,13 @@ class DeepseekMLARocmForwardMixin:
         # HYV4 carries a per-head learnable attention sink logit that the
         # sparse backend folds into the softmax denominator.
         sink_args = (
-            dict(attn_sink=self.learnable_sink_param)
+            dict(
+                attn_sink=(
+                    self.get_local_attention_sink()
+                    if hasattr(self, "get_local_attention_sink")
+                    else self.learnable_sink_param
+                )
+            )
             if getattr(self, "learnable_sink_param", None) is not None
             else {}
         )

@@ -196,6 +196,14 @@ class PrefillServerInfo:
     required_prefill_response_num: Optional[int] = None
 
     def __post_init__(self):
+        if self.kv_cache_layout not in (
+            None, "hnd", "nhd", "vectorized_5d", "page_major_layer_major"
+        ):
+            raise ValueError(
+                "Unsupported prefill KV cache layout for this decode revision: "
+                f"kv_cache_layout={self.kv_cache_layout!r}. "
+                "Use matching P/D revisions with support for that layout."
+            )
         self.attn_tp_size = int(self.attn_tp_size)
         self.attn_cp_size = int(self.attn_cp_size)
         self.dp_size = int(self.dp_size)

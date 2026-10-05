@@ -239,7 +239,7 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     # pattern: "full" layers own indexer weights and run the indexer,
     # "shared" layers reuse the previous layer's top-k.
     indexer_types = getattr(config, "indexer_types", None)
-    if indexer_types is not None:
+    if is_hy_v4(config) and indexer_types is not None:
         return layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
 
     # LongCat computes fresh top-k indices every cli_factor layers.
@@ -831,8 +831,9 @@ class ModelConfig:
             self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] == "HYV4ForCausalLM":
+            if getattr(self.hf_config, "num_nextn_predict_layers", 0) != 1:
+                raise ValueError("HYV4 MTP requires exactly one checkpoint MTP layer")
             self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
-            self.hf_config.num_nextn_predict_layers = 1
 
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
@@ -897,6 +898,8 @@ class ModelConfig:
         attention.  Not every hybrid-SWA model uses them.
         """
         archs = self.hf_config.architectures or []
+        if is_hy_v4(self.hf_config):
+            return bool(getattr(self.hf_text_config, "learnable_sink", False))
         if any(a in SWA_SINK_ARCHS for a in archs):
             return True
 
@@ -969,7 +972,8 @@ class ModelConfig:
             setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
         # FIXME: temporary special judge for MLA architecture
         if (
-            "DeepseekV2ForCausalLM" in self.hf_config.architectures
+            is_hy_v4(self.hf_config)
+            or "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures

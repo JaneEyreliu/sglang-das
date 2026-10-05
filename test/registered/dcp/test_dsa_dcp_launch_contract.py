@@ -63,6 +63,38 @@ class TestDSADCPLaunchContract(unittest.TestCase):
             **_valid_config(is_hcu_platform=True, device_capability=(9, 3))
         )
 
+    def test_hcu_hyv4_a2a_contract(self):
+        base = _valid_config(
+            is_hcu_platform=True,
+            device_capability=(9, 3),
+            is_hy_v4_model=True,
+            dcp_size=2,
+            attn_tp_size=2,
+            dcp_group_ranks=(0, 1),
+            attn_tp_group_ranks=(0, 1),
+            dcp_comm_backend="a2a",
+        )
+        _validate_dsa_dcp_launch(**base)
+        for graph_backend in ("disabled", "full"):
+            _validate_dsa_dcp_launch(**{
+                **base,
+                "speculative_algorithm": "EAGLE",
+                "speculative_num_steps": 2,
+                "speculative_eagle_topk": 1,
+                "speculative_num_draft_tokens": 3,
+                "index_share_for_mtp_iteration": True,
+                "decode_cuda_graph_backend": graph_backend,
+            })
+        for overrides in (
+            {"is_hy_v4_model": False},
+            {"is_hcu_platform": False, "device_capability": (9, 0)},
+            {"dcp_comm_backend": "fi_a2a"},
+            {"dcp_comm_backend": "invalid"},
+            {"fused_topk_enabled": True},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                _validate_dsa_dcp_launch(**{**base, **overrides})
+
     def test_dcp_disabled_is_noop(self):
         _validate_dsa_dcp_launch(
             **_valid_config(

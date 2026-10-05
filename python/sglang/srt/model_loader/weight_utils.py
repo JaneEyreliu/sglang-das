@@ -262,6 +262,22 @@ def _resolve_explicit_draft_quant_config(
     return quant_config
 
 
+def _get_hyv4_checkpoint_format(hf_folder, hf_config, quantization):
+    if (
+        quantization != "slimquant_w4a8_marlin"
+        or getattr(hf_config, "model_type", None) != "hy_v4"
+    ):
+        return None
+    manifest = os.path.join(hf_folder, "hy4-assets.json")
+    if not os.path.isfile(manifest):
+        return None
+    with open(manifest) as stream:
+        checkpoint_format = json.load(stream).get("format")
+    if checkpoint_format != "hy4_w4a8_v1":
+        raise ValueError(f"Unsupported HY4 checkpoint format: {checkpoint_format!r}")
+    return checkpoint_format
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig,
@@ -331,6 +347,19 @@ def get_quant_config(
             )
     else:
         hf_folder = model_name_or_path
+
+    # Component-suffixed HY4 exports identify packing in a separate manifest.
+    # Only HY4 + this quantization method may opt into the format conversion.
+    checkpoint_format = _get_hyv4_checkpoint_format(
+        hf_folder, model_config.hf_config, quant_cls.get_name()
+    )
+    if checkpoint_format is not None:
+        return quant_cls.from_config(
+            {
+                "checkpoint_format": checkpoint_format,
+                "packed_modules_mapping": packed_modules_mapping,
+            }
+        )
 
     possible_config_filenames = quant_cls.get_config_filenames()
 
