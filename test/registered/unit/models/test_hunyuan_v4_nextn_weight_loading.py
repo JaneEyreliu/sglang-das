@@ -68,7 +68,7 @@ class TestHunyuanV4NextNQuantConfig(CustomTestCase):
             )
         )
 
-    def test_all_supported_mtp_prefixes_are_normalized(self):
+    def test_mtp_fusion_and_norm_paths_match_root_level_modules(self):
         quant_config = SimpleNamespace(
             ignored_layers=[
                 "model.mtp.layers.0.eh_proj",
@@ -85,10 +85,10 @@ class TestHunyuanV4NextNQuantConfig(CustomTestCase):
         self.assertEqual(
             mtp_config.ignored_layers,
             [
-                "model.decoder.eh_proj",
-                "model.decoder.enorm",
-                "model.decoder.hnorm",
-                "model.decoder.shared_head.norm",
+                "model.eh_proj",
+                "model.enorm",
+                "model.hnorm",
+                "model.shared_head.norm",
             ],
         )
 

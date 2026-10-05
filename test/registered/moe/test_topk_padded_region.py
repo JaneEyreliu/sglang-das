@@ -1,4 +1,5 @@
 import unittest
+from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
 import torch
@@ -12,6 +13,8 @@ from sglang.srt.layers.moe.topk import (
     _post_process_topk_ids,
     _zero_topk_weights_padded_region,
 )
+from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -151,54 +154,160 @@ class TestZeroPaddedRegionIdempotent(CustomTestCase):
 
 
 class TestDeepEPPaddedTokenMasking(unittest.TestCase):
-    def _run_post_process(self, skip_deepep_padded_tokens):
-        topk_ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
-        topk_weights = torch.ones((2, 2), dtype=torch.float32)
-        router_logits = torch.ones((2, 8), dtype=torch.float32)
-        num_token_non_padded = torch.tensor(1, dtype=torch.int32)
-        cfg = TopKConfig(top_k=2, num_fused_shared_experts=0)
+    DEVICE = "cpu"
 
-        with (
-            patch.object(topk_mod, "_is_cuda", False),
-            patch.object(topk_mod, "_is_hip", True),
-            patch.object(topk_mod, "_is_hcu", skip_deepep_padded_tokens),
-            patch.object(topk_mod, "_eplb_remap_enabled", return_value=False),
-            patch.object(topk_mod, "capture_routed_experts_if_allowed"),
-            patch.object(topk_mod, "get_moe_a2a_backend") as get_a2a,
-            patch.object(topk_mod, "get_moe_runner_backend") as get_runner,
-            patch.object(topk_mod, "_mask_topk_ids_padded_region") as mask_ids,
-            patch.object(topk_mod, "_zero_topk_weights_padded_region") as zero_weights,
-        ):
-            get_a2a.return_value.is_deepep.return_value = skip_deepep_padded_tokens
-            get_runner.return_value.is_deep_gemm.return_value = (
-                skip_deepep_padded_tokens
+    @contextmanager
+    def _backend(
+        self,
+        *,
+        hcu=True,
+        a2a=MoeA2ABackend.DEEPEP,
+        runner=MoeRunnerBackend.AUTO,
+        quantization="slimquant_w4a8_marlin",
+        legacy_deepgemm=False,
+    ):
+        with ExitStack() as stack:
+            stack.enter_context(
+                get_flags().moe.override(
+                    a2a_backend=a2a,
+                    runner_backend=runner,
+                    quantization=quantization,
+                )
             )
-            _post_process_topk_ids(
-                topk_ids,
-                topk_weights,
-                cfg,
-                router_logits,
-                layer_id=0,
-                num_token_non_padded=num_token_non_padded,
+            for name, value in {
+                "_is_cuda": False,
+                "_is_hip": True,
+                "_is_hcu": hcu,
+                "_use_aiter": False,
+                "_use_deepgemm_moe": legacy_deepgemm,
+                "_skip_hip_pad_mask": False,
+                "_use_lightop_topk_ids_postprocess": False,
+            }.items():
+                stack.enter_context(patch.object(topk_mod, name, value))
+            stack.enter_context(
+                patch.object(topk_mod, "_eplb_remap_enabled", return_value=False)
             )
+            stack.enter_context(
+                patch.object(topk_mod, "capture_routed_experts_if_allowed")
+            )
+            if self.DEVICE == "cpu":
+                # CPU tests exercise routing policy and values without Inductor;
+                # the HIP subclass exercises the compiled helper and graph replay.
+                stack.enter_context(
+                    patch.object(topk_mod, "_can_fuse_padded_region", return_value=False)
+                )
+                stack.enter_context(
+                    patch.object(
+                        topk_mod,
+                        "_topk_ids_postprocess_torch",
+                        topk_mod._topk_ids_postprocess_torch._torchdynamo_orig_callable,
+                    )
+                )
+            yield
 
-        return mask_ids, zero_weights, topk_ids, num_token_non_padded
+    def _inputs(self, k=8):
+        ids = torch.arange(6 * k, device=self.DEVICE, dtype=torch.int32).view(6, k)
+        weights = (ids.float() + 1) / (6 * k)
+        logits = torch.zeros((6, 256), device=self.DEVICE)
+        return ids, weights, logits
 
-    def test_hcu_deepep_deepgemm_masks_ids_to_negative_one(self):
-        mask_ids, zero_weights, topk_ids, num_token_non_padded = self._run_post_process(
-            skip_deepep_padded_tokens=True
-        )
+    def _check(self, *, skip=True, **backend):
+        for dtype in (torch.int32, torch.int64):
+            for n_valid in (0, 3, 6, None):
+                with self.subTest(dtype=dtype, n_valid=n_valid, **backend):
+                    ids, weights, logits = self._inputs()
+                    ids = ids.to(dtype)
+                    expected_ids, expected_weights = ids.clone(), weights.clone()
+                    pad = (
+                        torch.tensor(n_valid, device=self.DEVICE, dtype=torch.int32)
+                        if n_valid is not None
+                        else None
+                    )
+                    if n_valid is not None:
+                        expected_ids[n_valid:] = -1 if skip else 0
+                        if not skip:
+                            expected_weights[n_valid:] = 0
+                    with self._backend(**backend):
+                        out_ids, out_weights, _ = _post_process_topk_ids(
+                            ids, weights, TopKConfig(top_k=8), logits, 0, pad
+                        )
+                    self.assertTrue(torch.equal(out_ids, expected_ids))
+                    self.assertTrue(torch.equal(out_weights, expected_weights))
+                    self.assertEqual(out_ids.dtype, torch.int64 if skip else dtype)
 
-        mask_ids.assert_called_once_with(topk_ids, num_token_non_padded, fill_value=-1)
-        zero_weights.assert_not_called()
+    def test_w4a8_auto_and_lightop_skip_padding(self):
+        for runner in (MoeRunnerBackend.AUTO, MoeRunnerBackend.LIGHTOP):
+            self._check(runner=runner)
+
+    def test_deepgemm_selectors_still_skip_padding(self):
+        self._check(quantization=None, runner=MoeRunnerBackend.DEEP_GEMM)
+        self._check(quantization=None, legacy_deepgemm=True)
 
     def test_other_hip_paths_keep_in_range_ids_and_zero_weights(self):
-        mask_ids, zero_weights, topk_ids, num_token_non_padded = self._run_post_process(
-            skip_deepep_padded_tokens=False
-        )
+        self._check(skip=False, hcu=False)
+        self._check(skip=False, a2a=MoeA2ABackend.NONE)
+        self._check(skip=False, quantization=None, runner=MoeRunnerBackend.AITER)
 
-        mask_ids.assert_called_once_with(topk_ids, num_token_non_padded, fill_value=0)
-        zero_weights.assert_called_once()
+    def test_shared_slots_are_masked_after_remapping(self):
+        for n_valid in (0, 3, 6):
+            with self.subTest(n_valid=n_valid):
+                ids, weights, logits = self._inputs(k=9)
+                expected_ids, expected_weights = ids.clone(), weights.clone()
+                expected_ids[:, :-1] += expected_ids[:, :-1] // 8
+                expected_ids[:, -1] = 8
+                expected_ids[n_valid:] = -1
+                expected_weights[:, -1] = 0.5
+                pad = torch.tensor(n_valid, device=self.DEVICE, dtype=torch.int32)
+                with self._backend(), get_parallel().override(
+                    moe_ep_size=32, moe_ep_rank=0
+                ):
+                    out_ids, out_weights, _ = _post_process_topk_ids(
+                        ids,
+                        weights,
+                        TopKConfig(
+                            top_k=9,
+                            num_fused_shared_experts=1,
+                            routed_scaling_factor=2.0,
+                        ),
+                        logits,
+                        0,
+                        pad,
+                    )
+                self.assertTrue(torch.equal(out_ids, expected_ids))
+                self.assertTrue(torch.equal(out_weights, expected_weights))
+
+
+@unittest.skipUnless(_IS_HIP and torch.cuda.is_available(), "needs a HIP GPU")
+class TestDeepEPPaddedTokenMaskingHip(TestDeepEPPaddedTokenMasking):
+    DEVICE = "cuda"
+
+    def test_graph_replay_reads_current_valid_count(self):
+        ids, weights, logits = self._inputs()
+        work = ids.clone()
+        pad = torch.tensor(6, device=self.DEVICE, dtype=torch.int32)
+        cfg = TopKConfig(top_k=8)
+        with self._backend():
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    _post_process_topk_ids(work, weights, cfg, logits, 0, pad)
+            torch.cuda.current_stream().wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out_ids, out_weights, _ = _post_process_topk_ids(
+                    work, weights, cfg, logits, 0, pad
+                )
+            # Includes an entirely padded DCP rank and a later fully valid batch.
+            for n_valid in (3, 0, 6, 1):
+                work.copy_(ids)
+                pad.fill_(n_valid)
+                graph.replay()
+                torch.cuda.synchronize()
+                expected = ids.clone()
+                expected[n_valid:] = -1
+                self.assertTrue(torch.equal(out_ids, expected))
+                self.assertTrue(torch.equal(out_weights, weights))
 
 
 @unittest.skipUnless(
