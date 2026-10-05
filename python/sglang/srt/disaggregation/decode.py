@@ -1059,6 +1059,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # HiSparse admits up to the host-backed logical capacity.
         if self.scheduler.enable_hisparse:
             capacity = self.scheduler.tp_worker.model_runner.max_token_pool_size
+        elif get_parallel().dcp_enabled:
+            # A paged DCP allocator exposes virtual token ids widened by the
+            # attention-DCP size while its backing KV pages remain rank-local.
+            # Admission must compare the global request length with that
+            # virtual capacity, not with one rank's physical pool size.
+            capacity = self.token_to_kv_pool_allocator.size
         else:
             capacity = self.max_total_num_tokens
         input_len = self._rebootstrap_prefill_len(req)

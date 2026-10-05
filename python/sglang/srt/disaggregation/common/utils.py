@@ -263,6 +263,42 @@ class DCPTokenTransferPlan:
     dst_token_indices: npt.NDArray[np.int64]
 
 
+def localize_num_kv_tokens_for_page_slice(
+    num_kv_tokens: Optional[int],
+    *,
+    original_page_start: int,
+    sliced_page_start: int,
+    sliced_page_count: int,
+    physical_page_size: int,
+) -> Optional[int]:
+    """Return the valid-token count after a contiguous page slice.
+
+    ``num_kv_tokens`` describes the unfiltered chunk beginning at
+    ``original_page_start``. Prefill context parallelism can give each CP rank
+    only a sub-slice of those pages. The DCP relayout plan consumes a token
+    count relative to that sub-slice, so forwarding the original count can
+    exceed the local source capacity (and, for the ragged tail, copy invalid
+    token rows).
+    """
+    if num_kv_tokens is None:
+        return None
+    if num_kv_tokens < 0:
+        raise ValueError(f"num_kv_tokens must be non-negative, got {num_kv_tokens}")
+    if sliced_page_start < original_page_start:
+        raise ValueError(
+            "sliced_page_start must not precede original_page_start, "
+            f"got {sliced_page_start} < {original_page_start}"
+        )
+    if sliced_page_count < 0:
+        raise ValueError(
+            f"sliced_page_count must be non-negative, got {sliced_page_count}"
+        )
+
+    skipped_tokens = (sliced_page_start - original_page_start) * physical_page_size
+    sliced_capacity = sliced_page_count * physical_page_size
+    return max(0, min(num_kv_tokens - skipped_tokens, sliced_capacity))
+
+
 def build_dcp_token_transfer_plan(
     src_page_indices: npt.NDArray[np.int32],
     dst_page_indices: npt.NDArray[np.int32],

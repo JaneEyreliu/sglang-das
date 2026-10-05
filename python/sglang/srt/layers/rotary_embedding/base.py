@@ -17,6 +17,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_mps,
     is_musa,
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
@@ -94,7 +96,10 @@ class RotaryEmbedding(BaseFusedOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
-        self._force_native = (
+        # The prebuilt HCU sgl_kernel RoPE binary has a 256-thread launch
+        # bound but launches 512 threads for GLM's head layout. Keep the
+        # verified native fallback until the binary is rebuilt consistently.
+        self._force_native = _is_hcu or (
             publish_role() is not None
             and get_exec().deterministic.rl_on_policy_target is not None
         )

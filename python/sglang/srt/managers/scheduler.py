@@ -1330,6 +1330,68 @@ class Scheduler(
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
 
+    @staticmethod
+    def _validate_pd_decode_dp_sync_parallel_sizes(ps: ParallelState) -> None:
+        if ps.pp_size != 1:
+            raise RuntimeError("PD Decode DP sync currently supports pp_size=1 only")
+        # Attention TP participates in the full scheduler group and is valid
+        # for DCP. Attention context parallelism is not in this envelope.
+        if ps.attn_cp_size != 1:
+            raise RuntimeError(
+                "PD Decode DP sync currently supports attn_cp_size=1 only"
+            )
+
+    def _init_pd_decode_stepinfo_sync(self) -> None:
+        """Initialize the optional scheduler StepInfo process group."""
+        self.dp_scheduler_cpu_group = None
+        self._dp_scheduler_epoch = 0
+        self._enable_pd_decode_stepinfo_sync = (
+            envs.SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC.get()
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.server_args.enable_dp_attention
+        )
+        if not self._enable_pd_decode_stepinfo_sync:
+            return
+
+        if not self.require_mlp_sync:
+            raise RuntimeError("PD Decode DP sync requires require_mlp_sync=True")
+        self._validate_pd_decode_dp_sync_parallel_sizes(self.ps)
+
+        tp_ranks = list(self.tp_group.ranks)
+        expected_world = (
+            self.server_args.dp_size * self.ps.attn_tp_size * self.ps.attn_cp_size
+        )
+        default_world = torch.distributed.get_world_size()
+        if len(tp_ranks) != expected_world or len(tp_ranks) != default_world:
+            raise RuntimeError(
+                "PD Decode DP sync topology check failed: "
+                f"tp_ranks={len(tp_ranks)} expected={expected_world} "
+                f"default_world={default_world}. "
+                "Supported only on PP1 DP-attention Decode topology."
+            )
+        expected_ranks = list(range(default_world))
+        if tp_ranks != expected_ranks:
+            raise RuntimeError(
+                "PD Decode DP sync requires tp_group.ranks to be the ordered "
+                f"full default world: actual={tp_ranks} expected={expected_ranks}"
+            )
+
+        from datetime import timedelta
+
+        timeout_s = 60.0
+        self.dp_scheduler_cpu_group = torch.distributed.new_group(
+            ranks=tp_ranks,
+            backend="gloo",
+            timeout=timedelta(seconds=timeout_s),
+        )
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "PD Decode StepInfo sync enabled: dedicated Gloo scheduler "
+                "group, world=%s timeout=%.1fs",
+                len(tp_ranks),
+                timeout_s,
+            )
+
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
@@ -1342,63 +1404,7 @@ class Scheduler(
             get_disagg().disaggregation_transfer_backend
         )
 
-        # Dedicated Gloo group for epoch-tagged StepInfo/MLPSync all-gather.
-        # Do not mix recv-control or model-forward collectives into it.
-        # A process-group timeout is replica-fatal; no plain-barrier fallback.
-        self.dp_scheduler_cpu_group = None
-        self._dp_scheduler_epoch = 0
-        if (
-            self.disaggregation_mode == DisaggregationMode.DECODE
-            and self.server_args.enable_dp_attention
-        ):
-            if not self.require_mlp_sync:
-                raise RuntimeError("PD Decode DP sync requires require_mlp_sync=True")
-            if self.ps.pp_size != 1:
-                raise RuntimeError(
-                    "PD Decode DP sync currently supports pp_size=1 only"
-                )
-            # if self.ps.attn_tp_size != 1 or self.ps.attn_cp_size != 1:
-            #     raise RuntimeError(
-            #         "PD Decode DP sync currently supports attn_tp_size=1 and "
-            #         "attn_cp_size=1 only"
-            #     )
-
-            tp_ranks = list(self.tp_group.ranks)
-            expected_world = (
-                self.server_args.dp_size * self.ps.attn_tp_size * self.ps.attn_cp_size
-            )
-            default_world = torch.distributed.get_world_size()
-            if len(tp_ranks) != expected_world or len(tp_ranks) != default_world:
-                raise RuntimeError(
-                    "PD Decode DP sync topology check failed: "
-                    f"tp_ranks={len(tp_ranks)} expected={expected_world} "
-                    f"default_world={default_world}. "
-                    "Supported only on PP1 DP-attention Decode topology."
-                )
-            expected_ranks = list(range(default_world))
-            if tp_ranks != expected_ranks:
-                raise RuntimeError(
-                    "PD Decode DP sync requires tp_group.ranks to be the ordered "
-                    f"full default world: actual={tp_ranks} "
-                    f"expected={expected_ranks}"
-                )
-
-            from datetime import timedelta
-
-            # Dedicated scheduler-group timeout for PD Decode DP sync.
-            timeout_s = 60.0
-            self.dp_scheduler_cpu_group = torch.distributed.new_group(
-                ranks=tp_ranks,
-                backend="gloo",
-                timeout=timedelta(seconds=timeout_s),
-            )
-            if self.ps.tp_rank == 0:
-                logger.info(
-                    "PD Decode single-clock enabled: dedicated Gloo scheduler "
-                    "group, world=%s timeout=%.1fs",
-                    len(tp_ranks),
-                    timeout_s,
-                )
+        self._init_pd_decode_stepinfo_sync()
 
         # In rust-server mode the KV bootstrap registry is already serving on
         # the rust api listener (maybe_init_rust_server runs before this
@@ -2167,10 +2173,7 @@ class Scheduler(
 
     def get_pd_decode_step_context(self):
         """Build the epoch-tagged scheduler state for the PD Decode DP sync."""
-        if not (
-            self.disaggregation_mode == DisaggregationMode.DECODE
-            and self.server_args.enable_dp_attention
-        ):
+        if not getattr(self, "_enable_pd_decode_stepinfo_sync", False):
             return None
 
         sync_group = self.dp_scheduler_cpu_group

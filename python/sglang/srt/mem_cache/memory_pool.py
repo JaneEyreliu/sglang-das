@@ -101,6 +101,56 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
 
+
+def _remap_hcu_dcp_graph_kv_write_locs(
+    loc: torch.Tensor,
+    *,
+    dcp_size: int,
+    dcp_rank: int,
+    pool_size: int,
+    padding_capacity: int,
+) -> torch.Tensor:
+    """Keep HCU DCP KV writes static-shaped during CUDA Graph capture."""
+    num_rows = loc.numel()
+    assert num_rows <= padding_capacity, (
+        "HCU DCP CUDA Graph KV writes require the captured batch "
+        f"({num_rows}) not to exceed padding capacity ({padding_capacity})."
+    )
+    valid_mask = loc % dcp_size == dcp_rank
+    local_loc = loc // dcp_size
+    padding_loc = pool_size + torch.arange(
+        num_rows, dtype=loc.dtype, device=loc.device
+    )
+    return torch.where(valid_mask, local_loc, padding_loc)
+
+
+def compute_hcu_dcp_graph_kv_padding_capacity(
+    *,
+    pool_page_size: int,
+    page_size: int,
+    dcp_enabled: bool,
+    is_hcu_platform: bool,
+    speculative_algorithm: Optional[str],
+    decode_cuda_graph_backend: str,
+    decode_cuda_graph_max_bs: Optional[int],
+    speculative_num_draft_tokens: Optional[int],
+) -> int:
+    """Return allocator-external rows reserved for static graph KV writes."""
+    capacity = pool_page_size
+    if not (
+        dcp_enabled
+        and is_hcu_platform
+        and speculative_algorithm == "EAGLE"
+        and decode_cuda_graph_backend == "full"
+    ):
+        return capacity
+
+    max_bs = decode_cuda_graph_max_bs or 0
+    draft_tokens = speculative_num_draft_tokens or 0
+    required_rows = max_bs * draft_tokens
+    aligned_rows = (required_rows + page_size - 1) // page_size * page_size
+    return max(capacity, aligned_rows)
+
 from sglang.srt.utils import get_bool_env_var
 
 _kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
@@ -4253,6 +4303,7 @@ class MLATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
+        padding_capacity: Optional[int] = None,
     ):
         super().__init__(
             size,
@@ -4268,6 +4319,19 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
+        self.padding_capacity = padding_capacity or page_size
+        assert self.padding_capacity >= self.page_size, (
+            "MLA KV padding capacity must cover at least one pool page; "
+            f"got capacity={self.padding_capacity}, page_size={self.page_size}."
+        )
+        if self.padding_capacity != self.page_size:
+            logger.info(
+                "MLA KV graph padding expanded: pool_size=%d, page_size=%d, "
+                "padding_capacity=%d",
+                self.size,
+                self.page_size,
+                self.padding_capacity,
+            )
         self.dsa_kv_cache_store_fp8 = (
             use_dsa
             and dtype == torch.float8_e4m3fn
@@ -4299,10 +4363,11 @@ class MLATokenToKVPool(KVCache):
                 if self.custom_mem_pool
                 else nullcontext()
             ):
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                # Padding rows absorb graph dummy/non-owner writes and are not
+                # visible to the allocator.
                 self.kv_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        (self.size + self.padding_capacity, 1, self.kv_cache_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -4371,7 +4436,9 @@ class MLATokenToKVPool(KVCache):
         layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
-        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
+        maybe_detect_oob(
+            loc, 0, self.size + self.padding_capacity, "set_kv_buffer (MLA)"
+        )
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
@@ -4432,6 +4499,34 @@ class MLATokenToKVPool(KVCache):
             if _is_hcu:
                 from lightop import kvcache as op
 
+                parallel = get_parallel()
+                if parallel.dcp_enabled:
+                    # LightOp has no DCP owner/slot parameters. Convert the
+                    # widened virtual locations to this rank's local slots.
+                    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+                    if get_is_capture_mode():
+                        # Boolean indexing performs a dynamic nonzero/compaction,
+                        # which HCU cannot capture in a CUDA graph. Keep the
+                        # launch shape static and redirect every non-owner row to
+                        # its own reserved padding slot.
+                        loc = _remap_hcu_dcp_graph_kv_write_locs(
+                            loc,
+                            dcp_size=parallel.attn_dcp_size,
+                            dcp_rank=parallel.attn_dcp_rank,
+                            pool_size=self.size,
+                            padding_capacity=self.padding_capacity,
+                        )
+                    else:
+                        valid_mask = (
+                            loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
+                        )
+                        loc = loc[valid_mask] // parallel.attn_dcp_size
+                        if loc.numel() == 0:
+                            return
+                        cache_k_nope = cache_k_nope[valid_mask]
+                        cache_k_rope = cache_k_rope[valid_mask]
+
                 op.fused_quantize_and_store_mla_kv_cache(
                     cache_k_nope,
                     cache_k_rope,
@@ -4477,7 +4572,7 @@ class MLATokenToKVPool(KVCache):
         maybe_detect_oob(
             loc,
             0,
-            (self.size + self.page_size) * get_parallel().attn_dcp_size,
+            (self.size + self.padding_capacity) * get_parallel().attn_dcp_size,
             "set_mla_kv_buffer (MLA)",
         )
         layer_id = (
@@ -4515,7 +4610,7 @@ class MLATokenToKVPool(KVCache):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate accepted-token combined MLA KV (latent + rope) per layer."""
-        size_limit = self.size + self.page_size
+        size_limit = self.size + self.padding_capacity
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
@@ -4564,7 +4659,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 else nullcontext()
             ):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                m = self.size + self.page_size
+                m = self.size + self.padding_capacity
                 n = 1  # head_num
                 k = self.kv_cache_dim  # head_dim
 
@@ -4623,7 +4718,9 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     ):
         # loc_info may be a KVWriteLoc; MLA pools have no SWA target.
         loc, _, _ = unwrap_write_loc(loc_info)
-        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA-FP4)")
+        maybe_detect_oob(
+            loc, 0, self.size + self.padding_capacity, "set_kv_buffer (MLA-FP4)"
+        )
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
@@ -4653,7 +4750,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_k_rope: torch.Tensor,
     ):
         maybe_detect_oob(
-            loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA-FP4)"
+            loc, 0, self.size + self.padding_capacity, "set_mla_kv_buffer (MLA-FP4)"
         )
         layer_id = layer.layer_id
 
@@ -4716,6 +4813,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
         indexer_layer_ids: Optional[Sequence[int]] = None,
+        index_page_size: Optional[int] = None,
+        padding_capacity: Optional[int] = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -4734,6 +4833,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             end_layer,
             use_dsa=True,
             override_kv_cache_dim=override_dim,
+            padding_capacity=padding_capacity,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
@@ -4761,13 +4861,19 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.indexer_layer_id_to_index = {
             layer_id: index for index, layer_id in enumerate(self.indexer_layer_ids)
         }
+        # A replicated DCP draft pool uses the global virtual KV page width
+        # (page_size * DCP), while the HCU DSA indexer ABI remains page-64.
+        self.index_page_size = index_page_size or page_size
         if index_buf_size is None:
-            index_buf_size = size
+            parallel = get_parallel()
+            index_buf_size = size * (
+                parallel.attn_dcp_size if parallel.dcp_enabled else 1
+            )
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
         self.index_k_cache_mode = resolve_index_k_cache_mode(
-            dtype, page_size, index_head_dim
+            dtype, self.index_page_size, index_head_dim
         )
         self.use_fp8_index_k_cache = (
             self.index_k_cache_mode is IndexKCacheMode.FP8_SCALED
@@ -4794,7 +4900,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     self.page_size == 1
                 ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
         else:
-            assert self.page_size == 64
+            assert self.index_page_size == 64
+            if self.index_page_size != self.page_size:
+                assert self.index_k_cache_mode is IndexKCacheMode.BF16, (
+                    "Virtual DCP draft pages require the BF16 index-K cache; "
+                    "scaled index-K layouts must match the KV pool page size."
+                )
         self.index_key_cache = self._create_index_key_cache()
         self._initialize_int8_index_k_workspace()
         self._finalize_allocation_log(size)
@@ -4844,7 +4955,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 remote_buffer
             )
 
-        num_pages = (self.index_buf_size + self.page_size + 1) // self.page_size
+        num_pages = (
+            self.index_buf_size + self.index_page_size + 1
+        ) // self.index_page_size
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -4853,7 +4966,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             self.index_k_dequant_workspace = torch.empty(
                 (
                     num_pages,
-                    self.page_size,
+                    self.index_page_size,
                     1,
                     self.index_head_dim,
                 ),
@@ -4865,7 +4978,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
             )
 
     def _create_index_k_buffer(self):
-        num_pages = (self.index_buf_size + self.page_size + 1) // self.page_size
+        num_pages = (
+            self.index_buf_size + self.index_page_size + 1
+        ) // self.index_page_size
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -4875,7 +4990,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 torch.zeros(
                     (
                         num_pages,
-                        self.page_size,
+                        self.index_page_size,
                         1,
                         self.index_head_dim,
                     ),
@@ -4954,12 +5069,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
         page_indices: torch.Tensor,
     ):
         if self.use_int8_index_k_cache:
-            num_pages = (seq_len + self.page_size - 1) // self.page_size
+            num_pages = (seq_len + self.index_page_size - 1) // self.index_page_size
             return self.index_k_dequant_workspace[page_indices[:num_pages]].view(
                 -1, 1, self.index_head_dim
             )[:seq_len]
         if self.index_k_cache_mode is IndexKCacheMode.BF16:
-            num_pages = (seq_len + self.page_size - 1) // self.page_size
+            num_pages = (seq_len + self.index_page_size - 1) // self.index_page_size
             buf = self.get_index_k_buffer(layer_id)
             return buf[page_indices[:num_pages]].view(-1, 1, self.index_head_dim)[
                 :seq_len
@@ -5072,11 +5187,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
             }
 
         index_k_cache = self.index_k_buffer
-        page_indices = indices[:: self.page_size] // self.page_size
+        page_indices = (
+            indices[:: self.index_page_size] // self.index_page_size
+        )
         torch.cuda.synchronize()
         index_k_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.page_size)
+        page_chunk_size = max(1, chunk_size // self.index_page_size)
         for layer_id in range(self.indexer_layer_num):
             index_k_cpu.append([])
             for i in range(0, len(page_indices), page_chunk_size):
@@ -5097,12 +5214,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
             self.index_key_cache.load_cpu_copy(kv_cache_cpu_dict["index_k"], indices)
             return
 
-        page_indices = indices[:: self.page_size] // self.page_size
+        page_indices = (
+            indices[:: self.index_page_size] // self.index_page_size
+        )
         index_k_cpu = kv_cache_cpu_dict["index_k"]
         index_k_cache = self.index_k_buffer
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.page_size)
+        page_chunk_size = max(1, chunk_size // self.index_page_size)
         for layer_id in range(self.indexer_layer_num):
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
@@ -5123,7 +5242,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             index_k = index_k.to(self.index_k_buffer_dtype)
 
         self.index_k_buffer[self._get_indexer_cache_index(layer_id)][
-            loc // self.page_size, loc % self.page_size
+            loc // self.index_page_size, loc % self.index_page_size
         ] = index_k
 
     def get_state_buf_infos(self):
@@ -5148,7 +5267,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         """Return the persistent index-K page ABI used by PD state transfer."""
         return (
             f"dsa-index-k-page-v1:{self.index_k_cache_mode.value}:"
-            f"page_size={self.page_size}:head_dim={self.index_head_dim}"
+            f"page_size={self.index_page_size}:head_dim={self.index_head_dim}"
         )
 
     def get_kv_size_bytes(self):

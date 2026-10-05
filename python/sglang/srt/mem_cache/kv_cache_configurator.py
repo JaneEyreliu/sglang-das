@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
+    compute_hcu_dcp_graph_kv_padding_capacity,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
@@ -85,6 +86,7 @@ from sglang.srt.utils.common import (
     get_available_gpu_memory,
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
+    is_hcu,
     is_hip,
     is_npu,
 )
@@ -323,6 +325,20 @@ class KVCacheConfigurator:
     @property
     def pool_page_size(self) -> int:
         return get_schedule().page_size * self.loc_space_scale
+
+    @property
+    def graph_kv_padding_capacity(self) -> int:
+        graph_config = self.server_args.cuda_graph_config.decode
+        return compute_hcu_dcp_graph_kv_padding_capacity(
+            pool_page_size=self.pool_page_size,
+            page_size=get_schedule().page_size,
+            dcp_enabled=get_parallel().dcp_enabled,
+            is_hcu_platform=is_hcu(),
+            speculative_algorithm=self.server_args.speculative_algorithm,
+            decode_cuda_graph_backend=graph_config.backend,
+            decode_cuda_graph_max_bs=graph_config.max_bs,
+            speculative_num_draft_tokens=max_speculative_num_draft_tokens(),
+        )
 
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
         max_total_num_tokens = config.max_total_num_tokens
@@ -1392,6 +1408,14 @@ class KVCacheConfigurator:
             pool_kwargs["indexer_prefetch_layer_ids"] = full_indexer_layer_ids
         if not get_memory().enable_hisparse:
             pool_kwargs["indexer_layer_ids"] = indexer_layer_ids
+        if self.is_draft_worker and self.loc_space_scale > 1:
+            # The replicated draft stores global virtual token ids, so its KV
+            # page spans DCP ranks. HCU DSA indexer kernels still consume
+            # physical page-64 index-K storage indexed by those raw ids.
+            pool_kwargs["index_page_size"] = get_schedule().page_size
+            pool_kwargs["index_buf_size"] = max_total_num_tokens
+        if self.graph_kv_padding_capacity > self.pool_page_size:
+            pool_kwargs["padding_capacity"] = self.graph_kv_padding_capacity
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,

@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
+    localize_num_kv_tokens_for_page_slice,
     pack_int_lists,
     unpack_int_lists,
 )
@@ -2784,11 +2785,20 @@ class NixlKVSender(CommonKVSender):
         if self._send_failed:
             return
 
+        original_page_start = self.curr_idx
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
         if should_skip:
             return
+
+        num_kv_tokens = localize_num_kv_tokens_for_page_slice(
+            num_kv_tokens,
+            original_page_start=original_page_start,
+            sliced_page_start=index_slice.start or 0,
+            sliced_page_count=len(kv_indices),
+            physical_page_size=self.kv_mgr.kv_args.page_size,
+        )
 
         if self._transfer_start_time is None and (
             len(kv_indices) > 0 or state_indices is not None

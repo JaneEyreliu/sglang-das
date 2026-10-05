@@ -107,12 +107,16 @@ def _select_local_dcp_heads_for_autotune(
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
 
 
-def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
+def is_dcp_mla_decode_phase(
+    forward_batch: ForwardBatch, *, use_dsa: bool = False
+) -> bool:
     if not get_parallel().dcp_enabled:
         return False
     return (
         forward_batch.forward_mode.is_decode()
         or forward_batch.forward_mode.is_target_verify()
+        or (use_dsa and forward_batch.forward_mode.is_draft_extend_v2())
+        or (use_dsa and forward_batch.forward_mode.is_extend_without_speculative())
     )
 
 
@@ -640,7 +644,7 @@ class DeepseekMLAForwardMixin:
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:
-            if is_dcp_mla_decode_phase(forward_batch):
+            if is_dcp_mla_decode_phase(forward_batch, use_dsa=self.use_dsa):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
@@ -738,7 +742,7 @@ class DeepseekMLAForwardMixin:
                     topk_indices=topk_indices,
                 )
                 attn_output = fusion_plan.attn_output_buf
-            elif is_dcp_mla_decode_phase(forward_batch):
+            elif is_dcp_mla_decode_phase(forward_batch, use_dsa=self.use_dsa):
                 # set return_lse=True to correct attn_output
                 attn_output, lse = self.attn_mqa_for_dcp_decode(
                     q_nope_out,
@@ -789,7 +793,7 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if is_dcp_mla_decode_phase(forward_batch):
+        if is_dcp_mla_decode_phase(forward_batch, use_dsa=self.use_dsa):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,

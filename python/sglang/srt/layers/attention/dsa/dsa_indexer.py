@@ -824,7 +824,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = getattr(pool, "index_page_size", pool.page_size)
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
@@ -1092,7 +1092,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = getattr(pool, "index_page_size", pool.page_size)
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip and not _is_hcu:
             if _use_aiter_preshuffle:
@@ -1496,7 +1496,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert effective_forward_mode(forward_batch).is_extend_without_speculative()
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = getattr(pool, "index_page_size", pool.page_size)
         if _is_hip and not _is_hcu:
             if _use_aiter_preshuffle:
                 assert (
@@ -1850,7 +1850,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = getattr(pool, "index_page_size", pool.page_size)
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
