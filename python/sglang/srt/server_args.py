@@ -10107,9 +10107,18 @@ class ServerArgs:
             pp_dspark_prefill = (
                 self.speculative_algorithm or ""
             ).upper() == "DSPARK" and self.disaggregation_mode == "prefill"
-            assert self.speculative_algorithm is None or pp_dspark_prefill, (
+            # EAGLE/NEXTN under PP is the PD-prefill MTP path (draft on the last
+            # stage); the per-algorithm spec hook validates the rest.
+            from sglang.srt.distributed.utils import is_pp_mtp_prefill
+
+            pp_mtp_prefill = is_pp_mtp_prefill(self)
+            assert (
+                self.speculative_algorithm is None
+                or pp_dspark_prefill
+                or pp_mtp_prefill
+            ), (
                 "Pipeline parallelism with speculative decoding is only supported "
-                "for DSPARK on a PD prefill server"
+                "for DSPARK or EAGLE/NEXTN on a PD prefill server"
             )
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "

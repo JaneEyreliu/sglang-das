@@ -34,7 +34,8 @@ class IndexTopKShareState:
     @property
     def _seed_buf(self) -> Optional[torch.Tensor]:
         if self._forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-            return self._forward_batch.spec_info.dsa_seed_topk_capture
+            spec_info = self._forward_batch.spec_info
+            return spec_info.dsa_seed_topk_capture if spec_info is not None else None
         return None
 
     @property

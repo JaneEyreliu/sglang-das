@@ -1,0 +1,22 @@
+--- a/python/sglang/srt/layers/quantization/slimquant_w4a8_marlin.py
++++ b/python/sglang/srt/layers/quantization/slimquant_w4a8_marlin.py
+@@ -562,7 +562,18 @@
+             if self.checkpoint_format == "hy4_w4a8_v1":
+                 if ".mlp.shared_experts." in prefix:
+                     return HYV4SharedExpertLinearMethod(self)
+-                return SlimQuantW4A8Int8LinearMethod(self)
++                # Match the 0916 HY4 policy: without an ignore list, ordinary
++                # LinearBase layers remain unquantized; with an ignore list,
++                # only layers outside that list use the SlimQuant path.
++                if self.ignore and should_ignore_layer(
++                    layer_name=prefix,
++                    ignore=self.ignore,
++                    fused_mapping=getattr(self, "packed_modules_mapping", {}),
++                ):
++                    return UnquantizedLinearMethod()
++                if self.ignore:
++                    return SlimQuantW4A8Int8LinearMethod(self)
++                return UnquantizedLinearMethod()
+             # Kimi-K3 INT4 (from mxfp4_to_int4.py) only quantizes the routed
+             # experts; dense layers stay in BF16 and are listed in the
+             # checkpoint's ignore list (native compressed-tensors style, with

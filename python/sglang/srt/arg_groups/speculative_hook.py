@@ -955,6 +955,29 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             f"{view.attention_backend!r}. Use page_size == 1 or one of those backends."
         )
 
+    # PP with EAGLE/NEXTN is only the PD-prefill MTP path: the draft lives on the
+    # last PP stage while decode runs DCP in a separate process. Every other
+    # PP+EAGLE combination is unvalidated, so reject it here.
+    if server_args.pp_size > 1:
+        from sglang.srt.distributed.utils import is_pp_mtp_prefill
+
+        if not is_pp_mtp_prefill(server_args):
+            raise ValueError(
+                "Pipeline parallelism with EAGLE/NEXTN speculative decoding is "
+                "only supported on a PD prefill server "
+                "(--disaggregation-mode prefill)."
+            )
+        if (
+            server_args.speculative_use_rejection_sampling
+            or server_args.speculative_adaptive
+            or view.enable_multi_layer_eagle
+            or server_args.dp_size > 1
+        ):
+            raise ValueError(
+                "PP MTP prefill does not support rejection sampling, adaptive or "
+                "multi-layer MTP, or dp_size > 1."
+            )
+
 
 def _handle_ngram(server_args: ServerArgs) -> None:
     if server_args.device not in ("cuda", "cpu"):
