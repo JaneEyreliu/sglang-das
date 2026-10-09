@@ -58,7 +58,6 @@ from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import (
     create_index_k_int8_aliases,
     dequantize_index_k_int8_paged,
     index_k_cache_bytes_per_token,
-    precompile_dequantize_index_k_int8_paged,
     quantize_and_store_index_k_int8,
     resolve_index_k_cache_mode,
 )
@@ -4992,38 +4991,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
             self.index_k_page_claims = torch.empty(
                 (num_pages,), dtype=torch.int32, device=self.device
             )
-
-        # Prefill CUDA graphs may be disabled, so the regular server warmup
-        # does not necessarily visit the ragged INT8 dequant path before the
-        # scheduler starts serving. Compile one signature while the pool is
-        # still being initialized; the kernel's runtime strides make it
-        # reusable across later page-table widths.
-        if self.indexer_layer_num > 0:
-            # Layer-split pools keep zero-page placeholders for non-owned
-            # layers. Use any owned page buffer, falling back to the remote
-            # scratch buffer when this rank owns no indexer layer.
-            precompile_cache = None
-            precompile_aliases = None
-            for cache, aliases in zip(
-                self.index_key_cache.buffer, self.index_k_int8_aliases
-            ):
-                if cache.shape[0] > 0:
-                    precompile_cache = cache
-                    precompile_aliases = aliases
-                    break
-            if precompile_cache is None:
-                remote_cache = getattr(self.index_key_cache, "remote_buffer", None)
-                if remote_cache is not None and remote_cache.shape[0] > 0:
-                    precompile_cache = remote_cache
-                    precompile_aliases = self.index_k_int8_remote_aliases
-            if precompile_cache is not None and precompile_aliases is not None:
-                precompile_dequantize_index_k_int8_paged(
-                    precompile_cache,
-                    self.index_k_dequant_workspace,
-                    self.index_k_page_claims,
-                    int8_k=precompile_aliases[0],
-                    fp32_scales=precompile_aliases[1],
-                )
 
     def _create_index_k_buffer(self):
         num_pages = self.index_num_pages

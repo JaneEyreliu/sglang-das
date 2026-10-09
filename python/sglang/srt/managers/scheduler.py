@@ -106,7 +106,6 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.distributed.utils import is_pp_mtp_prefill
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -1431,15 +1430,8 @@ class Scheduler(
 
         if self.spec_algorithm.carries_draft_hidden_states():
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
-            # worker, so a single accessor covers both shapes. On a PP MTP
-            # prefill server the draft worker lives only on the last stage;
-            # earlier stages have no local draft and read the spec off the target.
-            local_draft = self.draft_worker.draft_worker
-            draft_runner = (
-                local_draft.draft_runner
-                if local_draft is not None
-                else self.tp_worker.model_runner
-            )
+            # worker, so a single accessor covers both shapes.
+            draft_runner = self.draft_worker.draft_worker.draft_runner
             disagg_hidden_size, disagg_hidden_states_dtype = (
                 get_draft_recurrent_hidden_state_spec(draft_runner)
             )
@@ -4042,20 +4034,6 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
-                self._copy_auxiliary_output_to_cpu(batch, batch_result)
-            elif is_pp_mtp_prefill(self.server_args):
-                # PP MTP prefill: thread the PP proxy (hidden_states +
-                # topk_indices) through to the target; the last-stage draft
-                # worker turns the carry into next_draft_input, which the PD
-                # relay ships to the decode side. Runs non-overlap (PP forces
-                # --disable-overlap-schedule).
-                resolve_forward_inputs(batch, self.future_map)
-                with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(
-                        batch, pp_proxy_tensors=pp_proxy_tensors
-                    )
-                batch.spec_info = batch_result.next_draft_input
-                self.update_cache_from_scheduler(batch, batch_result)
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no

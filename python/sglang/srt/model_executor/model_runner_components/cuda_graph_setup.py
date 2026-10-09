@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelImpl
-from sglang.srt.distributed import get_tp_group, get_world_group
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
@@ -149,12 +149,11 @@ def capture_cuda_graphs(
             set_masked_standard_layout_memory_budget,
         )
 
-        # A PP draft exists only on the last stage; WORLD would wait for absent drafts.
-        memory_group = (
-            get_tp_group()
-            if model_runner.is_draft_worker and model_runner.ps.pp_size > 1
-            else get_world_group()
-        )
+        # The speculative draft runner can exist only on the last PP stage.
+        # All-reducing over the world group here would deadlock with collectives
+        # entered by the other PP stages, while every rank in this TP group
+        # executes this branch.
+        memory_group = get_tp_group()
         available_memory_gb = get_available_gpu_memory(
             model_runner.device,
             model_runner.gpu_id,

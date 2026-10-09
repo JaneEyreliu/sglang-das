@@ -21,9 +21,7 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.distributed.utils import is_pp_mtp_prefill, pp_mtp_draft_build_scope
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -181,10 +179,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.ps = ps
         self.nccl_port = nccl_port
         self.target_worker = target_worker
-        # PP MTP prefill: this draft worker runs only on the last PP stage and
-        # owns a complete (non-PP-partitioned) NextN draft; keep the target PP
-        # rank so the draft build can skip PP collectives via the build scope.
-        self.pp_mtp_prefill = is_pp_mtp_prefill(server_args)
         # mHC target models (for example DSV4-Flash with hc_mult > 1) feed the
         # draft model a recurrent hidden state wider than the ordinary hidden
         # size. Preserve the pre-hc-head state throughout the EAGLE pipeline.
@@ -216,26 +210,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ctx = empty_context()
         with (
             ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope(), pp_mtp_draft_build_scope(
-            self.pp_mtp_prefill
-        ):
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                # Keep the target PP rank under PP MTP prefill (the build scope
-                # makes the last stage own the whole draft); otherwise spec
-                # workers don't support pipeline parallelism, so pin to rank 0.
-                ps=ps if self.pp_mtp_prefill else replace(ps, pp_rank=0),
+                # spec workers don't support pipeline parallelism
+                ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
                 context_length=target_worker.model_runner.model_config.context_len,
             )
-
-        # The draft embedding lives on the first PP stage of the target; the
-        # first stage sends it here (last stage) during EAGLEWorkerV2 init.
-        if self.pp_mtp_prefill:
-            self._pp_mtp_embed = get_pp_group().recv_tensor_dict(src=0)["embedding"]
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
@@ -360,14 +345,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_lm_head(self):
         from sglang.srt.lora.layers import unwrap_lora_layer
 
-        if self.pp_mtp_prefill:
-            # On the last PP stage embed_tokens is a PPMissingLayer, so
-            # get_embed_and_head() cannot read the embedding; use the shard the
-            # first stage sent over PP and read lm_head directly for the head.
-            embed = self._pp_mtp_embed
-            head = self.target_worker.model_runner.model.lm_head.weight
-        else:
-            embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         target_lm_head = unwrap_lora_layer(
             getattr(self.target_worker.model_runner.model, "lm_head", None)
         )
@@ -1280,26 +1258,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
             get_spec().speculative_algorithm
         )
 
-        self.pp_mtp_prefill = is_pp_mtp_prefill(server_args)
-        if not self.pp_mtp_prefill or get_pp_group().is_last_rank:
-            # The draft worker lives only on the last PP stage under PP MTP
-            # prefill (it owns a complete, non-PP draft); other stages have none.
-            self._draft_worker = EagleDraftWorker(
-                server_args,
-                gpu_id,
-                ps,
-                nccl_port,
-                target_worker,
-            )
-        else:
-            self._draft_worker = None
-            if get_pp_group().is_first_rank:
-                # Ship the embedding shard to the last stage, where the draft's
-                # init_lm_head wants it (that stage's embed_tokens is missing).
-                embed = target_worker.model_runner.model.model.embed_tokens.weight
-                get_pp_group().send_tensor_dict(
-                    {"embedding": embed}, dst=get_pp_group().world_size - 1
-                )
+        self._draft_worker = EagleDraftWorker(
+            server_args,
+            gpu_id,
+            ps,
+            nccl_port,
+            target_worker,
+        )
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
@@ -1320,18 +1285,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
     @property
     def last_shared_read_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
-        # draft_extend, which runs on the draft runner. On a non-last PP MTP
-        # prefill stage there is no draft; fall back to the target runner.
-        if self._draft_worker is None:
-            return self._target_worker.model_runner
+        # draft_extend, which runs on the draft runner.
         return self._draft_worker.draft_runner
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
         # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
-        if self._draft_worker is None:
-            return (self._target_worker.model_runner.attn_backend,)
         return (
             self._target_worker.model_runner.attn_backend,
             self._draft_worker.draft_attn_backend,
@@ -1371,11 +1331,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
 
     def forward_batch_generation(
-        self,
-        batch: ScheduleBatch,
-        on_publish=None,
-        grammar_barrier=None,
-        pp_proxy_tensors=None,
+        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
@@ -1388,13 +1344,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch,
                 capture_hidden_mode=target_capture_mode,
                 return_hidden_states_before_norm=self.need_hidden_states_before_norm,
-                pp_proxy_tensors=pp_proxy_tensors,
             )
-
-            # PP MTP prefill, non-last stage: no local draft, so the target
-            # forward only produces the PP proxy the next stage consumes.
-            if self.pp_mtp_prefill and self._draft_worker is None:
-                return batch_output
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.

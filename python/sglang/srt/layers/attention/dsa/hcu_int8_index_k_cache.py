@@ -254,15 +254,7 @@ def quantize_and_store_index_k_int8(
     )
 
 
-@triton.jit(
-    do_not_specialize=[
-        "block_table_stride_0",
-        "k_page_stride_0",
-        "scale_page_stride_0",
-        "workspace_page_stride_0",
-        "NUM_PHYSICAL_PAGES",
-    ]
-)
+@triton.jit
 def _dequantize_index_k_int8_paged_kernel(
     int8_k_ptr,
     scale_ptr,
@@ -270,22 +262,14 @@ def _dequantize_index_k_int8_paged_kernel(
     context_lens_ptr,
     workspace_ptr,
     page_claims_ptr,
-    block_table_stride_0,
-    k_page_stride_0,
-    scale_page_stride_0,
-    workspace_page_stride_0,
+    block_table_stride_0: tl.constexpr,
+    k_page_stride_0: tl.constexpr,
+    scale_page_stride_0: tl.constexpr,
+    workspace_page_stride_0: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
-    NUM_PHYSICAL_PAGES,
+    NUM_PHYSICAL_PAGES: tl.constexpr,
 ):
-    # Keep storage strides and the physical-page bound runtime so a changing
-    # page-table width does not create a new Triton specialization for every
-    # prefill chunk.  The fixed INT8 page ABI remains compile-time constant.
-    block_table_stride_0 = tl.cast(block_table_stride_0, tl.int64)
-    k_page_stride_0 = tl.cast(k_page_stride_0, tl.int64)
-    scale_page_stride_0 = tl.cast(scale_page_stride_0, tl.int64)
-    workspace_page_stride_0 = tl.cast(workspace_page_stride_0, tl.int64)
-    num_physical_pages = tl.cast(NUM_PHYSICAL_PAGES, tl.int64)
     batch_idx = tl.program_id(0)
     logical_page_idx = tl.program_id(1)
     context_len = tl.load(context_lens_ptr + batch_idx).to(tl.int64)
@@ -294,7 +278,7 @@ def _dequantize_index_k_int8_paged_kernel(
         physical_page = tl.load(
             block_tables_ptr + batch_idx * block_table_stride_0 + logical_page_idx
         ).to(tl.int64)
-        if (physical_page >= 0) & (physical_page < num_physical_pages):
+        if (physical_page >= 0) & (physical_page < NUM_PHYSICAL_PAGES):
             previous_claim = tl.atomic_cas(page_claims_ptr + physical_page, 0, 1)
             if previous_claim == 0:
                 offsets = tl.arange(0, HEAD_DIM)
@@ -413,48 +397,6 @@ def dequantize_index_k_int8_paged(
         return workspace
     return _dequantize_index_k_int8_paged_reference(
         int8_k, fp32_scales, block_tables, context_lens, workspace, page_claims
-    )
-
-
-def precompile_dequantize_index_k_int8_paged(
-    packed_cache: torch.Tensor,
-    workspace: torch.Tensor,
-    page_claims: torch.Tensor,
-    *,
-    int8_k: Optional[torch.Tensor] = None,
-    fp32_scales: Optional[torch.Tensor] = None,
-) -> None:
-    """Compile the paged INT8 dequant kernel before serving starts.
-
-    A zero-length synthetic request exercises the same kernel signature while
-    avoiding reads from or writes to the cache.  Strides and the page-count
-    bound are runtime values, so this specialization is reused by all
-    prefill page-table widths and cache sizes.
-    """
-    if not packed_cache.is_cuda or packed_cache.shape[0] == 0:
-        return
-    if int8_k is None or fp32_scales is None:
-        int8_k, fp32_scales = create_index_k_int8_aliases(packed_cache)
-
-    block_tables = torch.zeros(
-        (1, 1), dtype=torch.int32, device=packed_cache.device
-    )
-    context_lens = torch.zeros((1,), dtype=torch.int32, device=packed_cache.device)
-    _dequantize_index_k_int8_paged_kernel[(1, 1)](
-        int8_k,
-        fp32_scales,
-        block_tables,
-        context_lens,
-        workspace,
-        page_claims,
-        block_tables.stride(0),
-        int8_k.stride(0),
-        fp32_scales.stride(0),
-        workspace.stride(0),
-        HEAD_DIM=INDEX_K_HEAD_DIM,
-        PAGE_SIZE=INDEX_K_PAGE_SIZE,
-        NUM_PHYSICAL_PAGES=packed_cache.shape[0],
-        num_warps=4,
     )
 
 

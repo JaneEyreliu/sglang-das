@@ -559,14 +559,10 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         if isinstance(layer, LinearBase):
-            # HY4 v1 quantizes shared experts too. Once kept separate from the
-            # routed MoE (different activation clipping), they still need to
-            # load packed INT4 weights rather than the default BF16 linear.
-            if (
-                self.checkpoint_format == "hy4_w4a8_v1"
-                and ".mlp.shared_experts." in prefix
-            ):
-                return HYV4SharedExpertLinearMethod(self)
+            if self.checkpoint_format == "hy4_w4a8_v1":
+                if ".mlp.shared_experts." in prefix:
+                    return HYV4SharedExpertLinearMethod(self)
+                return UnquantizedLinearMethod()
             # Kimi-K3 INT4 (from mxfp4_to_int4.py) only quantizes the routed
             # experts; dense layers stay in BF16 and are listed in the
             # checkpoint's ignore list (native compressed-tensors style, with
@@ -576,15 +572,15 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
             if self.ignore and should_ignore_layer(
                 layer_name=prefix,
                 ignore=self.ignore,
-                fused_mapping=self.packed_modules_mapping,
+                fused_mapping=getattr(self, "packed_modules_mapping", {}),
             ):
                 return UnquantizedLinearMethod()
-            if self.ignore:
-                return SlimQuantW4A8Int8LinearMethod(self)
-            # ChannelWise W4A8/W4A16 ckpts quantize MoE experts only and often
-            # have no ignore list; attn / linear_attn / router / lm_head stay
-            # BF16 and must not use the int8 Linear path.
-            return UnquantizedLinearMethod()
+            # Qwen3.8 Flash-Next ChannelWise W4A8/W4A16: MoE experts only.
+            # DeepSeek W4A8 has no ignore list but still quantizes attn Linear
+            # (e.g. self_attn.wqkv_a.weight_scale_inv).
+            if self.experts_only_linear:
+                return UnquantizedLinearMethod()
+            return SlimQuantW4A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             if get_moe_a2a_backend().is_megamoe():
                 return SlimQuantW4A8Int8MarlinMoEMethod(self)
