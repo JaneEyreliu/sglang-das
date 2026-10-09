@@ -12,12 +12,72 @@ import os
 import pickle
 import time
 from collections import deque
+from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 
 import torch
 from torch.distributed import TCPStore
 
 logger = logging.getLogger(__name__)
+
+_pp_mtp_draft_build = False
+
+
+def is_pp_mtp_prefill(server_args=None) -> bool:
+    """PP speculative execution is limited to EAGLE prefill on the last stage."""
+    if server_args is None:
+        from sglang.srt.runtime_context import get_server_args
+
+        server_args = get_server_args()
+    return (
+        server_args.pp_size > 1
+        and server_args.disaggregation_mode == "prefill"
+        and server_args.speculative_algorithm == "EAGLE"
+    )
+
+
+def is_pp_mtp_draft_build() -> bool:
+    return _pp_mtp_draft_build
+
+
+@contextmanager
+def pp_mtp_draft_build_scope(enabled: bool):
+    # The target keeps its PP partition; the last stage owns the complete draft.
+    global _pp_mtp_draft_build
+    previous = _pp_mtp_draft_build
+    _pp_mtp_draft_build = enabled
+    try:
+        yield
+    finally:
+        _pp_mtp_draft_build = previous
+
+
+@contextmanager
+def pp_mtp_local_model_scope():
+    """Construct a complete NextN model without changing scheduler/TP groups."""
+    if not is_pp_mtp_draft_build():
+        yield
+        return
+
+    from sglang.srt.distributed import parallel_state
+
+    pp_group = parallel_state.get_pp_group()
+    assert pp_group.is_last_rank, "Only the final PP stage owns a draft"
+    # Model constructors may reject PP or omit embeddings on non-first stages.
+    # No communication methods: a local draft must never issue PP collectives.
+    parallel_state._PP = SimpleNamespace(
+        world_size=1,
+        rank_in_group=0,
+        rank=pp_group.rank,
+        is_first_rank=True,
+        is_last_rank=True,
+    )
+    try:
+        yield
+    finally:
+        parallel_state._PP = pp_group
+
 
 
 def set_global_tcp_store(store: TCPStore) -> None:
@@ -99,6 +159,10 @@ def get_pp_indices(
     If the number of layers is not divisible by the number of partitions,
     the last N partitions will have one extra layer, where N = remainder.
     """
+    if is_pp_mtp_draft_build():
+        assert pp_rank == pp_size - 1, "PP MTP draft must live on the last stage"
+        return (0, num_hidden_layers)
+
     # partition_list_str can be set to None in sglang
     partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
     if partition_list_str is not None:
@@ -109,9 +173,19 @@ def get_pp_indices(
                 "Invalid partition string: {}".format(partition_list_str)
             ) from err
         if len(partitions) != pp_size:
-            raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
+            raise ValueError(
+                f"SGLANG_PP_LAYER_PARTITION={partition_list_str!r} has "
+                f"{len(partitions)} entries but pp_size={pp_size}; give exactly one "
+                f"per-stage layer count, or unset it to auto-split evenly."
+            )
         if sum(partitions) != num_hidden_layers:
-            raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
+            raise ValueError(
+                f"SGLANG_PP_LAYER_PARTITION={partition_list_str!r} sums to "
+                f"{sum(partitions)} but the model has num_hidden_layers="
+                f"{num_hidden_layers}; per-stage counts must sum to exactly the "
+                f"transformer-layer count (MTP/nextn layers are not included). "
+                f"Fix or unset the env var."
+            )
         start_layer = sum(partitions[:pp_rank])
         end_layer = start_layer + partitions[pp_rank]
     else:
