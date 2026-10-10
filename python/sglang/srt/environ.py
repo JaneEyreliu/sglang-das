@@ -1557,6 +1557,12 @@ class Envs:
     # ===================================================================
     SGLANG_OPT_HY4_IHC_TILELANG = EnvBool(False)
     SGLANG_HY4_COMPACT_PD_INDEX_K = EnvBool(False)
+    # HCU HYV4 DCP2: pack raw natural-log LSE, apply one sink after A2A.
+    SGLANG_HY4_DCP2_FUSED_POST_ATTN = EnvBool(False)
+    # Fused receive-side V projection/gate for measured BF16 shapes. This is
+    # only reached when FUSED_POST_ATTN is enabled; set to 0 to isolate pack/
+    # sink-merge when benchmarking or validating numerical differences.
+    SGLANG_HY4_DCP2_FUSED_VPROJ = EnvBool(True)
 
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================

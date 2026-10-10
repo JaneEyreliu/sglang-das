@@ -515,6 +515,58 @@ def dcp_a2a_lse_reduce(
     return combined
 
 
+def hyv4_dcp2_a2a_reduce(
+    raw_output: torch.Tensor,
+    raw_lse,
+    local_sink: torch.Tensor,
+    cp_group: "GroupCoordinator",
+    *,
+    w_vc: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Exchange native HYV4 FlashMLA partials and add the sink exactly once.
+
+    Returns latent attention unless both projection operands are supplied;
+    that variant returns the gated, flattened V projection for o_proj.
+    Allocations during capture belong to the graph memory pool. They are
+    per invocation, so overlapping steps never share mutable transport state.
+    """
+    from sglang.kernels.ops.attention.hyv4_dcp_fused import (
+        dcp2_sink_combine,
+        dcp2_sink_project_gate,
+        fused_sanitize_pack,
+    )
+    from sglang.srt.layers.hy4_dcp import Hyv4DcpRawLSE
+
+    if not isinstance(raw_lse, Hyv4DcpRawLSE) or cp_group.world_size != 2:
+        raise ValueError("HYV4 fused A2A requires raw natural-log LSE and DCP2")
+    if raw_lse.num_heads != 2 * local_sink.numel():
+        raise ValueError("HYV4 sink shard must match the received head partition")
+    if (w_vc is None) != (gate is None):
+        raise ValueError("HYV4 fused V projection requires both weight and gate")
+    dim = raw_output.shape[-1]
+    send = torch.empty(
+        (2, raw_lse.num_total_rows, local_sink.numel(), dim + 2),
+        dtype=raw_output.dtype,
+        device=raw_output.device,
+    )
+    recv = torch.empty_like(send)
+    fused_sanitize_pack(
+        raw_output,
+        raw_lse.lse,
+        raw_lse.valid_chunks,
+        send,
+        num_valid_rows=raw_lse.num_valid_rows,
+    )
+    cp_group.all_to_all_single(
+        recv.reshape(-1).view(torch.uint8),
+        send.reshape(-1).view(torch.uint8),
+    )
+    if w_vc is not None:
+        return dcp2_sink_project_gate(recv, local_sink, w_vc, gate)
+    return dcp2_sink_combine(recv, local_sink)
+
+
 def _dcp_fi_a2a_lse_reduce(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,

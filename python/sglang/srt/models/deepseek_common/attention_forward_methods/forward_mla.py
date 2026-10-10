@@ -40,6 +40,8 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.dcp.comm import hyv4_dcp2_a2a_reduce
+from sglang.srt.layers.hy4_dcp import Hyv4DcpRawLSE
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
@@ -800,8 +802,22 @@ class DeepseekMLAForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
 
-        # correct attn_output with respect to lse from other ranks
-        if is_dcp_mla_decode_phase(forward_batch, use_dsa=self.use_dsa):
+        # A HYV4 raw carrier has natural-log LSE and no local sink correction.
+        if is_dcp_mla_decode_phase(
+            forward_batch, use_dsa=self.use_dsa
+        ) and isinstance(lse, Hyv4DcpRawLSE):
+            if get_in_autotune_dummy_run():
+                attn_output = attn_output.new_zeros(
+                    (lse.num_total_rows, self.num_local_heads, self.kv_lora_rank)
+                )
+            else:
+                attn_output = hyv4_dcp2_a2a_reduce(
+                    attn_output,
+                    lse,
+                    self.get_local_attention_sink(),
+                    get_parallel().dcp_group,
+                )
+        elif is_dcp_mla_decode_phase(forward_batch, use_dsa=self.use_dsa):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,

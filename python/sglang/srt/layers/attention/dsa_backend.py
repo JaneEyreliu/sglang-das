@@ -111,6 +111,7 @@ if is_cuda():
     import deep_gemm
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.hy4_dcp import Hyv4DcpRawLSE
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
@@ -481,6 +482,37 @@ class DeepseekSparseAttnBackend(
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
     needs_cpu_seq_lens: bool = False
+
+    def _hyv4_dcp_valid_chunks(self, layer, q, forward_batch, impl, chunks):
+        """Allocate per-call validity only when the raw-LSE consumer is usable.
+
+        Capture allocates these tensors in the graph pool; replay launches no
+        allocator or Python work. Separate calls cannot overwrite each other's
+        flags (in particular target versus MTP draft backends).
+        """
+        mode = effective_forward_mode(forward_batch)
+        if not (
+            _is_hcu
+            and envs.SGLANG_HY4_DCP2_FUSED_POST_ATTN.get()
+            and self.is_hy_v4
+            and self.dcp_enabled
+            and self.dcp_size == 2
+            and get_parallel().dcp_comm_backend == "a2a"
+            and impl == "flashmla_kv"
+            and q.dtype == torch.bfloat16
+            and getattr(layer, "hyv4_sink_getter", None) is not None
+            and not self.use_fused_topk
+            and self.hisparse_coordinator is None
+            and not hasattr(self.token_to_kv_pool, "translate_main_kv_loc_to_compact")
+            and (
+                mode.is_decode()
+                or mode.is_target_verify()
+                or mode.is_draft_extend_v2()
+                or mode.is_extend_without_speculative()
+            )
+        ):
+            return None
+        return torch.empty((q.shape[0], chunks), dtype=torch.uint8, device=q.device)
 
     def _translate_main_kv_loc_to_compact(self, loc: torch.Tensor) -> torch.Tensor:
         translate = getattr(
@@ -2313,6 +2345,12 @@ class DeepseekSparseAttnBackend(
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method(forward_mode)
 
+        dcp_valid_chunks = None
+        if topk_transform_method == TopkTransformMethod.PAGED:
+            dcp_valid_chunks = self._hyv4_dcp_valid_chunks(
+                layer, q_nope, forward_batch, dsa_impl, chunks=8
+            )
+
         if self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
@@ -2357,6 +2395,7 @@ class DeepseekSparseAttnBackend(
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     dcp_size=self.dcp_size,
                     dcp_rank=self.dcp_rank,
+                    out_valid_chunks=dcp_valid_chunks,
                 )
 
         # todo hisparse: to cover more backends
@@ -2531,6 +2570,7 @@ class DeepseekSparseAttnBackend(
                 forward_batch=forward_batch,
                 attn_sink=attn_sink,
                 return_lse=self.dcp_enabled,
+                dcp_valid_chunks=dcp_valid_chunks,
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -2639,6 +2679,10 @@ class DeepseekSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
+        dcp_valid_chunks = self._hyv4_dcp_valid_chunks(
+            layer, q_nope, forward_batch, self.dsa_decode_impl, chunks=1
+        )
+
         if self.hisparse_coordinator is not None:
             page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
                 forward_batch.req_pool_indices,
@@ -2655,6 +2699,7 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
                 dcp_size=self.dcp_size,
                 dcp_rank=self.dcp_rank,
+                out_valid_chunks=dcp_valid_chunks,
             )
 
         if self.dsa_decode_impl == "flashmla_sparse":
@@ -2695,6 +2740,7 @@ class DeepseekSparseAttnBackend(
                 forward_batch=forward_batch,
                 attn_sink=attn_sink,
                 return_lse=self.dcp_enabled,
+                dcp_valid_chunks=dcp_valid_chunks,
             )
         elif self.dsa_decode_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -3228,7 +3274,8 @@ class DeepseekSparseAttnBackend(
         forward_batch: Optional[ForwardBatch] = None,
         attn_sink: Optional[torch.Tensor] = None,
         return_lse: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        dcp_valid_chunks: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | Hyv4DcpRawLSE]:
         # HY4 applies its sink once to both output and LSE below. Do not also
         # fold it into FlashMLA's native denominator (or count it per rank).
         if getattr(layer, "hyv4_sink_getter", None) is not None:
@@ -3318,6 +3365,19 @@ class DeepseekSparseAttnBackend(
                 ),
                 is_fp8_kvcache=True,
                 **({"attn_sink": attn_sink_kv} if attn_sink_kv is not None else {}),
+            )
+
+        if return_lse and dcp_valid_chunks is not None:
+            from sglang.srt.layers.hy4_dcp import Hyv4DcpRawLSE
+
+            # Keep the native strides and natural-log LSE. The masked pack
+            # handles empty rows, query padding and head trimming in one pass.
+            return o, Hyv4DcpRawLSE(
+                lse=lse,
+                valid_chunks=dcp_valid_chunks,
+                num_valid_rows=num_valid if needs_repad else num_total,
+                num_total_rows=num_total,
+                num_heads=num_q_heads,
             )
 
         if needs_repad:

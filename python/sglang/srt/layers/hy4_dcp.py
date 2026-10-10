@@ -1,8 +1,26 @@
 """HYV4-only launch checks and learnable-sink correction for FlashMLA."""
 
 import math
+from dataclasses import dataclass
 
 import torch
+
+
+@dataclass(frozen=True)
+class Hyv4DcpRawLSE:
+    """Per-call contract for HYV4's deferred DCP sink correction.
+
+    Unlike a normal DSA LSE tensor, ``lse`` is natural-log and has no sink.
+    The explicit carrier prevents it entering a base-2 or already-corrected
+    merge. It owns the validity tensor for this layer/step (never global state).
+    Output/LSE may retain FlashMLA head padding and contain only the real rows.
+    """
+
+    lse: torch.Tensor
+    valid_chunks: torch.Tensor
+    num_valid_rows: int
+    num_total_rows: int
+    num_heads: int
 
 
 def validate_hyv4_launch(args, parallel):

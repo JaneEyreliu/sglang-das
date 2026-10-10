@@ -29,6 +29,8 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.dcp.comm import hyv4_dcp2_a2a_reduce
+from sglang.srt.layers.hy4_dcp import Hyv4DcpRawLSE
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
     emit_transposed_bpreshuffle_scale,
@@ -834,8 +836,56 @@ class DeepseekMLARocmForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
 
-        # correct attn_output with respect to lse from other ranks
-        if is_dcp_mla_decode_phase(forward_batch, use_dsa=self.use_dsa):
+        # The raw carrier explicitly selects natural-log LSE with a deferred
+        # sink. Never feed it through the generic backend-name LSE inference.
+        if is_dcp_mla_decode_phase(
+            forward_batch, use_dsa=self.use_dsa
+        ) and isinstance(lse, Hyv4DcpRawLSE):
+            if get_in_autotune_dummy_run():
+                attn_output = attn_output.new_zeros(
+                    (lse.num_total_rows, self.num_local_heads, self.kv_lora_rank)
+                )
+            else:
+                project_weight = None
+                if (
+                    envs.SGLANG_HY4_DCP2_FUSED_VPROJ.get()
+                    and not self.use_deep_gemm_bmm
+                    and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                    and not is_kv_b_lora_active(self)
+                    and attention_output_gate is not None
+                    and attention_output_gate.dtype == torch.bfloat16
+                    and self.w_vc.dtype == torch.bfloat16
+                    and isinstance(self.w_scale, (int, float))
+                    and self.w_scale == 1
+                    and self.kv_lora_rank == 512
+                    and self.v_head_dim == 256
+                    and self.num_local_heads == 32
+                    # B64 regressed versus rocBLAS in graph microbenchmarks;
+                    # keep only the tested winning gfx936 buckets.
+                    and lse.num_total_rows in (1, 2, 4, 8, 16, 32)
+                    and getattr(
+                        torch.cuda.get_device_properties(attn_output.device),
+                        "gcnArchName",
+                        "",
+                    ).startswith("gfx936")
+                ):
+                    project_weight = self.w_vc
+                attn_output = hyv4_dcp2_a2a_reduce(
+                    attn_output,
+                    lse,
+                    self.get_local_attention_sink(),
+                    get_parallel().dcp_group,
+                    w_vc=project_weight,
+                    gate=attention_output_gate if project_weight is not None else None,
+                )
+                if project_weight is not None:
+                    # Projection and gate are already applied by the receive
+                    # kernel. Preserve the normal TopK carry contract below.
+                    output, _ = self.o_proj(attn_output)
+                    if self.next_skip_topk is None:
+                        return output
+                    return output, topk_indices if self.next_skip_topk else None
+        elif is_dcp_mla_decode_phase(forward_batch, use_dsa=self.use_dsa):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,
