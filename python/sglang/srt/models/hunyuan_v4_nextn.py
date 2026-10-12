@@ -28,6 +28,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
+from sglang.srt.mem_cache.hyv4_dcp_write_locs import scoped_hyv4_dcp_write_locs
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
@@ -190,6 +191,7 @@ class HYV4ModelNextN(nn.Module):
         self.shared_head.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.dp_attn_scattered = hyv4_dp_attn_scattered()
 
+    @scoped_hyv4_dcp_write_locs
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds

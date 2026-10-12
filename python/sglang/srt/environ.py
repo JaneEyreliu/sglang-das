@@ -1366,6 +1366,9 @@ class Envs:
     # ===================================================================
     # Hunyuan V4
     # ===================================================================
+    # HCU HY4: produce DCP KV write locations once per forward and reuse them
+    # across layers. Every captured forward records its own GPU producer.
+    SGLANG_HY4_DCP_FUSED_KV_WRITE_LOCS = EnvBool(False)
     SGLANG_OPT_HY4_IHC_TILELANG = EnvBool(False)
 
     # ===================================================================
@@ -1593,6 +1596,9 @@ class Envs:
     SGLANG_DSA_HCU_INT8_INDEX_K_CACHE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HCU_INT8_INDEX_K_CACHE"
     )
+    # HCU HY4: select a K-only indexer graph only when a CPU-known conservative
+    # KV length bound fits TopK. Missing bounds keep the full indexer path.
+    SGLANG_HY4_HCU_DSA_SHORT_CONTEXT_K_ONLY = EnvBool(False)
     # Opt-in HCU AOT kernel for concatenating absorbed MLA Q components.
     SGLANG_ENABLE_HCU_CONCAT_MLA_ABSORB_Q = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)

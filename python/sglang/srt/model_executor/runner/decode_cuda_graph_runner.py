@@ -48,6 +48,10 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.attention.dsa.hyv4_short_context import (
+    hyv4_short_context_enabled,
+    select_hyv4_dsa_variant,
+)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -110,6 +114,7 @@ from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    is_hcu,
     is_hip,
     require_attn_tp_gather,
     require_mlp_tp_gather,
@@ -275,6 +280,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         hf_config = model_runner.model_config.hf_config
+        self.hyv4_short_context_k_only = hyv4_short_context_enabled(
+            hf_config, is_hcu=is_hcu()
+        )
         if is_hip() and is_deepseek_dsa(hf_config):
             self.dsa_index_topk = get_dsa_index_topk(hf_config)
             self.dsa_dual_graph = True
@@ -562,6 +570,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         the sparse (full indexer) graph. Returns None when dual-graph is off."""
         if not getattr(self, "dsa_dual_graph", False):
             return None
+        if getattr(self, "hyv4_short_context_k_only", False):
+            return select_hyv4_dsa_variant(
+                forward_batch,
+                self.dsa_index_topk,
+                extra_tokens=self.captured_req_width,
+            )
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
             # Host-side mirror (maintained incrementally for plain decode) — no
@@ -686,6 +700,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
             variant_label=self._resolve_lora_variant(forward_batch),
+            dsa_variant=self._resolve_dsa_variant(forward_batch),
         )
 
         is_bs_supported = (

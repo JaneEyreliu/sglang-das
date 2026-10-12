@@ -117,6 +117,18 @@ def _remap_hcu_dcp_graph_kv_write_locs(
         "HCU DCP CUDA Graph KV writes require the captured batch "
         f"({num_rows}) not to exceed padding capacity ({padding_capacity})."
     )
+    if envs.SGLANG_HY4_DCP_FUSED_KV_WRITE_LOCS.get():
+        from sglang.srt.mem_cache.hyv4_dcp_write_locs import (
+            remap_hyv4_dcp_write_locs,
+        )
+
+        return remap_hyv4_dcp_write_locs(
+            loc,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            pool_size=pool_size,
+            padding_capacity=padding_capacity,
+        )
     valid_mask = loc % dcp_size == dcp_rank
     local_loc = loc // dcp_size
     padding_loc = pool_size + torch.arange(

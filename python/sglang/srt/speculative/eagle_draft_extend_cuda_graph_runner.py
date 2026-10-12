@@ -21,6 +21,9 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.layers.attention.dsa.hyv4_short_context import (
+    hyv4_short_context_enabled,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -58,6 +61,7 @@ from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
+    is_hcu,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -138,6 +142,18 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.enable_pdmux = False
         self.record_nolora_graph = False
         self.is_dllm = False
+
+        self.hyv4_short_context_k_only = hyv4_short_context_enabled(
+            model_runner.model_config.hf_config, is_hcu=is_hcu()
+        )
+        self.dsa_dual_graph = self.hyv4_short_context_k_only
+        self.dsa_index_topk = None
+        if self.dsa_dual_graph:
+            from sglang.srt.configs.model_config import get_dsa_index_topk
+
+            self.dsa_index_topk = get_dsa_index_topk(
+                model_runner.model_config.hf_config
+            )
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
@@ -295,8 +311,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        return ShapeKey(size=bs)
+    def _make_graph_key(
+        self, bs, stream_idx=None, variant_label=None, dsa_variant=None
+    ):
+        return ShapeKey(size=bs, dsa_variant=dsa_variant)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Uniform-width replay invariant: the batch's actual per-request width
@@ -317,7 +335,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             cuda_graph_bs = forward_batch.seq_lens.numel()
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, self._make_graph_key(cuda_graph_bs))
+            self.backend.can_run(
+                forward_batch,
+                self._make_graph_key(
+                    cuda_graph_bs, dsa_variant=self._resolve_dsa_variant(forward_batch)
+                ),
+            )
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -333,6 +356,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        dsa_variant: Optional[str] = None,
     ):
         bs = size
         buffers = self.buffers
@@ -462,7 +486,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 else contextlib.nullcontext()
             )
             with canary_ctx:
-                shape_key = self._make_graph_key(bs)
+                shape_key = self._make_graph_key(bs, dsa_variant=dsa_variant)
                 post_warmup_hook = getattr(
                     self.draft_extend_attn_backend,
                     "on_after_cuda_graph_warmup",
@@ -614,7 +638,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         self.raw_bs = raw_bs
         self.bs = bs
-        shape_key = self._make_graph_key(bs)
+        shape_key = self._make_graph_key(
+            bs, dsa_variant=self._resolve_dsa_variant(forward_batch)
+        )
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
 

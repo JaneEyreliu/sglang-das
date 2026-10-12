@@ -27,6 +27,10 @@ from sglang.srt.layers.attention.dsa.forward_batch_utils import (
     effective_forward_mode,
 )
 from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import IndexKCacheMode
+from sglang.srt.layers.attention.dsa.hyv4_short_context import (
+    hyv4_short_context_enabled,
+    select_hyv4_dsa_variant,
+)
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -315,6 +319,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
+        self.hyv4_short_context_k_only = hyv4_short_context_enabled(
+            config, is_hcu=_is_hcu
+        )
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
@@ -575,11 +582,37 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return x if self.use_dsa_indexer_fusion else rotate_activation(x)
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
-        # The HCU LightOp path keeps query preparation and index-K storage in a
-        # fused operation and does not use the generic act_quant fallback that
-        # powers the K-only shortcut.
         if _is_hcu:
-            return False
+            # A separate HCU K-only path preserves the exact LightOp K norm /
+            # RoPE / Hadamard representation. FP8 and prefill-CP stay on their
+            # existing paths; this opt-in targets the HYV4 BF16/INT8 index cache.
+            mode = effective_forward_mode(forward_batch)
+            if (
+                not self.hyv4_short_context_k_only
+                or self.dsa_enable_prefill_cp
+                or forward_batch.attn_cp_metadata is not None
+                or not self._use_hcu_bf16_indexer_compute(get_token_to_kv_pool())
+                or not (
+                    mode.is_decode_or_idle()
+                    or mode.is_target_verify()
+                    or mode.is_draft_extend_v2()
+                )
+            ):
+                return False
+            if get_is_capture_mode():
+                from sglang.srt.model_executor.runner_utils.capture_mode import (
+                    get_capture_dsa_variant,
+                )
+
+                return get_capture_dsa_variant() == "dense"
+            return select_hyv4_dsa_variant(
+                forward_batch,
+                self.index_topk,
+                extra_tokens=max(
+                    int(getattr(forward_batch.spec_info, "num_tokens_per_req", 1) or 1),
+                    1,
+                ),
+            ) == "dense"
 
         # When kv_len <= index_topk the top-k selects ALL valid positions, so the
         # indexer's logits GEMM + paged_mqa_logits + top-k are wasted work: a plain
@@ -1755,6 +1788,58 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         return topk_result
 
+    def _get_hcu_k_only_bf16(
+        self, x: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        key, _ = self.wk(x)
+        key = key.view(key.shape[0], -1, self.head_dim)
+        # LightOp's split launcher derives the Q grid from the head count. Zero
+        # Q heads launch only K blocks, running the exact same K arithmetic as
+        # _get_q_k_bf16 (including its BF16 rounding). Do not substitute generic
+        # LayerNorm/RoPE: cache differences would survive the 2048 transition.
+        empty_query = key.new_empty((key.shape[0], 0, self.head_dim))
+        lightop_attention.fuse_layernorm_rotary_embedding(
+            positions,
+            empty_query,
+            key,
+            self.head_dim,
+            self._indexer_cos_sin_cache,
+            False,
+            None,
+            None,
+            self.k_norm.weight,
+            getattr(self.k_norm, "bias", None),
+            None,
+            None,
+            self.k_norm.variance_epsilon,
+        )
+        return rotate_activation(key)
+
+    def _forward_hcu_k_only(
+        self, x, positions, forward_batch, layer_id, metadata, return_indices
+    ):
+        from sglang.kernels.ops.attention.dsa.short_context import logical_select_all
+
+        # Empty eager/idle batches must not reach LightOp's host launcher,
+        # which divides query.numel() by positions.numel(). Captured padded
+        # idle batches have nonzero static rows and follow the normal path.
+        x_meta = x[0] if isinstance(x, tuple) else x
+        if positions.numel() == 0 or x_meta.shape[0] == 0:
+            return (
+                logical_select_all(metadata.get_seqlens_expanded(), self.index_topk)
+                if return_indices
+                else None
+            )
+        key = self._get_hcu_k_only_bf16(x, positions)
+        # Index-K must be populated even while logits are skipped: a subsequent
+        # longer-context sparse graph consumes the entire historical K cache.
+        self._store_index_k_cache(
+            forward_batch=forward_batch, layer_id=layer_id, key=key
+        )
+        if not return_indices:
+            return None
+        return logical_select_all(metadata.get_seqlens_expanded(), self.index_topk)
+
     def _forward_cuda_k_only(
         self,
         x: torch.Tensor,
@@ -2244,18 +2329,31 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             skip_logits_computation = self._should_skip_logits_computation(
                 forward_batch
             )
+            if _is_hcu and skip_logits_computation:
+                # The shared HYV4 TopK state carries logical IDs. If another
+                # configuration requests physically transformed TopK, keep its
+                # established full path instead of changing this contract.
+                skip_logits_computation = (
+                    getattr(metadata, "force_unfused_topk", False)
+                    or not envs.SGLANG_DSA_FUSE_TOPK.get()
+                )
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.dsa_enable_prefill_cp):
-            topk_result = self._forward_cuda_k_only(
-                x,
-                positions,
-                forward_batch,
-                layer_id,
-                act_quant,
-                metadata,
-                return_indices,
-            )
+            if _is_hcu:
+                topk_result = self._forward_hcu_k_only(
+                    x, positions, forward_batch, layer_id, metadata, return_indices
+                )
+            else:
+                topk_result = self._forward_cuda_k_only(
+                    x,
+                    positions,
+                    forward_batch,
+                    layer_id,
+                    act_quant,
+                    metadata,
+                    return_indices,
+                )
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return maybe_capture_indexer_topk(layer_id, topk_result)
 

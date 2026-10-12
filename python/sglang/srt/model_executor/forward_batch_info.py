@@ -474,6 +474,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
+    # Runtime host allocation bound for opt-in HYV4 HCU K-only graph dispatch.
+    # Capture-created batches leave this unset; the selected graph variant is
+    # fixed during capture, then chosen anew for each runtime forward.
+    hyv4_dsa_kv_len_upper_bound: Optional[int] = None
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
@@ -818,6 +822,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
 
+        hyv4_dsa_kv_len_upper_bound = None
+        if envs.SGLANG_HY4_HCU_DSA_SHORT_CONTEXT_K_ONLY.get():
+            from sglang.srt.layers.attention.dsa.hyv4_short_context import (
+                hyv4_short_context_enabled,
+                request_kv_upper_bound,
+            )
+
+            if hyv4_short_context_enabled(
+                model_runner.model_config.hf_config, is_hcu=_is_hcu
+            ):
+                from sglang.srt.mem_cache.allocation_sizing import (
+                    get_alloc_reserve_per_decode,
+                )
+
+                hyv4_dsa_kv_len_upper_bound = request_kv_upper_bound(
+                    batch.reqs, get_alloc_reserve_per_decode()
+                )
+
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
         # (incl. seq_lens_sum) is slated for removal in favor of kv-committed
         # lengths, so this init_new-time backfill onto the ScheduleBatch is
@@ -836,6 +858,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens_sum=batch.seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
+            hyv4_dsa_kv_len_upper_bound=hyv4_dsa_kv_len_upper_bound,
             orig_seq_lens=batch.orig_seq_lens,
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             mamba_track_indices=batch.mamba_track_indices,

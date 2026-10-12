@@ -72,6 +72,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
+from sglang.srt.mem_cache.hyv4_dcp_write_locs import scoped_hyv4_dcp_write_locs
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
@@ -790,6 +791,7 @@ class HYV4Model(nn.Module):
         )
         return True
 
+    @scoped_hyv4_dcp_write_locs
     def forward(
         self,
         input_ids,
