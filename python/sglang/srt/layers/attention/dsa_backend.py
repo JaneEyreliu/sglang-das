@@ -273,6 +273,39 @@ def _get_flashmla_module():
     return flash_mla
 
 
+def _lightop_prefill_dequantize_k_cache_paged(
+    quant_k_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+) -> torch.Tensor:
+    """lightop drop-in for the Triton ``dequantize_k_cache_paged``.
+
+    Routes the DSA fp8 sparse-MLA prefix dequant (656-byte packed MLA rows
+    -> bf16 ``[N, 1, 576]``) through
+    ``lightop.op.prefill_gather_and_upconvert_fp8_kv_cache``, which the
+    lightop source documents as a drop-in replacement for
+    ``dequantize_k_cache_paged``. Gated by
+    ``SGLANG_DSA_LIGHTOP_PREFILL_DEQUANT_KV``.
+    """
+    from lightop import op as lightop_op
+
+    dim_quant = quant_k_cache.shape[-1]
+    assert (
+        dim_quant == 656
+    ), f"lightop prefill dequant expects 656-byte rows, got {dim_quant}"
+    # lightop requires src [*, 1, 656] one-byte (fp8/uint8) contiguous.
+    src = quant_k_cache.view(torch.uint8).reshape(-1, 1, dim_quant).contiguous()
+    # lightop requires a contiguous int32 1D page table.
+    page_table = page_table_1_flattened.reshape(-1).to(torch.int32).contiguous()
+    num_tokens = page_table.shape[0]
+    out = torch.empty(
+        (num_tokens, 1, 576),
+        dtype=torch.bfloat16,
+        device=quant_k_cache.device,
+    )
+    lightop_op.prefill_gather_and_upconvert_fp8_kv_cache(src, page_table, out)
+    return out
+
+
 def _all_gather_dsa_trtllm_fp8_kv(
     forward_batch: ForwardBatch,
     k: torch.Tensor,
@@ -2515,9 +2548,14 @@ class DeepseekSparseAttnBackend(
                     page_table_1_flattened = self._translate_main_kv_loc_to_compact(
                         page_table_1_flattened
                     )
-                    kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
-                    )
+                    if envs.SGLANG_DSA_LIGHTOP_PREFILL_DEQUANT_KV.get():
+                        kv_cache = _lightop_prefill_dequantize_k_cache_paged(
+                            kv_cache, page_table_1_flattened
+                        )
+                    else:
+                        kv_cache = dequantize_k_cache_paged(
+                            kv_cache, page_table_1_flattened
+                        )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 

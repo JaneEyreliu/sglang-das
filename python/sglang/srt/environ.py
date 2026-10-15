@@ -863,6 +863,10 @@ class Envs:
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
 
     SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED = EnvBool(False)
+    # Route the DSA fp8 sparse-MLA prefill prefix dequant
+    # (dequantize_k_cache_paged) through the lightop kernel
+    # prefill_gather_and_upconvert_fp8_kv_cache. Opt-in, default off.
+    SGLANG_DSA_LIGHTOP_PREFILL_DEQUANT_KV = EnvBool(False)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
