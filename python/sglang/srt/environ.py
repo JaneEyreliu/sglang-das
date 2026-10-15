@@ -1375,6 +1375,12 @@ class Envs:
     SGLANG_HY4_DCP_FUSED_KV_WRITE_LOCS = EnvBool(False)
     SGLANG_OPT_HY4_IHC_TILELANG = EnvBool(False)
 
+    # Overlap the HYV4 gated-MLA attention output-gate GEMM (``linear_gate`` /
+    # "g_proj") with the Q/KV projection GEMMs on a dedicated side stream.
+    # Ported from the vLLM-HCU PCP+EP ``gate_proj`` overlap. Off by default;
+    # only takes effect when expert parallelism is active (moe_ep_size > 1).
+    SGLANG_ENABLE_HYV4_GATE_PROJ_PARALLEL = EnvBool(False)
+
     # ===================================================================
     # DeepSeek V4
     # ===================================================================

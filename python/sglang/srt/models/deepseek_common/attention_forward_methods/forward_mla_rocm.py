@@ -381,6 +381,22 @@ class DeepseekMLARocmForwardMixin:
         )
         q_lora = None
         topk_indices = None
+
+        # HYV4 gated-MLA g_proj/projection overlap: launch ``linear_gate`` on a
+        # dedicated side stream before the Q/KV projections so it overlaps them
+        # (and the attention core). Joined in ``forward_absorb_rocm_core``.
+        _gate_proj_stream = getattr(self, "gate_proj_stream", None)
+        _gate_proj_overlap = _gate_proj_stream is not None and hasattr(
+            self, "prepare_attention_output_gate"
+        )
+        _overlapped_gate = None
+        if _gate_proj_overlap:
+            self.gate_proj_start_event.record(torch.cuda.current_stream())
+            with torch.cuda.stream(_gate_proj_stream):
+                _gate_proj_stream.wait_event(self.gate_proj_start_event)
+                _overlapped_gate = self.prepare_attention_output_gate(hidden_states)
+                self.gate_proj_done_event.record(_gate_proj_stream)
+
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -663,8 +679,14 @@ class DeepseekMLARocmForwardMixin:
             llama_4_scaling,
             # Only models that own the MLA output gate (currently HYV4) emit
             # this extra slot, so every other caller keeps the 9-tuple.
+            # When the g_proj side-stream overlap launched it above, reuse that
+            # tensor; otherwise compute it here on the main stream as before.
             *(
-                (self.prepare_attention_output_gate(hidden_states),)
+                (
+                    _overlapped_gate
+                    if _gate_proj_overlap
+                    else self.prepare_attention_output_gate(hidden_states),
+                )
                 if hasattr(self, "prepare_attention_output_gate")
                 else ()
             ),
@@ -970,6 +992,12 @@ class DeepseekMLARocmForwardMixin:
                 self, attn_output, attn_bmm_output
             )
         if attention_output_gate is not None:
+            # Join the g_proj side stream (if the overlap launched the gate
+            # there) now that attention has finished, then apply the gate.
+            _gate_proj_stream = getattr(self, "gate_proj_stream", None)
+            if _gate_proj_stream is not None:
+                torch.cuda.current_stream().wait_event(self.gate_proj_done_event)
+                attention_output_gate.record_stream(torch.cuda.current_stream())
             attn_bmm_output = self.apply_attention_output_gate(
                 attn_bmm_output, attention_output_gate
             )

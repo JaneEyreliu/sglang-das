@@ -100,6 +100,23 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 
 
+def enable_hyv4_gate_proj_parallel() -> bool:
+    """Whether HYV4 overlaps the gated-MLA g_proj GEMM with the Q/KV projections.
+
+    Ports the vLLM-HCU PCP+EP ``gate_proj`` overlap: the attention output-gate
+    projection (``linear_gate``, a.k.a. "g_proj") runs on a dedicated side
+    stream concurrently with the Q/KV projection GEMMs, and the join is deferred
+    until after the attention core -- which is where sglang applies the gate
+    anyway (``forward_absorb_core``). Gated on expert parallelism being active,
+    the regime where the extra projection GEMM is large enough for the overlap
+    to pay off (notably prefill); a no-op otherwise.
+    """
+    return (
+        envs.SGLANG_ENABLE_HYV4_GATE_PROJ_PARALLEL.get()
+        and get_parallel().moe_ep_size > 1
+    )
+
+
 def hyv4_dp_attn_scattered() -> bool:
     """Does this layout run the layer stack in ``ScatterMode.SCATTERED``?
 
@@ -425,6 +442,7 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         quant_config=None,
         prefix="",
         alt_stream=None,
+        gate_proj_stream=None,
         is_nextn=False,
     ):
         rope_parameters = config.rope_parameters
@@ -494,6 +512,23 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         if get_parallel().dcp_enabled:
             self.attn_mqa_for_dcp_decode.hyv4_sink_getter = self.get_dcp_attention_sink
 
+        # Optional g_proj/projection overlap stream (see
+        # ``enable_hyv4_gate_proj_parallel``). Created once at the model level
+        # and shared by every layer (which run sequentially), so the overlap
+        # uses exactly one side stream -- not one per layer. Kept distinct from
+        # the parent's ``alt_stream`` so it never contends with the qk-norm /
+        # q_b_proj + indexer overlaps already running there.
+        # ``forward_absorb_prepare`` launches ``linear_gate`` on this stream
+        # before the Q/KV projections; ``forward_absorb_core`` joins it after
+        # attention, before the gate is applied.
+        self.gate_proj_stream = gate_proj_stream
+        self.gate_proj_start_event = (
+            torch.cuda.Event() if gate_proj_stream is not None else None
+        )
+        self.gate_proj_done_event = (
+            torch.cuda.Event() if gate_proj_stream is not None else None
+        )
+
     @staticmethod
     def _sink_weight_loader(param, loaded_weight):
         if param.shape != loaded_weight.shape:
@@ -537,7 +572,15 @@ class HYV4Attention(DeepseekV2AttentionMLA):
 
 
 class HYV4DecoderLayer(nn.Module):
-    def __init__(self, config, layer_id, quant_config=None, prefix="", alt_stream=None):
+    def __init__(
+        self,
+        config,
+        layer_id,
+        quant_config=None,
+        prefix="",
+        alt_stream=None,
+        gate_proj_stream=None,
+    ):
         super().__init__()
         self.self_attn = HYV4Attention(
             config,
@@ -545,6 +588,7 @@ class HYV4DecoderLayer(nn.Module):
             quant_config,
             add_prefix("self_attn", prefix),
             alt_stream,
+            gate_proj_stream,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -718,6 +762,17 @@ class HYV4Model(nn.Module):
             if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
+        # One shared g_proj side stream for the whole stack (see
+        # ``enable_hyv4_gate_proj_parallel``); created here, not per layer, so
+        # the overlap does not spawn num_layers streams.
+        self.gate_proj_stream = (
+            torch.cuda.Stream() if enable_hyv4_gate_proj_parallel() else None
+        )
+        if self.gate_proj_stream is not None:
+            logger.info(
+                "HYV4 gated-MLA g_proj/projection overlap enabled "
+                "(shared side stream across all layers)"
+            )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: HYV4DecoderLayer(
@@ -726,6 +781,7 @@ class HYV4Model(nn.Module):
                 quant_config,
                 prefix,
                 self.alt_stream,
+                self.gate_proj_stream,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
