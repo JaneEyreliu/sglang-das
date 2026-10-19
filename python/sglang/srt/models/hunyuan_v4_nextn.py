@@ -37,6 +37,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.models.hunyuan_v4 import (
     HYV4Attention,
     HYV4ForCausalLM,
+    adapt_hyv4_packed_weight,
     hyv4_attn_tp_gather,
     hyv4_attn_tp_reduce_scatter,
     hyv4_attn_tp_split,
@@ -263,9 +264,10 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
         if (
             quant_config is not None
             and quant_config.get_name() == "slimquant_w4a8_marlin"
-            and getattr(quant_config, "checkpoint_format", None) != "hy4_w4a8_v1"
+            and getattr(quant_config, "checkpoint_format", None)
+            not in ("hy4_w4a8_v1", "hy4_compressed_tensors_w4a8")
         ):
-            raise ValueError("HYV4 MTP W4A8 requires checkpoint_format=hy4_w4a8_v1")
+            raise ValueError("HYV4 MTP W4A8 requires a supported HYV4 checkpoint format")
         self.pp_group = get_pp_group()
         validate_hyv4_launch(get_global_server_args(), get_parallel())
         # Both index-share modes use EagleDraftWorker's existing lifecycle:
@@ -323,6 +325,11 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
 
         def mapped_weights():
             for name, loaded_weight in weights:
+                name, loaded_weight = adapt_hyv4_packed_weight(
+                    name, loaded_weight, self.quant_config
+                )
+                if name is None:
+                    continue
                 relative = normalize_hyv4_mtp_weight_name(name)
                 if relative is None:
                     continue
@@ -343,7 +350,9 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
                 vars(self.config),
                 metadata,
                 packed_experts=getattr(self.quant_config, "checkpoint_format", None)
-                == "hy4_w4a8_v1",
+                in ("hy4_w4a8_v1", "hy4_compressed_tensors_w4a8"),
+                mixed_int8=getattr(self.quant_config, "checkpoint_format", None)
+                == "hy4_compressed_tensors_w4a8",
             )
 
         self.do_load_weights(mapped_weights(), is_nextn=True)

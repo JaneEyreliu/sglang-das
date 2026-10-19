@@ -206,6 +206,26 @@ def normalize_hyv4_weight_name(name: str) -> str:
     return name
 
 
+def adapt_hyv4_packed_weight(name, weight, quant_config):
+    """Expose CT int32 storage as byte pairs; normalize values after EP slicing."""
+    if (
+        getattr(quant_config, "checkpoint_format", None)
+        != "hy4_compressed_tensors_w4a8"
+    ):
+        return name, weight
+    if name.endswith(".weight_shape"):
+        return None, None
+    if name.endswith(".weight_packed"):
+        if (
+            ".mlp.experts." not in name
+            or weight.dtype != torch.int32
+            or weight.ndim != 2
+        ):
+            raise ValueError(f"Expected a packed INT32 HYV4 expert matrix: {name}")
+        return name.removesuffix("_packed"), weight.contiguous().view(torch.int8)
+    return name, weight
+
+
 def permute_hyv4_indexer_weight(name, loaded_weight, config):
     """Move the indexer's rope slice to the front of each head group.
 
@@ -1053,11 +1073,12 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         if (
             quant_config is not None
             and quant_config.get_name() == "slimquant_w4a8_marlin"
-            and getattr(quant_config, "checkpoint_format", None) != "hy4_w4a8_v1"
+            and getattr(quant_config, "checkpoint_format", None)
+            not in ("hy4_w4a8_v1", "hy4_compressed_tensors_w4a8")
         ):
             raise ValueError(
                 "HY4 W4A8 requires quantization_config.checkpoint_format="
-                "hy4_w4a8_v1 (low-nibble-even INT4 with true channel scales)"
+                "hy4_w4a8_v1 or the supported HYV4 compressed-tensors W4A8 scheme"
             )
         validate_hyv4_launch(get_global_server_args(), get_parallel())
         get_attn_tp_context().init_context(config.q_lora_rank, True)
@@ -1141,6 +1162,11 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         def mapped_weights():
             for name, loaded_weight in weights:
+                name, loaded_weight = adapt_hyv4_packed_weight(
+                    name, loaded_weight, self.quant_config
+                )
+                if name is None:
+                    continue
                 if (
                     name.endswith(".weight.packed")
                     and getattr(self.quant_config, "checkpoint_format", None)

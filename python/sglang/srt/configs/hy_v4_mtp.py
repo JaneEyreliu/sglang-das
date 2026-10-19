@@ -27,7 +27,7 @@ def normalize_hyv4_mtp_weight_name(name):
     return name
 
 
-def validate_hyv4_mtp_metadata(config, weights, *, packed_experts):
+def validate_hyv4_mtp_metadata(config, weights, *, packed_experts, mixed_int8=False):
     """Check unsharded checkpoint metadata before returning a loaded draft.
 
     weights maps normalized relative names to {shape, dtype}. Both the offline
@@ -86,8 +86,20 @@ def validate_hyv4_mtp_metadata(config, weights, *, packed_experts):
                 f"dtype in {sorted(dtypes)}"
             )
 
+    def check_linear(name, shape):
+        meta = weights.get(name, {})
+        if mixed_int8 and len(shape) == 2 and meta.get("dtype") in ("I8", "torch.int8"):
+            check(name, shape, {"I8", "torch.int8"})
+            check(
+                name.removesuffix(".weight") + ".weight_scale",
+                [shape[0], 1],
+                floating,
+            )
+        else:
+            check(name, shape, floating)
+
     for name, shape in dense.items():
-        check(name, shape, floating)
+        check_linear(name, shape)
     intermediate = config["moe_intermediate_size"]
     modules = [(f"mlp.experts.{i}", intermediate) for i in range(experts)]
     shared = config.get("n_shared_experts", 0) or 0
@@ -100,6 +112,9 @@ def validate_hyv4_mtp_metadata(config, weights, *, packed_experts):
             ("down_proj", d, width),
         ):
             name = f"{prefix}.{proj}"
+            if mixed_int8 and prefix == "mlp.shared_experts":
+                check_linear(name + ".weight", [out_size, in_size])
+                continue
             check(
                 name + ".weight",
                 [out_size, in_size // 2 if packed_experts else in_size],

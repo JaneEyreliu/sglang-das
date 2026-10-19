@@ -501,11 +501,13 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         ignore: Optional[list[str]] = None,
         experts_only_linear: bool = False,
         checkpoint_format: Optional[str] = None,
+        linear_targets: Optional[list[str]] = None,
     ):
         super().__init__()
         self.ignore = ignore
         self.experts_only_linear = experts_only_linear
         self.checkpoint_format = checkpoint_format
+        self.linear_targets = linear_targets
         if checkpoint_format == "hy4_w4a8_v1":
             logger.info(
                 "[slimquant_w4a8_marlin] checkpoint_format=hy4_w4a8_v1: "
@@ -533,14 +535,67 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
     def from_config(cls, config: Dict[str, any]) -> "SlimQuantW4A8Int8MarlinConfig":
         archs = _hf_architectures(config.get("hf_config"))
         experts_only_linear = any(arch in _QWEN4_EXP_ARCHS for arch in archs)
+        checkpoint_format = config.get("checkpoint_format")
+        linear_targets = None
+        if config.get("quant_method") == "compressed-tensors":
+            if not cls._supports_compressed_config(config):
+                raise ValueError("Unsupported compressed-tensors W4A8 scheme")
+            if not any(arch.startswith("HYV4") for arch in archs):
+                raise ValueError("Compressed-tensors slimquant adapter requires HYV4")
+            checkpoint_format = "hy4_compressed_tensors_w4a8"
+            linear_targets = [
+                target
+                for group in config["config_groups"].values()
+                if group["weights"]["num_bits"] == 8
+                for target in group["targets"]
+            ]
         return cls(
             ignore=config.get("ignore"),
             experts_only_linear=experts_only_linear,
-            checkpoint_format=config.get("checkpoint_format"),
+            checkpoint_format=checkpoint_format,
+            linear_targets=linear_targets,
         )
+
+    @staticmethod
+    def _supports_compressed_config(config):
+        groups = config.get("config_groups", {})
+        if not groups:
+            return False
+        has_int4 = False
+        for group in groups.values():
+            weight = group.get("weights") or {}
+            act = group.get("input_activations") or {}
+            bits = weight.get("num_bits")
+            if not (
+                bits in (4, 8)
+                and weight.get("type") == "int"
+                and weight.get("strategy") == "channel"
+                and weight.get("symmetric") is True
+                and not weight.get("dynamic")
+                and weight.get("group_size") in (None, -1)
+                and weight.get("actorder") is None
+                and act.get("num_bits") == 8
+                and act.get("type") == "int"
+                and act.get("strategy") == "token"
+                and act.get("symmetric") is True
+                and act.get("dynamic") is True
+                and group.get("output_activations") is None
+                and group.get("format", config.get("format"))
+                == ("pack-quantized" if bits == 4 else "int-quantized")
+                and group.get("targets")
+            ):
+                return False
+            has_int4 |= bits == 4
+        return has_int4
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
+        if (
+            user_quant == cls.get_name()
+            and hf_quant_cfg.get("quant_method") == "compressed-tensors"
+            and cls._supports_compressed_config(hf_quant_cfg)
+        ):
+            return cls.get_name()
         if hf_quant_cfg.get("quant_method") == "slimquant_w4a8" and user_quant in (
             "slimquant_w4a8_marlin",
             "slimquant_marlin",
@@ -578,6 +633,12 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
                 ignore=self.ignore,
                 fused_mapping=self.packed_modules_mapping,
             ):
+                return UnquantizedLinearMethod()
+            if self.linear_targets is not None:
+                if should_ignore_layer(
+                    prefix, self.linear_targets, self.packed_modules_mapping
+                ):
+                    return SlimQuantW4A8Int8LinearMethod(self)
                 return UnquantizedLinearMethod()
             if self.ignore:
                 return SlimQuantW4A8Int8LinearMethod(self)
@@ -627,10 +688,17 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         in the 20260915 image consumes these divided scales directly; other
         backends retain their own scale conversion.
         """
-        if self.checkpoint_format != "hy4_w4a8_v1":
+        if self.checkpoint_format not in (
+            "hy4_w4a8_v1",
+            "hy4_compressed_tensors_w4a8",
+        ):
             return
         for name in ("w13_weight", "w2_weight"):
             packed = getattr(layer, name).data.view(torch.uint8)
+            if self.checkpoint_format == "hy4_compressed_tensors_w4a8":
+                # compressed-tensors stores q + 8 per nibble; convert to
+                # signed two's complement before the legacy nibble swap.
+                packed.bitwise_xor_(0x88)
             packed.copy_((packed << 4) | (packed >> 4))
             getattr(layer, name + "_scale").data.div_(16.0)
 
@@ -793,7 +861,10 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
                 # scale for both contiguous and masked GEMM. Other checkpoint
                 # formats retain their existing conversion.
                 scale_mul = (
-                    1.0 if self.quant_config.checkpoint_format == "hy4_w4a8_v1" else 16.0
+                    1.0
+                    if self.quant_config.checkpoint_format
+                    in ("hy4_w4a8_v1", "hy4_compressed_tensors_w4a8")
+                    else 16.0
                 )
                 layer.w13_weight_scale = Parameter(
                     layer.w13_weight_scale.data * scale_mul,
@@ -1449,7 +1520,12 @@ class SlimQuantW4A8Int8AiterMoEMethod:
                 pack_w4a8_moe_hipc_weight(layer.w2_weight.data),
                 requires_grad=False,
             )
-            scale_mul = 1.0 if self.quant_config.checkpoint_format == "hy4_w4a8_v1" else 16.0
+            scale_mul = (
+                1.0
+                if self.quant_config.checkpoint_format
+                in ("hy4_w4a8_v1", "hy4_compressed_tensors_w4a8")
+                else 16.0
+            )
             layer.w13_weight_scale = Parameter(
                 layer.w13_weight_scale.data * scale_mul, requires_grad=False
             )

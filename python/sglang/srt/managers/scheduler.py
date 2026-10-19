@@ -3194,7 +3194,7 @@ class Scheduler(
         # Without the reason the tokenizer falls back to its generic "Abort in
         # waiting queue", which loses both the message and the status code.
         self.ipc_channels.send_to_tokenizer.send_output(
-            _make_abort_req(req, finished_reason=req.finished_reason.to_json()), req
+            AbortReq(rid=req.rid, finished_reason=req.finished_reason.to_json()), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
@@ -4871,8 +4871,7 @@ class Scheduler(
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self._release_aborted_request(req.rid)
-            self.beam_coordinator.retire_group(req)
-            self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
+            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
