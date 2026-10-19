@@ -60,7 +60,12 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.hyv4_gate_cp_shard import (
+    build_gate_cp_chain,
+    get_gate_cp_shard_runtime,
+)
 from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
@@ -486,21 +491,60 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         )
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
-        self.linear_gate = ColumnParallelLinear(
-            config.hidden_size,
-            config.num_attention_heads * config.v_head_dim,
+        parallel = get_parallel()
+        gate_kwargs = dict(
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
             prefix=add_prefix("linear_gate", prefix),
         )
+        full_gate_width = config.num_attention_heads * config.v_head_dim
+        # linear_gate CP sharding: output rows split across attention-CP ranks,
+        # rebuilt per forward by GateCPShardChain. Decided on the layer's
+        # resolved quant method rather than quant_config, since W4A8 configs
+        # still leave this projection unquantized.
+        self.gate_cp_shard_enabled = False
+        if (
+            envs.SGLANG_HY4_LINEAR_GATE_CP_SHARD.get()
+            and parallel.attn_cp_size > 1
+            and attn_tp_size == 1
+            and not parallel.dcp_enabled
+            and full_gate_width % parallel.attn_cp_size == 0
+        ):
+            self.linear_gate = ColumnParallelLinear(
+                config.hidden_size,
+                full_gate_width,
+                tp_rank=parallel.attn_cp_rank,
+                tp_size=parallel.attn_cp_size,
+                **gate_kwargs,
+            )
+            if isinstance(self.linear_gate.quant_method, UnquantizedLinearMethod):
+                self.gate_cp_shard_enabled = True
+                self._gate_cp_runtime = get_gate_cp_shard_runtime(
+                    self.linear_gate.weight
+                )
+                # Bound by the owning model's GateCPShardChain.
+                self._gate_cp_chain = None
+                self._gate_cp_index = None
+            else:
+                del self.linear_gate
+        if not self.gate_cp_shard_enabled:
+            self.linear_gate = ColumnParallelLinear(
+                config.hidden_size,
+                full_gate_width,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                **gate_kwargs,
+            )
         self.local_gate_width = self.num_local_heads * config.v_head_dim
-        if self.linear_gate.output_size_per_partition != self.local_gate_width:
+        gate_width = (
+            full_gate_width
+            if self.gate_cp_shard_enabled
+            else self.linear_gate.output_size_per_partition
+        )
+        if gate_width != self.local_gate_width:
             raise ValueError(
                 "HYV4 attention gate shard width must match the local attention "
-                f"output width: {self.linear_gate.output_size_per_partition} != "
-                f"{self.local_gate_width}"
+                f"output width: {gate_width} != {self.local_gate_width}"
             )
         # Replicating these small logits avoids a per-layer DCP all-gather.
         # The much larger output gate remains attention-TP column-sharded.
@@ -546,6 +590,11 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         return self.learnable_sink_param[start : start + heads]
 
     def prepare_attention_output_gate(self, hidden_states):
+        if self.gate_cp_shard_enabled:
+            if self._gate_cp_chain is None:
+                raise RuntimeError("HYV4 CP-sharded linear_gate is not bound to a model")
+            return self._gate_cp_chain.gate(self._gate_cp_index, hidden_states)
+
         from sglang.srt.layers.hyv4_tuned_gate import try_tuned_gate
 
         tuned = try_tuned_gate(self.linear_gate, hidden_states)
@@ -787,6 +836,13 @@ class HYV4Model(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
+
+        self.gate_cp_chain = build_gate_cp_chain(
+            [
+                getattr(layer, "self_attn", None)
+                for layer in self.layers[self.start_layer : self.end_layer]
+            ]
+        )
         # hc_head collapses the 3D iHC stream back to (T, H); only the last
         # stage produces a model output, so only it needs the head and norm.
         if self.pp_group.is_last_rank:
@@ -926,15 +982,21 @@ class HYV4Model(nn.Module):
             dtype=torch.float32,
             device=hidden_states.device,
         )
-        for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states, topk_indices = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                zero_allocator,
-                prev_topk_indices=index_topk_share.topk_indices,
-            )
-            index_topk_share.update(topk_indices)
+        if self.gate_cp_chain is not None:
+            self.gate_cp_chain.begin(use_cp, hidden_states.shape[0])
+        try:
+            for layer in self.layers[self.start_layer : self.end_layer]:
+                hidden_states, topk_indices = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    zero_allocator,
+                    prev_topk_indices=index_topk_share.topk_indices,
+                )
+                index_topk_share.update(topk_indices)
+        finally:
+            if self.gate_cp_chain is not None:
+                self.gate_cp_chain.end()
         index_topk_share.publish()
         if not self.pp_group.is_last_rank:
             # Flatten the 3D iHC stream for PP IPC, as DeepseekV4Model does for

@@ -21,6 +21,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.hy4_dcp import validate_hyv4_launch
+from sglang.srt.layers.hyv4_gate_cp_shard import build_gate_cp_chain
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -190,6 +191,7 @@ class HYV4ModelNextN(nn.Module):
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.dp_attn_scattered = hyv4_dp_attn_scattered()
+        self.gate_cp_chain = build_gate_cp_chain([self.decoder.self_attn])
 
     @scoped_hyv4_dcp_write_locs
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
@@ -219,13 +221,21 @@ class HYV4ModelNextN(nn.Module):
             device=hidden_states.device,
         )
         index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
-        hidden_states, residual, topk_indices = self.decoder(
-            positions,
-            hidden_states,
-            forward_batch,
-            zero_allocator,
-            prev_topk_indices=index_topk_share.topk_indices,
-        )
+        # The draft layer never takes the prefill-CP split: tokens are the
+        # same on every CP rank.
+        if self.gate_cp_chain is not None:
+            self.gate_cp_chain.begin(False, hidden_states.shape[0])
+        try:
+            hidden_states, residual, topk_indices = self.decoder(
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                prev_topk_indices=index_topk_share.topk_indices,
+            )
+        finally:
+            if self.gate_cp_chain is not None:
+                self.gate_cp_chain.end()
         index_topk_share.update(topk_indices)
         index_topk_share.publish()
         # Join alt_stream before returning: leftover work there can create a

@@ -1609,6 +1609,14 @@ class Envs:
     # HCU HY4: select a K-only indexer graph only when a CPU-known conservative
     # KV length bound fits TopK. Missing bounds keep the full indexer path.
     SGLANG_HY4_HCU_DSA_SHORT_CONTEXT_K_ONLY = EnvBool(False)
+    # HY4 linear_gate CP sharding: each attention-CP rank keeps 1/cp of the
+    # gate's output rows. Prefill-CP batches all-gather the weight per layer
+    # into two shared ping-pong buffers, prefetched on a side stream while the
+    # preceding compute runs; replicated small batches (decode/verify/draft,
+    # CUDA graph) gather the local GEMM output instead. Saves ~13 GiB on CP8.
+    # Requires attn_cp_size > 1, attn_tp_size == 1, no DCP, and linear_gate
+    # resolving to UnquantizedLinearMethod (true under slimquant_w4a8_marlin).
+    SGLANG_HY4_LINEAR_GATE_CP_SHARD = EnvBool(False)
     # Opt-in HCU AOT kernel for concatenating absorbed MLA Q components.
     SGLANG_ENABLE_HCU_CONCAT_MLA_ABSORB_Q = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)

@@ -718,6 +718,34 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _broadcast_verify_results(predict, accept_index, num_correct_drafts):
+    """Make every rank that holds this batch commit rank 0's verify result.
+
+    Under DP attention the batch is shared by the attention-TP *and*
+    attention-CP ranks of one DP group, and each of them runs verify on its
+    own logits. Those logits are not bit-identical across ranks (the MoE /
+    DeepEP path is batch-layout dependent), so without a sync the ranks accept
+    different drafts, drift apart and deadlock the next collective. With
+    attn_tp_size == 1 the attention-TP broadcast alone is a no-op, hence the
+    second hop over attention-CP.
+    """
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+    if is_dp_attention_enabled():
+        parallel = get_parallel()
+        groups = [parallel.attn_tp_group]
+        if parallel.attn_cp_size > 1:
+            groups.append(parallel.attn_cp_group)
+    else:
+        groups = [get_tp_group()]
+    for group in groups:
+        if group.world_size > 1:
+            group.broadcast(predict, src=0)
+            group.broadcast(accept_index, src=0)
+            group.broadcast(num_correct_drafts, src=0)
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -730,10 +758,6 @@ def eagle_sample(
     """
     import torch.nn.functional as F
 
-    from sglang.srt.distributed import get_tp_group
-    from sglang.srt.layers.dp_attention import (
-        is_dp_attention_enabled,
-    )
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
@@ -838,15 +862,7 @@ def eagle_sample(
             # different number of drafts, desynchronize the committed seq_lens, and
             # deadlock the next TP collective. Broadcast from rank 0 to ensure
             # consistency, the same way the sampling branch below does.
-            tp_group = (
-                get_parallel().attn_tp_group
-                if is_dp_attention_enabled()
-                else get_tp_group()
-            )
-            if tp_group.world_size > 1:
-                tp_group.broadcast(predict, src=0)
-                tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_correct_drafts, src=0)
+            _broadcast_verify_results(predict, accept_index, num_correct_drafts)
     else:
         from sgl_kernel import (
             top_k_renorm_prob,
@@ -951,15 +967,7 @@ def eagle_sample(
         # produce slightly different target_probs due to floating-point
         # non-determinism in softmax/top_k/top_p, causing different
         # sampled tokens. Broadcast from rank 0 to ensure consistency.
-        tp_group = (
-            get_parallel().attn_tp_group
-            if is_dp_attention_enabled()
-            else get_tp_group()
-        )
-        if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
+        _broadcast_verify_results(predict, accept_index, num_correct_drafts)
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
