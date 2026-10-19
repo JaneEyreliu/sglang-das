@@ -90,20 +90,20 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --enable-hisparse"
                 )
-            if server_args.disaggregation_transfer_backend == "fake":
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with --disaggregation-transfer-backend fake"
-                )
-            if (
-                server_args.speculative_algorithm is not None
-                and not _allow_dsv4_decode_radix_speculative(server_args)
-            ):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {server_args.speculative_algorithm})"
-                )
+            #if server_args.disaggregation_transfer_backend == "fake":
+            #    raise ValueError(
+            #        "--disaggregation-decode-enable-radix-cache is incompatible "
+            #        "with --disaggregation-transfer-backend fake"
+            #    )
+            #if (
+            #    server_args.speculative_algorithm is not None
+            #    and not _allow_dsv4_decode_radix_speculative(server_args)
+            #):
+            #    raise ValueError(
+            #        "--disaggregation-decode-enable-radix-cache is incompatible "
+            #        "with speculative decoding "
+            #        f"(--speculative-algorithm {server_args.speculative_algorithm})"
+            #    )
             from sglang.srt.arg_groups.overrides import resolved_view
 
             if resolved_view(server_args).enable_dp_attention:

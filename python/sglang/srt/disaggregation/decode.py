@@ -98,6 +98,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     HybridReqToTokenPool,
     KVCache,
     ReqToTokenPool,
@@ -526,19 +527,41 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         )
 
+    def _uses_dsa_decode_radix_cache(self) -> bool:
+        # Plain-MLA DSA pool: no compressed sidecars, no sliding window. It uses
+        # the same decode-radix prompt-donation path as DSV4, minus the
+        # SWA/compression handling.
+        return (
+            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            and isinstance(self.token_to_kv_pool, DSATokenToKVPool)
+        )
+
+    def _uses_mla_decode_radix_cache(self) -> bool:
+        return (
+            self._uses_dsv4_decode_radix_cache()
+            or self._uses_dsa_decode_radix_cache()
+        )
+
+    def _decode_radix_compression_ratios(self) -> List[int]:
+        # DSV4 exposes per-layer compression ratios; plain MLA/DSA pools do not
+        # compress, so treat them as ratio 1 (page-size alignment only). This
+        # also fixes the AttributeError on DSATokenToKVPool, which has no
+        # `compression_ratios` attribute.
+        return list(getattr(self.token_to_kv_pool, "compression_ratios", []) or [1])
+
     def _dsv4_safe_prefix_len(self, prefix_len: int) -> int:
         """Avoid splitting reused prefixes through compressed DSV4 blocks."""
-        if not self._uses_dsv4_decode_radix_cache() or prefix_len <= 0:
+        if not self._uses_mla_decode_radix_cache() or prefix_len <= 0:
             return prefix_len
 
-        compression_ratios = self.token_to_kv_pool.compression_ratios
+        compression_ratios = self._decode_radix_compression_ratios()
         max_compression_ratio = max([r for r in compression_ratios if r > 0], default=1)
         page_size = self.token_to_kv_pool_allocator.page_size
         alignment = math.lcm(page_size, max_compression_ratio)
         return (prefix_len // alignment) * alignment
 
     def _dsv4_singleflight_min_prefix_len(self) -> int:
-        compression_ratios = self.token_to_kv_pool.compression_ratios
+        compression_ratios = self._decode_radix_compression_ratios()
         max_compression_ratio = max([r for r in compression_ratios if r > 0], default=1)
         alignment = math.lcm(
             self.token_to_kv_pool_allocator.page_size, max_compression_ratio
@@ -555,7 +578,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _dsv4_inflight_prompt_reqs(
         self, preallocated_reqs: List[DecodeRequest]
     ) -> List[Req]:
-        if not self._uses_dsv4_decode_radix_cache():
+        if not self._uses_mla_decode_radix_cache():
             return []
 
         inflight_reqs = [
@@ -2547,12 +2570,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # inserts committed KV into the radix tree. The last output token
         # hasn't had KV committed yet (output_ids is 1 ahead).
         req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
-        if self._uses_dsv4_decode_radix_cache():
-            # DSV4 compressed sidecars are not yet safe to reinsert from decode
-            # workers after generation starts. Defer the one prompt insert
-            # until the prebuilt forward has finished; process_prebuilt() runs
-            # before forward and must not free duplicate prompt pages still
-            # referenced by the current batch's out_cache_loc.
+        if self._uses_mla_decode_radix_cache():
+            # Defer the single prompt insert until the prebuilt forward has
+            # finished: process_prebuilt() runs before forward and must not free
+            # duplicate prompt pages still referenced by the current batch's
+            # out_cache_loc. DSV4 additionally carries compressed sidecars; DSA
+            # is plain MLA but shares the same deferral requirement. Bounding the
+            # key to kv_committed_len keeps MTP accepted/draft deltas out of the
+            # radix tree.
             req.dsv4_decode_radix_cache_prompt_len = req.kv_committed_len
             req.dsv4_decode_radix_cache_prompt_once = True
             req.skip_radix_cache_insert = True

@@ -205,13 +205,21 @@ class SchedulerBatchResultProcessor:
         old_swa_evicted_seqlen = req.kv.swa_evicted_seqlen
         old_force_leaf_creation = getattr(req, "force_radix_leaf_creation", False)
 
+        # Plain-MLA pools (e.g. DSA) have no sliding window and no compressed
+        # sidecars: the donation is just a full-attention prefix insert with no
+        # SWA tombstoning. Only the SWA-bearing hybrid pool (DSV4, window_size>0)
+        # needs the swa_evicted_seqlen / donated-SWA bookkeeping below. Gating on
+        # sliding_window_size matches the existing free_swa guard in this method.
+        window_size = int(getattr(self.model_config, "sliding_window_size", 0) or 0)
+
         # DSV4 prompt donation only needs a full-attention radix leaf. Mark the
         # whole donated key as SWA-evicted so the SWA component stays tombstoned,
         # but force full leaf creation so later matches can reuse the full prefix.
         # Do not pre-protect the whole radix key here: when the prefix already
         # exists, the generic overlap path must free this request's duplicate
         # prompt pages and repoint it to the existing radix leaf.
-        req.kv.swa_evicted_seqlen = radix_key_len
+        if window_size > 0:
+            req.kv.swa_evicted_seqlen = radix_key_len
         req.force_radix_leaf_creation = True
         try:
             maybe_cache_unfinished_req(req, self.tree_cache)
@@ -223,9 +231,6 @@ class SchedulerBatchResultProcessor:
             # for (pool leak). Use the tracked window-aware helper, which stops
             # at max(window, page) and records swa_evicted_seqlen so the
             # end-of-request path releases the remainder.
-            window_size = int(
-                getattr(self.model_config, "sliding_window_size", 0) or 0
-            )
             if window_size > 0 and prompt_len > 0:
                 free_swa_out_of_window_slots(
                     req,
@@ -239,9 +244,11 @@ class SchedulerBatchResultProcessor:
             # The tree keeps the donated full pages but tombstones their SWA,
             # so no owner remains for the SWA under [0, radix_key_len). Hand the
             # range to release_kv_cache, which runs after the last decode step.
-            req.dsv4_donated_swa_len = max(
-                int(getattr(req, "dsv4_donated_swa_len", 0) or 0), radix_key_len
-            )
+            # Plain-MLA/DSA has no SWA tail, so skip this entirely.
+            if window_size > 0:
+                req.dsv4_donated_swa_len = max(
+                    int(getattr(req, "dsv4_donated_swa_len", 0) or 0), radix_key_len
+                )
             if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
                 logger.info(
                     "DSV4 decode radix prompt inserted: rid=%s "

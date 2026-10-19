@@ -3196,6 +3196,9 @@ class Scheduler(
         self.ipc_channels.send_to_tokenizer.send_output(
             AbortReq(rid=req.rid, finished_reason=req.finished_reason.to_json()), req
         )
+        self.ipc_channels.send_to_tokenizer.send_output(
+           _make_abort_req(req, finished_reason=req.finished_reason.to_json()), req
+        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -4872,6 +4875,8 @@ class Scheduler(
             req = self.waiting_queue.pop(i)
             self._release_aborted_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            self.beam_coordinator.retire_group(req)
+            self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)

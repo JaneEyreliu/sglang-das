@@ -428,6 +428,12 @@ class DeepEPConfig(BaseDispatcherConfig):
 
             assert config_dispatch["num_sms"] == config_combine["num_sms"]
             self.num_sms = config_dispatch["num_sms"]
+            # HCU DeepEP sizes the rocSHMEM context pool (ROCSHMEM_MAX_NUM_CONTEXTS)
+            # from the class-level Buffer.num_sms at Buffer creation, and every
+            # high-throughput kernel workgroup takes one context; keep them in sync
+            # or workgroups beyond the pool run with an invalid (null) ctx.
+            if hasattr(Buffer, "set_num_sms"):
+                Buffer.set_num_sms(self.num_sms)
         else:
             self.normal_dispatch_config = None
             self.normal_combine_config = None
