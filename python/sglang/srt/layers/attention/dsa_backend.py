@@ -55,6 +55,7 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
 )
 from sglang.srt.layers.attention.dsa.flashmla_backend import (
     DSAFlashMLAMetadata,
+    FlashMLACompactIndexCache,
     can_fuse_flashmla_metadata,
     get_flashmla_op,
     refresh_flashmla_metadata,
@@ -547,6 +548,153 @@ class DeepseekSparseAttnBackend(
             return None
         return torch.empty((q.shape[0], chunks), dtype=torch.uint8, device=q.device)
 
+    def _get_flashmla_dcp_compact_entry(
+        self,
+        layer,
+        q,
+        kv_cache,
+        forward_batch,
+        metadata,
+        topk_indices,
+        impl,
+        *,
+        is_prefill: bool,
+    ) -> Optional[FlashMLACompactIndexCache]:
+        """Compact compatible paged TopK; share only within this forward/group.
+
+        Each producer records a fresh transform and scheduler during capture.
+        Their GPU nodes then refresh the indices, lengths and schedule on every
+        replay. Never use a warmup schedule as a substitute for those nodes.
+        Draft calls may compact independently, but can_reuse excludes nextn.
+        """
+        mode = effective_forward_mode(forward_batch)
+        if not (
+            _is_hcu
+            and getattr(self, "_flashmla_dcp_grouped_topk_enabled", False)
+            and self.dcp_size in (1, 2, 4, 8)
+            and self.dsa_kv_cache_store_fp8
+            and self.dsa_index_topk == 2048
+            and impl == "flashmla_kv"
+            and q.dtype == torch.bfloat16
+            and self.real_page_size == 64
+            and self.kv_cache_dim == 656
+            and layer.head_dim == 576
+            and layer.v_head_dim == 512
+            and kv_cache.is_contiguous()
+            and topk_indices is not None
+            and not self.use_fused_topk
+            and self.hisparse_coordinator is None
+            and not hasattr(self.token_to_kv_pool, "translate_main_kv_loc_to_compact")
+            and (
+                mode.is_decode()
+                or mode.is_target_verify()
+                or mode.is_draft_extend_v2()
+                or mode == ForwardMode.EXTEND
+            )
+        ):
+            self._flashmla_dcp_compact_cache = None
+            return None
+
+        num_rows = q.shape[0]
+        num_valid = get_flashmla_kv_valid_rows(forward_batch, num_rows)
+        page_table = metadata.page_table_1
+        # Ordinary prefill maps query rows through cu_seqlens_q to request
+        # rows. Verify/draft-extend metadata already has one page-table row
+        # per query. Do not treat ordinary prefill as an expanded table.
+        page_table_is_expanded = (
+            not is_prefill or mode.is_target_verify() or mode.is_draft_extend_v2()
+        )
+        # Host metadata only: no device reads, hashing of tensor values or sync.
+        layout_key = (
+            mode,
+            is_prefill,
+            page_table_is_expanded,
+            id(page_table),
+            tuple(page_table.shape),
+            page_table.stride(),
+            id(metadata.dsa_cache_seqlens_int32),
+            id(metadata.cu_seqlens_q) if is_prefill else None,
+            tuple(metadata.dsa_extend_seq_lens_list) if is_prefill else None,
+        )
+        query_key = (
+            num_rows,
+            num_valid,
+            layer.tp_q_head_num,
+            self.flashmla_kv_num_q_heads,
+            layer.head_dim,
+            layer.v_head_dim,
+            self.real_page_size,
+            tuple(kv_cache.shape),
+            kv_cache.stride(),
+            kv_cache.dtype,
+            q.dtype,
+            q.device,
+        )
+        entry = getattr(self, "_flashmla_dcp_compact_cache", None)
+        if entry is not None and entry.can_reuse(
+            layer=layer,
+            original_topk=topk_indices,
+            forward_batch=forward_batch,
+            metadata=metadata,
+            num_rows=num_rows,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+            layout_key=layout_key,
+            query_key=query_key,
+        ):
+            entry.last_layer_id = layer.layer_id
+            return entry
+
+        lengths = torch.empty((num_rows,), dtype=torch.int32, device=q.device)
+        valid_chunks = self._hyv4_dcp_valid_chunks(
+            layer, q, forward_batch, impl, chunks=8 if is_prefill else 1
+        )
+        if is_prefill:
+            indices = transform_index_page_table_prefill(
+                page_table=page_table,
+                topk_indices=topk_indices,
+                extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
+                page_size=1,
+                output_num_tokens=num_rows,
+                page_table_is_expanded=page_table_is_expanded,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
+                out_valid_chunks=valid_chunks,
+                out_topk_lengths=lengths,
+            )
+        else:
+            padded_topk = self._pad_topk_indices(topk_indices, num_rows)
+            indices = transform_index_page_table_decode(
+                page_table=page_table,
+                topk_indices=padded_topk,
+                page_size=1,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
+                out_valid_chunks=valid_chunks,
+                out_topk_lengths=lengths,
+            )
+        entry = FlashMLACompactIndexCache(
+            original_topk=topk_indices,
+            forward_batch=forward_batch,
+            metadata=metadata,
+            last_layer_id=layer.layer_id,
+            num_rows=num_rows,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+            indices=indices,
+            topk_length=lengths,
+            valid_chunks=valid_chunks,
+            layout_key=layout_key,
+            query_key=query_key,
+        )
+        # A draft entry belongs to this call only, even if a future caller
+        # uses the same backend instance for both draft and target layers.
+        self._flashmla_dcp_compact_cache = (
+            None if getattr(layer, "is_nextn", False) else entry
+        )
+        return entry
+
     def _translate_main_kv_loc_to_compact(self, loc: torch.Tensor) -> torch.Tensor:
         translate = getattr(
             self.token_to_kv_pool, "translate_main_kv_loc_to_compact", None
@@ -766,6 +914,10 @@ class DeepseekSparseAttnBackend(
         self._q8kv8_topk_length_enabled: bool = (
             envs.SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH.get()
         )
+        self._flashmla_dcp_grouped_topk_enabled = (
+            envs.SGLANG_ENABLE_DSA_FLASHMLA_DCP_GROUPED_TOPK.get()
+        )
+        self._flashmla_dcp_compact_cache: Optional[FlashMLACompactIndexCache] = None
         # Persistent (grow-only) kernel-output buffers (out/max_logits/lse).
         self._q8kv8_out_bufs: Optional[tuple] = None
         # Fused non-prefix KV prep (cast-concat k/k_rope directly into the
@@ -1078,6 +1230,7 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        self._flashmla_dcp_compact_cache = None
         if _is_hcu:
             # HCU records the static-shape metadata kernels through
             # init_forward_metadata_in_graph. At replay the captured graph reads
@@ -1123,6 +1276,7 @@ class DeepseekSparseAttnBackend(
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        self._flashmla_dcp_compact_cache = None
         if not _is_hcu:
             return
         # Restore the pre-forward-port behavior for HCU: metadata tensor
@@ -1142,6 +1296,7 @@ class DeepseekSparseAttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        self._flashmla_dcp_compact_cache = None
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
         forward_mode = effective_forward_mode(forward_batch)
@@ -1625,6 +1780,7 @@ class DeepseekSparseAttnBackend(
         actual_forward_mode: Optional[ForwardMode] = None,
     ):
         """Create and store DSAMetadata for a new batch size during CUDA graph capture."""
+        self._flashmla_dcp_compact_cache = None
         self.set_dsa_prefill_impl(forward_batch=None)
 
         if forward_mode.is_decode_or_idle():
@@ -1793,6 +1949,7 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
+        self._flashmla_dcp_compact_cache = None
         if bs not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
@@ -2103,6 +2260,7 @@ class DeepseekSparseAttnBackend(
             precomputed: Precomputed metadata to copy from
             forward_mode: Forward mode
         """
+        self._flashmla_dcp_compact_cache = None
         self.set_dsa_prefill_impl(forward_batch=None)
 
         metadata = self.decode_cuda_graph_metadata[bs]
@@ -2378,13 +2536,30 @@ class DeepseekSparseAttnBackend(
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method(forward_mode)
 
+        dcp_compact_entry = None
         dcp_valid_chunks = None
         if topk_transform_method == TopkTransformMethod.PAGED:
-            dcp_valid_chunks = self._hyv4_dcp_valid_chunks(
-                layer, q_nope, forward_batch, dsa_impl, chunks=8
+            dcp_compact_entry = self._get_flashmla_dcp_compact_entry(
+                layer,
+                q_nope,
+                kv_cache,
+                forward_batch,
+                metadata,
+                topk_indices,
+                dsa_impl,
+                is_prefill=True,
+            )
+            dcp_valid_chunks = (
+                dcp_compact_entry.valid_chunks
+                if dcp_compact_entry is not None
+                else self._hyv4_dcp_valid_chunks(
+                    layer, q_nope, forward_batch, dsa_impl, chunks=8
+                )
             )
 
-        if self.use_fused_topk:
+        if dcp_compact_entry is not None:
+            page_table_1 = dcp_compact_entry.indices
+        elif self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
@@ -2609,6 +2784,7 @@ class DeepseekSparseAttnBackend(
                 attn_sink=attn_sink,
                 return_lse=self.dcp_enabled,
                 dcp_valid_chunks=dcp_valid_chunks,
+                dcp_compact_entry=dcp_compact_entry,
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -2713,15 +2889,30 @@ class DeepseekSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
-        # Align topk_indices with q dimensions
-        if topk_indices is not None:
+        dcp_compact_entry = self._get_flashmla_dcp_compact_entry(
+            layer,
+            q_nope,
+            kv_cache,
+            forward_batch,
+            metadata,
+            topk_indices,
+            self.dsa_decode_impl,
+            is_prefill=False,
+        )
+        if dcp_compact_entry is None and topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
-        dcp_valid_chunks = self._hyv4_dcp_valid_chunks(
-            layer, q_nope, forward_batch, self.dsa_decode_impl, chunks=1
+        dcp_valid_chunks = (
+            dcp_compact_entry.valid_chunks
+            if dcp_compact_entry is not None
+            else self._hyv4_dcp_valid_chunks(
+                layer, q_nope, forward_batch, self.dsa_decode_impl, chunks=1
+            )
         )
 
-        if self.hisparse_coordinator is not None:
+        if dcp_compact_entry is not None:
+            page_table_1 = dcp_compact_entry.indices
+        elif self.hisparse_coordinator is not None:
             page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -2779,6 +2970,7 @@ class DeepseekSparseAttnBackend(
                 attn_sink=attn_sink,
                 return_lse=self.dcp_enabled,
                 dcp_valid_chunks=dcp_valid_chunks,
+                dcp_compact_entry=dcp_compact_entry,
             )
         elif self.dsa_decode_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -3313,6 +3505,7 @@ class DeepseekSparseAttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         dcp_valid_chunks: Optional[torch.Tensor] = None,
+        dcp_compact_entry: Optional[FlashMLACompactIndexCache] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | Hyv4DcpRawLSE]:
         # HY4 applies its sink once to both output and LSE below. Do not also
         # fold it into FlashMLA's native denominator (or count it per rank).
@@ -3369,13 +3562,44 @@ class DeepseekSparseAttnBackend(
             q_input = q_input[:num_valid]
             indices = indices[:num_valid]
             cache_seqlens = cache_seqlens[:num_valid]
-            if num_valid > 0:
+            if num_valid > 0 and dcp_compact_entry is None:
                 flashmla_metadata = self._compute_flashmla_metadata(
                     cache_seqlens=cache_seqlens,
                     seq_len_q=1,
                 )
 
-        if needs_repad and num_valid == 0:
+        mla_topk_length = (
+            dcp_compact_entry.topk_length
+            if dcp_compact_entry is not None
+            else None
+        )
+        if dcp_compact_entry is not None:
+            if needs_repad:
+                mla_topk_length = mla_topk_length[:num_valid]
+            if q_input.shape[0] > 0:
+                flashmla_metadata = dcp_compact_entry.get_scheduler(
+                    num_rows=q_input.shape[0],
+                    num_heads=target_q_heads,
+                    query_key=dcp_compact_entry.query_key,
+                )
+                if flashmla_metadata is None:
+                    # Fresh at each producer, including capture after warmup.
+                    # The wheel records its scheduler on this first invocation;
+                    # shared layers consume the same buffers in graph order.
+                    flashmla_metadata = self._compute_flashmla_metadata(
+                        cache_seqlens=mla_topk_length,
+                        seq_len_q=1,
+                    )
+                    dcp_compact_entry.set_scheduler(
+                        flashmla_metadata,
+                        num_rows=q_input.shape[0],
+                        num_heads=target_q_heads,
+                        query_key=dcp_compact_entry.query_key,
+                    )
+
+        if (needs_repad and num_valid == 0) or (
+            dcp_compact_entry is not None and q_input.shape[0] == 0
+        ):
             o = q_input.new_zeros((0, 1, target_q_heads, v_head_dim))
             lse = torch.empty(
                 (0, target_q_heads, 1), dtype=torch.float32, device=q_input.device
@@ -3388,6 +3612,10 @@ class DeepseekSparseAttnBackend(
                 sink_padded = attn_sink_kv.new_zeros(target_q_heads)
                 sink_padded[:num_q_heads] = attn_sink_kv
                 attn_sink_kv = sink_padded
+            if mla_topk_length is not None:
+                assert mla_topk_length.dtype == torch.int32
+                assert mla_topk_length.device == indices.device
+                assert mla_topk_length.shape == (indices.shape[0],)
             o, lse = flash_mla_with_kvcache(
                 q=q_input,
                 k_cache=kv_cache,
@@ -3402,6 +3630,13 @@ class DeepseekSparseAttnBackend(
                     (q_input.shape[0], 0), dtype=torch.int32, device=q_input.device
                 ),
                 is_fp8_kvcache=True,
+                # Only the compact path supplies a per-row local prefix
+                # length. Other paths keep the baseline FlashMLA call.
+                **(
+                    {"topk_length": mla_topk_length}
+                    if mla_topk_length is not None
+                    else {}
+                ),
                 **({"attn_sink": attn_sink_kv} if attn_sink_kv is not None else {}),
             )
 
@@ -3437,7 +3672,11 @@ class DeepseekSparseAttnBackend(
 
             # Owner filtering may leave a rank with no local sparse KV. Such
             # rows must be the online-softmax identity before the DCP merge.
-            local_kv_counts = (page_table_1 >= 0).sum(dim=-1, dtype=torch.int32)
+            local_kv_counts = (
+                dcp_compact_entry.topk_length
+                if dcp_compact_entry is not None
+                else (page_table_1 >= 0).sum(dim=-1, dtype=torch.int32)
+            )
             batch_size = page_table_1.shape[0]
             fixup_zero_kv_rows(
                 o,
@@ -3468,9 +3707,20 @@ class DeepseekSparseAttnBackend(
                 o.squeeze(1),
                 lse.squeeze(-1),
                 sink_getter(),
-                (page_table_1 >= 0).sum(dim=-1),
+                (
+                    dcp_compact_entry.topk_length
+                    if dcp_compact_entry is not None
+                    else (page_table_1 >= 0).sum(dim=-1)
+                ),
             )
             o = o.unsqueeze(1)
+        elif dcp_compact_entry is not None:
+            # Single-rank models without the HY4 sink must also tolerate an
+            # empty local prefix. Do not expose a kernel's NaN/+inf sentinel
+            # output for zero-length or synthetic rows to the next layer.
+            o = torch.where(
+                dcp_compact_entry.topk_length[:, None, None, None] > 0, o, 0.0
+            )
         return o
 
     def _forward_standard_mha(

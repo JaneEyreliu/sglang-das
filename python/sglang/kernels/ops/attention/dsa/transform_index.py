@@ -54,6 +54,155 @@ def _validate_out_valid_chunks(
     assert out_valid_chunks.dtype in (torch.bool, torch.uint8, torch.int32)
 
 
+def _validate_out_topk_lengths(
+    out_topk_lengths: torch.Tensor,
+    rows: int,
+    device: torch.device,
+) -> None:
+    assert out_topk_lengths.shape == (rows,)
+    assert out_topk_lengths.device == device
+    assert out_topk_lengths.dtype == torch.int32
+    assert out_topk_lengths.is_contiguous()
+
+
+@triton.jit
+def transform_index_page_table_compact_kernel(
+    page_table_ptr,
+    topk_indices_ptr,
+    cu_seqlens_q_ptr,
+    result_ptr,
+    out_topk_lengths_ptr,
+    out_valid_chunks_ptr,
+    page_table_stride_0: tl.constexpr,
+    page_table_stride_1: tl.constexpr,
+    topk_indices_stride_0: tl.constexpr,
+    topk_indices_stride_1: tl.constexpr,
+    result_stride_0: tl.constexpr,
+    result_stride_1: tl.constexpr,
+    valid_stride_0: tl.constexpr,
+    valid_stride_1: tl.constexpr,
+    PAGE_TABLE_COLS: tl.constexpr,
+    TOPK_NUM_ROWS: tl.constexpr,
+    NUM_REQUESTS: tl.constexpr,
+    HAS_CU_SEQLENS: tl.constexpr,
+    PAGE_TABLE_IS_EXPANDED: tl.constexpr,
+    HAS_VALID_CHUNKS: tl.constexpr,
+    VALID_CHUNKS: tl.constexpr,
+    dcp_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
+):
+    # A single CTA owns every slot and the count of this output row. Prefix
+    # scatter and tail fill are disjoint, preserving order and duplicates.
+    row = tl.program_id(0)
+    offsets = tl.arange(0, 2048)
+    row_is_valid = row < TOPK_NUM_ROWS
+    page_table_row = row
+    if HAS_CU_SEQLENS:
+        live_rows = tl.load(cu_seqlens_q_ptr + NUM_REQUESTS)
+        row_is_valid = row_is_valid & (row < live_rows)
+        if not PAGE_TABLE_IS_EXPANDED:
+            # Find the request for this query from the live GPU boundaries.
+            # Repeated boundaries represent zero-query requests and must be
+            # skipped. This also works when boundaries change on graph replay.
+            left = 0
+            right = NUM_REQUESTS
+            while left < right:
+                middle = (left + right) // 2
+                query_end = tl.load(cu_seqlens_q_ptr + middle + 1)
+                move_right = row >= query_end
+                left = tl.where(move_right, middle + 1, left)
+                right = tl.where(move_right, right, middle)
+            page_table_row = left
+
+    logical_indices = tl.load(
+        topk_indices_ptr
+        + row * topk_indices_stride_0
+        + offsets * topk_indices_stride_1,
+        mask=row_is_valid,
+        other=-1,
+    )
+    valid = row_is_valid & (logical_indices >= 0) & (logical_indices < PAGE_TABLE_COLS)
+    physical_indices = tl.load(
+        page_table_ptr
+        + page_table_row * page_table_stride_0
+        + logical_indices * page_table_stride_1,
+        mask=valid,
+        other=-1,
+    )
+    valid = valid & (physical_indices >= 0)
+    if dcp_size > 1:
+        valid = valid & (physical_indices % dcp_size == dcp_rank)
+        physical_indices = physical_indices // dcp_size
+    valid_int = valid.to(tl.int32)
+    destination = tl.cumsum(valid_int, 0) - 1
+    valid_count = tl.sum(valid_int, 0)
+    tl.store(
+        result_ptr + row * result_stride_0 + destination * result_stride_1,
+        physical_indices,
+        mask=valid,
+    )
+    tl.store(
+        result_ptr + row * result_stride_0 + offsets * result_stride_1,
+        -1,
+        mask=offsets >= valid_count,
+    )
+    tl.store(out_topk_lengths_ptr + row, valid_count)
+    if HAS_VALID_CHUNKS:
+        chunks = tl.arange(0, VALID_CHUNKS)
+        tl.store(
+            out_valid_chunks_ptr
+            + row * valid_stride_0
+            + chunks * valid_stride_1,
+            valid_count > chunks * (2048 // VALID_CHUNKS),
+        )
+
+
+def _transform_index_page_table_compact(
+    page_table: torch.Tensor,
+    topk_indices: torch.Tensor,
+    result: torch.Tensor,
+    out_topk_lengths: torch.Tensor,
+    out_valid_chunks: Optional[torch.Tensor],
+    cu_seqlens_q: Optional[torch.Tensor],
+    page_table_is_expanded: bool,
+    dcp_size: int,
+    dcp_rank: int,
+) -> torch.Tensor:
+    _validate_out_topk_lengths(out_topk_lengths, result.shape[0], topk_indices.device)
+    assert result.shape == (out_topk_lengths.shape[0], 2048)
+    assert result.dtype == torch.int32 and result.device == topk_indices.device
+    assert dcp_size > 0 and 0 <= dcp_rank < dcp_size
+    if result.shape[0] == 0:
+        return result
+    transform_index_page_table_compact_kernel[(result.shape[0],)](
+        page_table,
+        topk_indices,
+        cu_seqlens_q,
+        result,
+        out_topk_lengths,
+        out_valid_chunks,
+        page_table.stride(0),
+        page_table.stride(1),
+        topk_indices.stride(0),
+        topk_indices.stride(1),
+        result.stride(0),
+        result.stride(1),
+        out_valid_chunks.stride(0) if out_valid_chunks is not None else 0,
+        out_valid_chunks.stride(1) if out_valid_chunks is not None else 0,
+        PAGE_TABLE_COLS=page_table.shape[1],
+        TOPK_NUM_ROWS=topk_indices.shape[0],
+        NUM_REQUESTS=cu_seqlens_q.shape[0] - 1 if cu_seqlens_q is not None else 0,
+        HAS_CU_SEQLENS=cu_seqlens_q is not None,
+        PAGE_TABLE_IS_EXPANDED=page_table_is_expanded,
+        HAS_VALID_CHUNKS=out_valid_chunks is not None,
+        VALID_CHUNKS=out_valid_chunks.shape[1] if out_valid_chunks is not None else 1,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        num_warps=4,
+    )
+    return result
+
+
 @triton.jit
 def transform_index_page_table_decode_kernel(
     page_table_ptr: torch.Tensor,
@@ -200,6 +349,7 @@ def transform_index_page_table_decode_fast(
     dcp_size: int = 1,
     dcp_rank: int = 0,
     out_valid_chunks: Optional[torch.Tensor] = None,
+    out_topk_lengths: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Transform the page table according to topk indices for sparse topk attention.
@@ -208,6 +358,9 @@ def transform_index_page_table_decode_fast(
         topk_indices: [qo_len, topk], the topk indices for each query position
         out_valid_chunks: Optional [qo_len, 1] bool/uint8/int32 output. The same
             launch writes whether each row contains a nonnegative final index.
+        out_topk_lengths: Optional int32 [qo_len] output. When supplied, the
+            same launch stably compacts locally owned indices to a prefix,
+            fills the tail with -1, and writes its actual length.
     Returns:
         transformed_page_table: [qo_len, topk], the transformed page table
         For out-of-bound indices in topk_indices, this should be filled with -1.
@@ -220,6 +373,18 @@ def transform_index_page_table_decode_fast(
         result = torch.empty_like(topk_indices, dtype=torch.int32)
     if out_valid_chunks is not None:
         _validate_out_valid_chunks(out_valid_chunks, qo_len, 1, topk_indices.device)
+    if out_topk_lengths is not None:
+        return _transform_index_page_table_compact(
+            page_table,
+            topk_indices,
+            result,
+            out_topk_lengths,
+            out_valid_chunks,
+            None,
+            True,
+            dcp_size,
+            dcp_rank,
+        )
     if qo_len == 0:
         return result
     # Launch triton kernel
@@ -252,6 +417,7 @@ def transform_index_page_table_prefill_fast(
     dcp_size: int = 1,
     dcp_rank: int = 0,
     out_valid_chunks: Optional[torch.Tensor] = None,
+    out_topk_lengths: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Transform TopK and optionally report validity for each 256-index tile.
 
@@ -259,6 +425,8 @@ def transform_index_page_table_prefill_fast(
     All result and validity rows, including padding, are written in the same
     launch. A row is locally valid iff any of its eight flags is nonzero. The
     flags describe this transform's output, before any later KV remapping.
+    Providing int32 ``out_topk_lengths[output rows]`` also stably compacts each
+    row and reports its actual local length; padding rows have length zero.
     """
     assert page_size == 1
     assert topk_indices.shape[1] == 2048
@@ -267,13 +435,31 @@ def transform_index_page_table_prefill_fast(
         topk_indices,
         real_num_tokens,
         output_num_tokens,
-        fill_padding=out_valid_chunks is None,
+        fill_padding=out_valid_chunks is None and out_topk_lengths is None,
     )
     block_topk = 256
     num_chunks = triton.cdiv(topk_indices.shape[1], block_topk)
     if out_valid_chunks is not None:
         _validate_out_valid_chunks(
             out_valid_chunks, result.shape[0], num_chunks, topk_indices.device
+        )
+    if out_topk_lengths is not None:
+        if cu_seqlens_q is None:
+            cu_seqlens_q = torch.tensor(
+                [0, *accumulate(extend_lens_cpu)],
+                dtype=torch.int32,
+                device=topk_indices.device,
+            )
+        return _transform_index_page_table_compact(
+            page_table,
+            topk_indices,
+            result,
+            out_topk_lengths,
+            out_valid_chunks,
+            cu_seqlens_q,
+            page_table_is_expanded,
+            dcp_size,
+            dcp_rank,
         )
     if result.shape[0] == 0 or (real_num_tokens == 0 and out_valid_chunks is None):
         return result

@@ -1636,6 +1636,11 @@ class Envs:
     # blocks contain only -1 pads, and -1 entries inside the consumed range
     # still take the in-kernel clamp+mask path.
     SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH = EnvBool(False)
+    # Opt-in HCU flashmla_kv FP8/BF16-Q TopK2048 compaction: single rank or
+    # DCP2/4/8, decode/verify/ordinary prefill/draft. Exact local lengths skip
+    # invalid tails; explicitly sharing target layers also reuse scheduling.
+    # Independent of the old FLASHMLA_KV_TOPK_LENGTH patch/flag.
+    SGLANG_ENABLE_DSA_FLASHMLA_DCP_GROUPED_TOPK = EnvBool(False)
     # Opt-in: run the born-fp8 q-prep (absorbed bmm + concat + fp8 cast,
     # ~173us/layer-call) on alt_stream underneath the DSA indexer — the two
     # chains fork independently from the q_a_layernorm output.  Requires
