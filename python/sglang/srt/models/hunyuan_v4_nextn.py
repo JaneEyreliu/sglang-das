@@ -18,12 +18,25 @@ from sglang.srt.configs.hy_v4_mtp import (
 )
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_cp_split,
+    dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
+    is_dsa_prefill_cp_round_robin_split,
+)
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.hy4_dcp import validate_hyv4_launch
 from sglang.srt.layers.hyv4_gate_cp_shard import build_gate_cp_chain
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -50,6 +63,49 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda
 
 _is_cuda = is_cuda()
+
+
+def _gather_dsa_topk_indices_for_cp(
+    topk_indices, local_num_tokens, cp_size, forward_batch, stream
+):
+    """Gather CP-local DSA top-k rows back to the original token order."""
+    if (
+        is_dsa_prefill_cp_round_robin_split()
+        and topk_indices.shape[0] < local_num_tokens
+    ):
+        pad_rows = local_num_tokens - topk_indices.shape[0]
+        topk_indices = torch.cat(
+            [
+                topk_indices,
+                topk_indices.new_full((pad_rows, topk_indices.shape[1]), -1),
+            ],
+            dim=0,
+        )
+    return cp_all_gather_rerange_output(
+        topk_indices, cp_size, forward_batch, stream
+    )
+
+
+def _split_hyv4_nextn_cp_inputs(
+    forward_batch, hidden_states, target_hidden_states, positions
+):
+    """Apply one CP token layout to both MTP input streams and positions."""
+    hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+    target_hidden_states = cp_split_and_rebuild_data(
+        forward_batch, target_hidden_states
+    )
+    positions = cp_split_and_rebuild_position(forward_batch, positions)
+    return hidden_states, target_hidden_states, positions
+
+
+def _restore_hyv4_nextn_cp_output(hidden_states, cp_size, forward_batch):
+    """Gather and restore original token order before draft logits."""
+    return cp_all_gather_rerange_output(
+        hidden_states.contiguous(),
+        cp_size,
+        forward_batch,
+        torch.cuda.current_stream(),
+    )
 
 
 def _mtp_quant_config(quant_config):
@@ -193,21 +249,40 @@ class HYV4ModelNextN(nn.Module):
         self.shared_head.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.dp_attn_scattered = hyv4_dp_attn_scattered()
         self.gate_cp_chain = build_gate_cp_chain([self.decoder.self_attn])
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
+            self.cp_size = get_parallel().attn_cp_size
+        else:
+            self.cp_size = None
 
     @scoped_hyv4_dcp_write_locs
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
+        previous_hidden_states = forward_batch.spec_info.hidden_states
+        cp_v2_active = is_cp_v2_active(forward_batch)
+        use_cp_v1 = (
+            dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
+            and not cp_v2_active
+        )
+        if use_cp_v1:
+            (
+                hidden_states,
+                previous_hidden_states,
+                positions,
+            ) = _split_hyv4_nextn_cp_inputs(
+                forward_batch, hidden_states, previous_hidden_states, positions
+            )
         if hidden_states.shape[0] > 0:
-            if forward_batch.spec_info.hidden_states.shape != hidden_states.shape:
+            if previous_hidden_states.shape != hidden_states.shape:
                 raise ValueError(
                     "HYV4 MTP requires token-aligned D-dimensional hidden states"
                 )
             mtp_input = torch.cat(
                 (
                     self.enorm(hidden_states),
-                    self.hnorm(forward_batch.spec_info.hidden_states),
+                    self.hnorm(previous_hidden_states),
                 ),
                 dim=-1,
             )
@@ -222,10 +297,10 @@ class HYV4ModelNextN(nn.Module):
             device=hidden_states.device,
         )
         index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
-        # The draft layer never takes the prefill-CP split: tokens are the
-        # same on every CP rank.
+        # CP-split tokens differ across ranks, so the gate shard must gather
+        # full gate weights before computing its local activation slice.
         if self.gate_cp_chain is not None:
-            self.gate_cp_chain.begin(False, hidden_states.shape[0])
+            self.gate_cp_chain.begin(use_cp_v1, hidden_states.shape[0])
         try:
             hidden_states, residual, topk_indices = self.decoder(
                 positions,
@@ -237,19 +312,34 @@ class HYV4ModelNextN(nn.Module):
         finally:
             if self.gate_cp_chain is not None:
                 self.gate_cp_chain.end()
-        index_topk_share.update(topk_indices)
-        index_topk_share.publish()
         # Join alt_stream before returning: leftover work there can create a
         # cross-stream dependency that deadlocks the next target-model graph
         # replay. Same guard as DeepseekModelNextN.
         if self.alt_stream is not None:
             torch.cuda.current_stream().wait_stream(self.alt_stream)
         if forward_batch.forward_mode.is_idle():
+            index_topk_share.update(topk_indices)
+            index_topk_share.publish()
             return hidden_states
         hidden_states, _ = self.shared_head.norm(hidden_states, residual)
         if self.dp_attn_scattered:
             # SCATTERED after the MoE; the logits processor wants TP_ATTN_FULL.
             hidden_states = hyv4_attn_tp_gather(hidden_states)
+        if use_cp_v1:
+            local_num_tokens = hidden_states.shape[0]
+            hidden_states = _restore_hyv4_nextn_cp_output(
+                hidden_states, self.cp_size, forward_batch
+            )
+            if index_topk_share.should_publish and topk_indices is not None:
+                topk_indices = _gather_dsa_topk_indices_for_cp(
+                    topk_indices,
+                    local_num_tokens,
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+        index_topk_share.update(topk_indices)
+        index_topk_share.publish()
         return hidden_states
 
 
@@ -274,6 +364,13 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
         # false recomputes per step; true carries draft-extend top-k through
         # the draft chain (and recomputes if no seed is available).
         get_attn_tp_context().init_context(config.q_lora_rank, True)
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
+            self.cp_rank = get_parallel().attn_cp_rank
+            self.cp_size = get_parallel().attn_cp_size
+        else:
+            self.cp_rank = None
+            self.cp_size = None
         self.model = HYV4ModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -290,6 +387,24 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
 
     @torch.no_grad()
     def forward(self, input_ids, positions, forward_batch):
+        # The draft runner creates a fresh ForwardBatch for EAGLE prefill.
+        # Prepare the same CP metadata as the target before the model applies
+        # the token split. CP-v2 owns sharding at the runner boundary and must
+        # not be split a second time here.
+        if (
+            self.dsa_enable_prefill_cp
+            and not is_cp_v2_active(forward_batch)
+            and can_dsa_cp_split(
+                len(input_ids), self.cp_size, True, forward_batch
+            )
+        ):
+            forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                len(input_ids),
+                self.cp_rank,
+                self.cp_size,
+                forward_batch.seq_lens_cpu.tolist(),
+                extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+            )
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

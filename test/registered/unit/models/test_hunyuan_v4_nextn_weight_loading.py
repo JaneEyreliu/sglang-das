@@ -2,6 +2,9 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -11,10 +14,91 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
-from sglang.srt.models.hunyuan_v4_nextn import _mtp_quant_config
+from sglang.srt.models.hunyuan_v4_nextn import (
+    _gather_dsa_topk_indices_for_cp,
+    _mtp_quant_config,
+    _restore_hyv4_nextn_cp_output,
+    _split_hyv4_nextn_cp_inputs,
+)
 
 
 class TestHunyuanV4NextNQuantConfig(CustomTestCase):
+    def test_prefill_cp_splits_embedding_and_target_hidden_states_together(self):
+        forward_batch = object()
+        embedding = torch.arange(12).view(6, 2)
+        target = embedding + 100
+        positions = torch.arange(6)
+        calls = []
+
+        def split_data(batch, value):
+            calls.append(value)
+            return value[::2]
+
+        with patch(
+            "sglang.srt.models.hunyuan_v4_nextn.cp_split_and_rebuild_data",
+            side_effect=split_data,
+        ) as split, patch(
+            "sglang.srt.models.hunyuan_v4_nextn.cp_split_and_rebuild_position",
+            side_effect=lambda batch, value: value[::2],
+        ):
+            got_embedding, got_target, got_positions = _split_hyv4_nextn_cp_inputs(
+                forward_batch, embedding, target, positions
+            )
+
+        self.assertEqual(split.call_count, 2)
+        self.assertIs(calls[0], embedding)
+        self.assertIs(calls[1], target)
+        self.assertTrue(torch.equal(got_embedding, embedding[::2]))
+        self.assertTrue(torch.equal(got_target, target[::2]))
+        self.assertTrue(torch.equal(got_positions, positions[::2]))
+
+    def test_prefill_cp_output_and_dsa_topk_are_gathered(self):
+        local_hidden = torch.tensor([[2.0], [4.0]])
+        local_topk = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
+        gathered_hidden = torch.tensor([[1.0], [2.0], [3.0], [4.0]])
+        gathered_topk = torch.tensor(
+            [[10, 11], [30, 31], [20, 21], [40, 41]], dtype=torch.int32
+        )
+        forward_batch = object()
+
+        with patch(
+            "sglang.srt.models.hunyuan_v4_nextn.cp_all_gather_rerange_output",
+            side_effect=[gathered_hidden, gathered_topk],
+        ) as gather, patch(
+            "sglang.srt.models.hunyuan_v4_nextn.is_dsa_prefill_cp_round_robin_split",
+            return_value=False,
+        ), patch(
+            "torch.cuda.current_stream", return_value=object()
+        ):
+            got_hidden = _restore_hyv4_nextn_cp_output(
+                local_hidden, 2, forward_batch
+            )
+            got_topk = _gather_dsa_topk_indices_for_cp(
+                local_topk, 2, 2, forward_batch, object()
+            )
+
+        self.assertIs(got_hidden, gathered_hidden)
+        self.assertIs(got_topk, gathered_topk)
+        self.assertEqual(gather.call_count, 2)
+
+    def test_round_robin_topk_is_padded_before_gather(self):
+        local_topk = torch.tensor([[10, 11]], dtype=torch.int32)
+        forward_batch = object()
+        with patch(
+            "sglang.srt.models.hunyuan_v4_nextn.is_dsa_prefill_cp_round_robin_split",
+            return_value=True,
+        ), patch(
+            "sglang.srt.models.hunyuan_v4_nextn.cp_all_gather_rerange_output",
+            side_effect=lambda value, cp_size, batch, stream: value,
+        ) as gather:
+            got = _gather_dsa_topk_indices_for_cp(
+                local_topk, 2, 2, forward_batch, object()
+            )
+
+        self.assertEqual(got.shape, (2, 2))
+        self.assertTrue(torch.equal(got[1], torch.tensor([-1, -1])))
+        self.assertEqual(gather.call_args.args[1], 2)
+
     def test_mtp_ignore_paths_follow_draft_decoder_without_broad_exclusion(self):
         fp8_config = object()
         quant_config = SimpleNamespace(
