@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.runtime_context import get_parallel
 
 DEFAULT_LOCAL_BUFFER_SIZE = int(
     __import__("os").environ.get(
@@ -624,6 +625,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
+
+            # LayerSplit assigns different MLA layers to different CP ranks.
+            # Keep each rank's Mooncake namespace disjoint, otherwise a page
+            # written by one rank can overwrite another rank's page and later
+            # reads may fail with a buffer-size mismatch.
+            self.cp_layer_split = (
+                self.attn_cp_size > 1
+                and getattr(get_parallel(), "enable_dsa_cache_layer_split", False)
+            )
+            if self.cp_layer_split:
+                cp_part = f"cp{self.attn_cp_rank}"
+                self.mla_suffix = (
+                    f"{self.mla_suffix}_{cp_part}" if self.enable_pp else cp_part
+                )
 
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads
