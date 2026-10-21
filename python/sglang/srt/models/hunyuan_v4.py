@@ -39,6 +39,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+from sglang.srt.layers.communicator_dsa_cp import (
+    maybe_prefetch_full_attention_kv,
+    maybe_prefetch_next_full_attention_kv,
+)
 from sglang.srt.layers.communicator import (
     AttentionInputs,
     enable_moe_dense_fully_dp,
@@ -703,6 +707,7 @@ class HYV4DecoderLayer(nn.Module):
         forward_batch,
         zero_allocator,
         prev_topk_indices=None,
+        next_full_attention_layer_id: Optional[int] = None,
     ):
         # The iHC stream (and therefore ``residual``) stays in whatever layout
         # the layer received: SCATTERED when attn_tp_size > 1, otherwise the DP
@@ -733,6 +738,11 @@ class HYV4DecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
+        # Enqueue the next layer's owner-broadcast (Index-K and Main-KV) on the
+        # side stream while this layer's reduce-scatter and MLP run.
+        maybe_prefetch_next_full_attention_kv(
+            forward_batch, next_full_attention_layer_id
+        )
         if self.dp_attn_scattered:
             # o_proj left the output partial; sum over the attn-tp group and go
             # back to SCATTERED so it lines up with ``residual`` again.
@@ -874,6 +884,12 @@ class HYV4Model(nn.Module):
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.cp_rank = get_parallel().attn_cp_rank
         self.cp_size = get_parallel().attn_cp_size
+        # The final local layer maps to no next layer; a later PP stage
+        # prefetches its own first layer on model entry.
+        local_layer_ids = list(range(self.start_layer, self.end_layer))
+        self.next_full_attention_layer_id = dict(
+            zip(local_layer_ids, local_layer_ids[1:])
+        )
 
     def _dsa_forward_uses_topk(self) -> bool:
         """Does this batch's attention backend consume DSA top-k indices?
@@ -1004,14 +1020,22 @@ class HYV4Model(nn.Module):
         )
         if self.gate_cp_chain is not None:
             self.gate_cp_chain.begin(use_cp, hidden_states.shape[0])
+        if (
+            get_parallel().enable_dsa_cache_layer_split
+            and self.start_layer < self.end_layer
+        ):
+            # Install this batch's compact Main-KV page plan and prefetch the
+            # first local layer before entering the layer loop.
+            maybe_prefetch_full_attention_kv(forward_batch, self.start_layer)
         try:
-            for layer in self.layers[self.start_layer : self.end_layer]:
-                hidden_states, topk_indices = layer(
+            for i in range(self.start_layer, self.end_layer):
+                hidden_states, topk_indices = self.layers[i](
                     positions,
                     hidden_states,
                     forward_batch,
                     zero_allocator,
                     prev_topk_indices=index_topk_share.topk_indices,
+                    next_full_attention_layer_id=self.next_full_attention_layer_id.get(i),
                 )
                 index_topk_share.update(topk_indices)
         finally:
