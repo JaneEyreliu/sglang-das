@@ -143,6 +143,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    FinishReasonDict,
     FlushCacheReqInput,
     FreezeGCReq,
     GetInternalStateReq,
@@ -390,6 +391,12 @@ def _accumulate_decode_moment(
 
 _is_npu = is_npu()
 _is_hip = is_hip()
+
+
+def _make_abort_req(
+    req: Req, finished_reason: Optional[FinishReasonDict] = None
+) -> AbortReq:
+    return AbortReq(rid=req.rid, finished_reason=finished_reason)
 
 
 class Scheduler(
@@ -3194,10 +3201,7 @@ class Scheduler(
         # Without the reason the tokenizer falls back to its generic "Abort in
         # waiting queue", which loses both the message and the status code.
         self.ipc_channels.send_to_tokenizer.send_output(
-            AbortReq(rid=req.rid, finished_reason=req.finished_reason.to_json()), req
-        )
-        self.ipc_channels.send_to_tokenizer.send_output(
-           _make_abort_req(req, finished_reason=req.finished_reason.to_json()), req
+            _make_abort_req(req, finished_reason=req.finished_reason.to_json()), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
@@ -4874,8 +4878,6 @@ class Scheduler(
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self._release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
-            self.beam_coordinator.retire_group(req)
             self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
