@@ -1,3 +1,4 @@
+import concurrent.futures
 import struct
 import threading
 import unittest
@@ -13,6 +14,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
 )
 from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
+    group_concurrent_contiguous_runs,
     pack_int_lists,
     pack_list_of_buffers,
     unpack_int_lists,
@@ -44,6 +46,7 @@ from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -220,6 +223,141 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestGroupConcurrentContiguousRuns(CustomTestCase):
+    @staticmethod
+    def _arr(values):
+        return np.array(values, dtype=np.int32)
+
+    def test_runs_match_group_concurrent_contiguous(self):
+        cases = [
+            ([10, 11, 12], [5, 6, 7]),
+            ([10, 11, 20], [5, 6, 7]),
+            ([10, 11, 12], [5, 6, 20]),
+            # DCP stride: every token is its own run.
+            ([6, 8, 18], [10, 11, 14]),
+            ([7], [3]),
+        ]
+        for src, dst in cases:
+            with self.subTest(src=src, dst=dst):
+                src_groups, dst_groups = group_concurrent_contiguous(
+                    self._arr(src), self._arr(dst)
+                )
+                runs = group_concurrent_contiguous_runs(self._arr(src), self._arr(dst))
+
+                self.assertEqual(runs[0].tolist(), [g[0] for g in src_groups])
+                self.assertEqual(runs[1].tolist(), [g[0] for g in dst_groups])
+                self.assertEqual(runs[2].tolist(), [len(g) for g in src_groups])
+                # Callers scale these by byte item lengths; int32 would wrap.
+                for part in runs:
+                    self.assertEqual(part.dtype, np.int64)
+
+    def test_empty_side_yields_no_runs_and_length_mismatch_raises(self):
+        for src, dst in (([], [1, 2]), ([1, 2], [])):
+            with self.subTest(src=src, dst=dst):
+                runs = group_concurrent_contiguous_runs(
+                    self._arr(src), self._arr(dst)
+                )
+                self.assertEqual([part.tolist() for part in runs], [[], [], []])
+
+        with self.assertRaises(ValueError):
+            group_concurrent_contiguous_runs(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestMooncakeSendKvcacheDcp(CustomTestCase):
+    SESSION = "peer"
+    SRC_PTRS = [0x1000, 0x2000]
+    DST_PTRS = [0x9000, 0xA000]
+    ITEM_LENS = [8, 16]
+
+    def _manager(self, *, custom_mem_pool):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            page_size=2, kv_layer_ids=[0, 1], kv_data_ptrs=self.SRC_PTRS
+        )
+        manager.engine = Mock()
+        manager.engine.batch_transfer_sync.return_value = 0
+        manager.enable_custom_mem_pool = custom_mem_pool
+        manager.enable_deferred_decode_kv_release = False
+        return manager
+
+    def _send(self, manager, *, dcp_size, dst_pages):
+        # 6 tokens on src pages [3, 4, 9] of 2 tokens each, DCP rank 0.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            return manager.send_kvcache_dcp(
+                self.SESSION,
+                np.array([3, 4, 9], dtype=np.int32),
+                self.DST_PTRS,
+                np.array(dst_pages, dtype=np.int32),
+                dcp_token_item_lens=self.ITEM_LENS,
+                dst_dcp_size=dcp_size,
+                dst_dcp_rank=0,
+                src_page_offset=0,
+                decode_prefix_len=0,
+                num_kv_tokens=6,
+                executor=executor,
+                dst_layer_ids=[0, 1],
+            )
+
+    def _layer_blocks(self, layer, runs):
+        # runs: (src_token, dst_token, num_tokens), derived by hand per test.
+        item_len = self.ITEM_LENS[layer]
+        return (
+            [self.SRC_PTRS[layer] + s * item_len for s, _, _ in runs],
+            [self.DST_PTRS[layer] + d * item_len for _, d, _ in runs],
+            [n * item_len for _, _, n in runs],
+        )
+
+    # dcp_size=1, dst pages [5, 6, 2]: src tokens 6..9 and 18..19 map to dst
+    # tokens 10..13 and 4..5, i.e. two runs of 4 and 2 tokens.
+    MERGED_RUNS = [(6, 10, 4), (18, 4, 2)]
+
+    def test_merged_runs_are_batched_across_layers(self):
+        manager = self._manager(custom_mem_pool=False)
+
+        ret = self._send(manager, dcp_size=1, dst_pages=[5, 6, 2])
+
+        self.assertEqual(ret, 0)
+        layer0 = self._layer_blocks(0, self.MERGED_RUNS)
+        layer1 = self._layer_blocks(1, self.MERGED_RUNS)
+        manager.engine.batch_transfer_sync.assert_called_once_with(
+            self.SESSION,
+            layer0[0] + layer1[0],
+            layer0[1] + layer1[1],
+            layer0[2] + layer1[2],
+        )
+
+    def test_strided_dcp_tokens_stay_separate_runs(self):
+        # dcp_size=2, dst pages [5, 7]: src tokens 6, 8, 18 map to dst tokens
+        # 10, 11, 14; neither side is consecutive, so three single-token runs.
+        manager = self._manager(custom_mem_pool=False)
+        runs = [(6, 10, 1), (8, 11, 1), (18, 14, 1)]
+
+        self._send(manager, dcp_size=2, dst_pages=[5, 7])
+
+        layer0 = self._layer_blocks(0, runs)
+        layer1 = self._layer_blocks(1, runs)
+        manager.engine.batch_transfer_sync.assert_called_once_with(
+            self.SESSION,
+            layer0[0] + layer1[0],
+            layer0[1] + layer1[1],
+            layer0[2] + layer1[2],
+        )
+
+    def test_custom_mem_pool_submits_one_transfer_per_layer(self):
+        manager = self._manager(custom_mem_pool=True)
+
+        ret = self._send(manager, dcp_size=1, dst_pages=[5, 6, 2])
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(
+            [c.args for c in manager.engine.batch_transfer_sync.call_args_list],
+            [
+                (self.SESSION, *self._layer_blocks(0, self.MERGED_RUNS)),
+                (self.SESSION, *self._layer_blocks(1, self.MERGED_RUNS)),
+            ],
+        )
 
 
 class TestMooncakePPStaging(unittest.TestCase):

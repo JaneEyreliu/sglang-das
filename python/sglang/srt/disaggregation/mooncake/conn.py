@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
+    group_concurrent_contiguous_runs,
     localize_num_kv_tokens_for_page_slice,
     pack_int_lists,
     pack_string_list,
@@ -855,6 +856,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
 
+    def _transfer_addrs(
+        self,
+        mooncake_session_id: str,
+        src_addrs: List[int],
+        dst_addrs: List[int],
+        lengths: List[int],
+    ) -> int:
+        # Column-wise twin of _transfer_data; skips the per-block tuple round trip.
+        if not src_addrs:
+            return 0
+
+        return self.engine.batch_transfer_sync(
+            mooncake_session_id, src_addrs, dst_addrs, lengths
+        )
+
     def _send_kvcache_generic(
         self,
         mooncake_session_id: str,
@@ -1166,7 +1182,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_kv_ptrs,
             )
         layers_current_pp_stage = len(src_kv_ptrs)
-        src_groups, dst_groups = group_concurrent_contiguous(
+        src_starts, dst_starts, run_lens = group_concurrent_contiguous_runs(
             plan.src_token_indices,
             plan.dst_token_indices,
         )
@@ -1180,22 +1196,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             for layer_id in range(layers_current_pp_stage)
         ]
 
+        # DCP strides the source tokens, so runs are ~1 token long; array ops here,
+        # as a per-run Python loop holds the GIL ~60 ms per chunk (16k tokens, DCP 2).
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, token_item_len: int
-        ) -> List[Tuple[int, int, int]]:
-            return [
-                (
-                    src_ptr + int(src_group[0]) * token_item_len,
-                    dst_ptr + int(dst_group[0]) * token_item_len,
-                    len(src_group) * token_item_len,
-                )
-                for src_group, dst_group in zip(src_groups, dst_groups)
-            ]
+        ) -> Tuple[List[int], List[int], List[int]]:
+            return (
+                (src_ptr + src_starts * token_item_len).tolist(),
+                (dst_ptr + dst_starts * token_item_len).tolist(),
+                (run_lens * token_item_len).tolist(),
+            )
 
         def process_layer(src_ptr: int, dst_ptr: int, token_item_len: int) -> int:
-            return self._transfer_data(
-                mooncake_session_id,
-                set_transfer_blocks(src_ptr, dst_ptr, token_item_len),
+            src_addrs, dst_addrs, lengths = set_transfer_blocks(
+                src_ptr, dst_ptr, token_item_len
+            )
+            return self._transfer_addrs(
+                mooncake_session_id=mooncake_session_id,
+                src_addrs=src_addrs,
+                dst_addrs=dst_addrs,
+                lengths=lengths,
             )
 
         if self.enable_custom_mem_pool:
@@ -1205,12 +1225,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             ]
             return self._await_transfer_futures(futures)
 
-        transfer_blocks = []
+        src_addrs: List[int] = []
+        dst_addrs: List[int] = []
+        lengths: List[int] = []
         for src_ptr, dst_ptr, token_item_len in layers_params:
-            transfer_blocks.extend(
-                set_transfer_blocks(src_ptr, dst_ptr, token_item_len)
+            layer_src, layer_dst, layer_lengths = set_transfer_blocks(
+                src_ptr, dst_ptr, token_item_len
             )
-        return self._transfer_data(mooncake_session_id, transfer_blocks)
+            src_addrs += layer_src
+            dst_addrs += layer_dst
+            lengths += layer_lengths
+        return self._transfer_addrs(
+            mooncake_session_id=mooncake_session_id,
+            src_addrs=src_addrs,
+            dst_addrs=dst_addrs,
+            lengths=lengths,
+        )
 
     def send_kvcache_slice(
         self,

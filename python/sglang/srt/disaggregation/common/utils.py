@@ -257,6 +257,29 @@ def group_concurrent_contiguous(
     return src_groups, dst_groups
 
 
+def group_concurrent_contiguous_runs(
+    src_indices: npt.NDArray[np.integer], dst_indices: npt.NDArray[np.integer]
+) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """Same runs as group_concurrent_contiguous, as (src_starts, dst_starts, lengths)."""
+    # int64: callers scale these by byte item lengths, which overflows int32.
+    src = np.asarray(src_indices, dtype=np.int64)
+    dst = np.asarray(dst_indices, dtype=np.int64)
+    if src.size == 0 or dst.size == 0:
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty.copy(), empty.copy()
+
+    if src.size != dst.size:
+        raise ValueError(
+            "group_concurrent_contiguous_runs requires equal-length src/dst index "
+            f"arrays, got {src.size} and {dst.size}"
+        )
+
+    is_run_start = np.ones(src.size, dtype=bool)
+    is_run_start[1:] = (np.diff(src) != 1) | (np.diff(dst) != 1)
+    run_starts = np.flatnonzero(is_run_start)
+    return src[run_starts], dst[run_starts], np.diff(run_starts, append=src.size)
+
+
 @dataclasses.dataclass(frozen=True)
 class DCPTokenTransferPlan:
     src_token_indices: npt.NDArray[np.int64]
