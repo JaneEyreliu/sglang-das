@@ -1051,6 +1051,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         else:
             overlap_args_dict = {}
 
+        # The HCU DeepEP API uses comp_signal, without an overlap keyword.
+        if _is_hcu:
+            overlap_args_dict.pop("overlap", None)
+
         with ctx:
             _deepep_precompile_tp_barrier()
             if use_groupgemm:

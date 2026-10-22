@@ -95,10 +95,18 @@ class DownGemmOverlapArgs:
     start_event: torch.cuda.Event
 
 
-def compute_overlap_args(dispatch_output, alt_stream):
+def compute_overlap_args(
+    dispatch_output, alt_stream, *, supports_down_gemm_overlap: bool = True
+):
+    # Some expert kernels (HCU W4A8 Marlin) cannot publish completion signals.
+    # Keep dispatch/shared-expert overlap, but never make combine wait on
+    # down-GEMM signals that this kernel cannot produce.
+    overlap_down_gemm = (
+        supports_down_gemm_overlap
+        and SboFlags.enable_combine_down_gemm_two_stream_overlap()
+    )
     if not (
-        SboFlags.enable_combine_down_gemm_two_stream_overlap()
-        or SboFlags.enable_combine_shared_two_stream_overlap()
+        overlap_down_gemm or SboFlags.enable_combine_shared_two_stream_overlap()
     ):
         return None, None, {}
 
@@ -129,7 +137,7 @@ def compute_overlap_args(dispatch_output, alt_stream):
     )
     down_gemm_overlap_args = None
 
-    if SboFlags.enable_combine_down_gemm_two_stream_overlap():
+    if overlap_down_gemm:
         # TODO use zero_allocator to remove this `torch.zeros` call
         # NOTE ours v2 use uint32 not int32 currently
         if is_blackwell():

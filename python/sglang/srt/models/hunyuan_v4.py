@@ -838,7 +838,11 @@ class HYV4Model(nn.Module):
             self.embed_tokens = PPMissingLayer()
         self.alt_stream = (
             torch.cuda.Stream()
-            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            if (
+                _is_cuda
+                or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+                or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
+            )
             else None
         )
         # One shared g_proj side stream for the whole stack (see

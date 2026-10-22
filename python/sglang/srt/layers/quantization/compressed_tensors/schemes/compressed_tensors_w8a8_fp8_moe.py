@@ -301,11 +301,18 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         w13 = layer.w13_weight
         w2 = layer.w2_weight
 
-        from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
+        from deepgemm.m_group_gemm import (
+            pack_int8_weight_enk_to_w6_low_latency_inplace,
+        )
 
+        from sglang.srt.layers.moe.hcu_fp8_sbo import get_hcu_fp8_pair32_packer
+
+        pair32_pack = get_hcu_fp8_pair32_packer(w13.device)
+        layer._hcu_fp8_pair32 = pair32_pack is not None
+        pack_weight = pair32_pack or pack_int8_weight_enk_to_w6_low_latency_inplace
         with torch.no_grad():
-            w13_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w13).detach()
-            w2_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w2).detach()
+            w13_deepgemm = pack_weight(w13).detach()
+            w2_deepgemm = pack_weight(w2).detach()
 
         self._register_runtime_buffer(layer, "w13_weight_deepgemm", w13_deepgemm)
         self._register_runtime_buffer(layer, "w2_weight_deepgemm", w2_deepgemm)

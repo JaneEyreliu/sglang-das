@@ -37,8 +37,10 @@ def validate_hyv4_launch(args, parallel):
         for name in ("speculative_num_steps", "speculative_num_draft_tokens"):
             if (getattr(args, name, None) or 0) <= 0:
                 raise ValueError(f"HYV4 MTP requires positive {name}")
-    if args.enable_two_batch_overlap or args.enable_single_batch_overlap:
-        raise ValueError("HYV4 iHC does not support SBO/TBO")
+    # SBO runs inside DeepseekV2MoE on the 2D projection of the iHC stream.
+    # TBO instead slices the layer residual, whose 3D iHC layout is unsupported.
+    if args.enable_two_batch_overlap:
+        raise ValueError("HYV4 iHC does not support TBO")
     graph = args.cuda_graph_config
     if graph is not None and (
         graph.prefill.backend != "disabled"

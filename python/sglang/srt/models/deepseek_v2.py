@@ -1400,7 +1400,13 @@ class DeepseekV2MoE(nn.Module):
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
-                    compute_overlap_args(dispatch_output, self.alt_stream)
+                    compute_overlap_args(
+                        dispatch_output,
+                        self.alt_stream,
+                        supports_down_gemm_overlap=getattr(
+                            self.experts, "supports_down_gemm_overlap", True
+                        ),
+                    )
                 )
                 dispatcher.set_overlap_args(
                     combine_overlap_args=combine_overlap_args,
@@ -1440,7 +1446,13 @@ class DeepseekV2MoE(nn.Module):
             ):
 
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
-                    compute_overlap_args(dispatch_output, self.alt_stream)
+                    compute_overlap_args(
+                        dispatch_output,
+                        self.alt_stream,
+                        supports_down_gemm_overlap=getattr(
+                            self.experts, "supports_down_gemm_overlap", True
+                        ),
+                    )
                 )
                 dispatcher.set_overlap_args(
                     combine_overlap_args=combine_overlap_args,
@@ -1496,7 +1508,13 @@ class DeepseekV2MoE(nn.Module):
             ):
 
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
-                    compute_overlap_args(dispatch_output, self.alt_stream)
+                    compute_overlap_args(
+                        dispatch_output,
+                        self.alt_stream,
+                        supports_down_gemm_overlap=getattr(
+                            self.experts, "supports_down_gemm_overlap", True
+                        ),
+                    )
                 )
                 dispatcher.set_overlap_args(
                     combine_overlap_args=combine_overlap_args,
