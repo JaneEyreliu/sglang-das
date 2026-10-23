@@ -619,9 +619,6 @@ def _get_k_and_s_triton(
 
     seq_num = seq_lens.shape[0]
     grid = (seq_num, num_token_blocks, num_k_threads)
-    seq_num_pow2 = 1
-    while seq_num_pow2 < seq_num:
-        seq_num_pow2 *= 2
 
     _get_k_and_s_triton_kernel[grid](
         buf_ptr=buf,
@@ -629,7 +626,6 @@ def _get_k_and_s_triton(
         k_out_ptr=k_out,
         s_out_ptr=s_out,
         seq_len_ptr=seq_lens,
-        seq_len_num_pow=seq_num_pow2,
         page_size=page_size,
         buf_numel_per_page=buf_numel_per_page,
         index_head_dim=index_head_dim,
@@ -637,6 +633,7 @@ def _get_k_and_s_triton(
         page_indice_batch_offset=page_indice_batch_offset,
         BLOCK_SIZE=BLOCK_SIZE,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
+        PREFIX_BLOCK=64,
     )
 
     return k_out, s_out
@@ -649,7 +646,6 @@ def _get_k_and_s_triton_kernel(
     k_out_ptr,
     s_out_ptr,
     seq_len_ptr,
-    seq_len_num_pow: tl.constexpr,
     page_size: tl.constexpr,
     buf_numel_per_page: tl.constexpr,
     index_head_dim: tl.constexpr,
@@ -657,6 +653,7 @@ def _get_k_and_s_triton_kernel(
     page_indice_batch_offset,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    PREFIX_BLOCK: tl.constexpr,
 ):
     """
     Fused kernel that gathers both K and S data in a single pass.
@@ -678,10 +675,15 @@ def _get_k_and_s_triton_kernel(
         return
     token_valid_mask = token_ids < seq_len
 
-    pre_batch_idx = tl.arange(0, seq_len_num_pow)
-    mask_pre_batch_idx = pre_batch_idx < batch_id
-    prev_seq_lens = tl.load(seq_len_ptr + pre_batch_idx, mask=mask_pre_batch_idx)
-    batch_token_offset = tl.sum(prev_seq_lens)
+    # Prefix sum of previous seq lens in PREFIX_BLOCK chunks with a runtime bound,
+    # so the kernel has no batch-size constexpr (one variant for every bs).
+    batch_token_offset = tl.zeros((), dtype=tl.int64)
+    for start in range(0, batch_id, PREFIX_BLOCK):
+        pre_batch_idx = start + tl.arange(0, PREFIX_BLOCK)
+        prev_seq_lens = tl.load(
+            seq_len_ptr + pre_batch_idx, mask=pre_batch_idx < batch_id, other=0
+        )
+        batch_token_offset += tl.sum(prev_seq_lens)
 
     # Batch calculate the page index and in-page offset of each token.
     page_idx = token_ids // page_size

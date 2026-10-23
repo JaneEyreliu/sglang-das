@@ -7,12 +7,12 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["tokens"])
 def dsa_cp_round_robin_split_q_seqs_kernel(
     in_seqs_ptr,
     out_seqs_ptr,
     bs_idx_ptr,
-    tokens: tl.constexpr,
+    tokens,  # runtime arg: a constexpr bs recompiles + reloads the module per new bs
     cp_size: tl.constexpr,
     cp_rank: tl.constexpr,
 ):
