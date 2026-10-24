@@ -31,6 +31,7 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.dcp.comm import hyv4_dcp2_a2a_reduce
 from sglang.srt.layers.hy4_dcp import Hyv4DcpRawLSE
+from sglang.srt.layers.hyv4_gate_a2a_overlap import DeferredHyv4Gate
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
     emit_transposed_bpreshuffle_scale,
@@ -390,6 +391,29 @@ class DeepseekMLARocmForwardMixin:
             self, "prepare_attention_output_gate"
         )
         _overlapped_gate = None
+        gate_a2a_enabled = getattr(self, "_hyv4_gate_a2a_enabled", False)
+        deferred_gate = None
+        if (
+            gate_a2a_enabled
+            and not _gate_proj_overlap
+            and self.use_dsa
+            and is_dcp_mla_decode_phase(forward_batch, use_dsa=self.use_dsa)
+            and not get_in_autotune_dummy_run()
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] > 0
+            and (
+                self._hyv4_gate_a2a_max_tokens == 0
+                or hidden_states.shape[0] <= self._hyv4_gate_a2a_max_tokens
+            )
+            and hidden_states.dtype == torch.bfloat16
+            and self.linear_gate.weight.dtype == torch.bfloat16
+            and type(self.linear_gate.quant_method).__name__ == "UnquantizedLinearMethod"
+        ):
+            deferred_gate = DeferredHyv4Gate(
+                hidden_states,
+                self.prepare_attention_output_gate,
+                self._hyv4_gate_a2a_state,
+            )
         if _gate_proj_overlap:
             self.gate_proj_start_event.record(torch.cuda.current_stream())
             with torch.cuda.stream(_gate_proj_stream):
@@ -683,9 +707,13 @@ class DeepseekMLARocmForwardMixin:
             # tensor; otherwise compute it here on the main stream as before.
             *(
                 (
-                    _overlapped_gate
-                    if _gate_proj_overlap
-                    else self.prepare_attention_output_gate(hidden_states),
+                    deferred_gate
+                    if deferred_gate is not None
+                    else (
+                        _overlapped_gate
+                        if _gate_proj_overlap
+                        else self.prepare_attention_output_gate(hidden_states)
+                    ),
                 )
                 if hasattr(self, "prepare_attention_output_gate")
                 else ()
@@ -705,6 +733,15 @@ class DeepseekMLARocmForwardMixin:
         llama_4_scaling,
         attention_output_gate=None,
     ):
+        # Keep the existing tuple arity. Only the opt-in HYV4 path carries a
+        # deferred value; no input/result state is stored on the layer.
+        deferred_gate = (
+            attention_output_gate
+            if isinstance(attention_output_gate, DeferredHyv4Gate)
+            else None
+        )
+        if deferred_gate is not None:
+            attention_output_gate = None
         save_kv_cache = True
         # HYV4 carries a per-head learnable attention sink logit that the
         # sparse backend folds into the softmax denominator.
@@ -869,13 +906,21 @@ class DeepseekMLARocmForwardMixin:
                 )
             else:
                 project_weight = None
+                gate_dtype = (
+                    deferred_gate.dtype
+                    if deferred_gate is not None
+                    else (
+                        attention_output_gate.dtype
+                        if attention_output_gate is not None
+                        else None
+                    )
+                )
                 if (
                     envs.SGLANG_HY4_DCP2_FUSED_VPROJ.get()
                     and not self.use_deep_gemm_bmm
                     and not _SGLANG_EXPERIMENTAL_LORA_OPTI
                     and not is_kv_b_lora_active(self)
-                    and attention_output_gate is not None
-                    and attention_output_gate.dtype == torch.bfloat16
+                    and gate_dtype == torch.bfloat16
                     and self.w_vc.dtype == torch.bfloat16
                     and isinstance(self.w_scale, (int, float))
                     and self.w_scale == 1
@@ -899,6 +944,11 @@ class DeepseekMLARocmForwardMixin:
                     get_parallel().dcp_group,
                     w_vc=project_weight,
                     gate=attention_output_gate if project_weight is not None else None,
+                    **(
+                        {"deferred_gate": deferred_gate}
+                        if deferred_gate is not None
+                        else {}
+                    ),
                 )
                 if project_weight is not None:
                     # Projection and gate are already applied by the receive
@@ -942,6 +992,9 @@ class DeepseekMLARocmForwardMixin:
                         is_lse_base_on_e=is_lse_base_on_e,
                     )
                     attn_output = attn_output.transpose(0, 1)
+        if deferred_gate is not None:
+            attention_output_gate = deferred_gate.resolve()
+
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None

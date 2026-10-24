@@ -102,7 +102,7 @@ from sglang.srt.models.deepseek_v2 import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, make_layers
+from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_hcu, make_layers
 
 logger = logging.getLogger(__name__)
 
@@ -473,6 +473,7 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         alt_stream=None,
         gate_proj_stream=None,
         is_nextn=False,
+        gate_a2a_stream=None,
     ):
         rope_parameters = config.rope_parameters
         super().__init__(
@@ -580,6 +581,38 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         if get_parallel().dcp_enabled:
             self.attn_mqa_for_dcp_decode.hyv4_sink_getter = self.get_dcp_attention_sink
 
+        # Attention DCP A2A/gate overlap is independent of MoE SBO.
+        self._hyv4_gate_a2a_enabled = False
+        self._hyv4_gate_a2a_max_tokens = 0
+        self._hyv4_gate_a2a_state = None
+        if envs.SGLANG_HY4_DCP2_GATE_A2A_OVERLAP.get():
+            if envs.SGLANG_ENABLE_HYV4_GATE_PROJ_PARALLEL.get():
+                raise ValueError(
+                    "HYV4 gate/A2A overlap and gate/QKV overlap are mutually exclusive"
+                )
+            max_tokens = envs.SGLANG_HY4_DCP2_GATE_A2A_MAX_TOKENS.get()
+            if max_tokens < 0:
+                raise ValueError(
+                    "HYV4 gate/A2A max tokens must be nonnegative (0 = unlimited)"
+                )
+            if (
+                is_hcu()
+                and get_parallel().dcp_enabled
+                and get_parallel().attn_dcp_size == 2
+                and get_parallel().dcp_comm_backend == "a2a"
+                and envs.SGLANG_HY4_DCP2_FUSED_POST_ATTN.get()
+                and not self.gate_cp_shard_enabled
+                and not is_nextn
+                and gate_a2a_stream is not None
+            ):
+                from sglang.srt.layers.hyv4_gate_a2a_overlap import GateA2AState
+
+                # Events belong to this layer; the dedicated stream is shared
+                # by the target model. NEXTN retains its original schedule.
+                self._hyv4_gate_a2a_state = GateA2AState(gate_a2a_stream)
+                self._hyv4_gate_a2a_enabled = True
+                self._hyv4_gate_a2a_max_tokens = max_tokens
+
         # Optional g_proj/projection overlap stream (see
         # ``enable_hyv4_gate_proj_parallel``). Created once at the model level
         # and shared by every layer (which run sequentially), so the overlap
@@ -653,6 +686,7 @@ class HYV4DecoderLayer(nn.Module):
         prefix="",
         alt_stream=None,
         gate_proj_stream=None,
+        gate_a2a_stream=None,
     ):
         super().__init__()
         self.self_attn = HYV4Attention(
@@ -662,6 +696,7 @@ class HYV4DecoderLayer(nn.Module):
             add_prefix("self_attn", prefix),
             alt_stream,
             gate_proj_stream,
+            gate_a2a_stream=gate_a2a_stream,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -856,6 +891,20 @@ class HYV4Model(nn.Module):
                 "HYV4 gated-MLA g_proj/projection overlap enabled "
                 "(shared side stream across all layers)"
             )
+        # Separate from alt_stream (QK norm / MoE SBO) and from the older
+        # early gate/QKV schedule. Allocate once, before graph capture.
+        self.gate_a2a_stream = (
+            torch.cuda.Stream()
+            if (
+                envs.SGLANG_HY4_DCP2_GATE_A2A_OVERLAP.get()
+                and is_hcu()
+                and get_parallel().dcp_enabled
+                and get_parallel().attn_dcp_size == 2
+                and get_parallel().dcp_comm_backend == "a2a"
+                and envs.SGLANG_HY4_DCP2_FUSED_POST_ATTN.get()
+            )
+            else None
+        )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: HYV4DecoderLayer(
@@ -865,11 +914,26 @@ class HYV4Model(nn.Module):
                 prefix,
                 self.alt_stream,
                 self.gate_proj_stream,
+                gate_a2a_stream=self.gate_a2a_stream,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
+
+        if self.gate_a2a_stream is not None:
+            configured = sum(
+                getattr(
+                    getattr(layer, "self_attn", None), "_hyv4_gate_a2a_enabled", False
+                )
+                for layer in self.layers[self.start_layer : self.end_layer]
+            )
+            logger.info(
+                "HYV4 gate/A2A side-stream schedule: configured_layers=%d "
+                "max_local_rows=%d (runtime eligibility still applies)",
+                configured,
+                envs.SGLANG_HY4_DCP2_GATE_A2A_MAX_TOKENS.get(),
+            )
 
         self.gate_cp_chain = build_gate_cp_chain(
             [

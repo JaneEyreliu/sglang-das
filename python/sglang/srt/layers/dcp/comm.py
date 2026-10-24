@@ -21,7 +21,7 @@ PR #25090 vs #14194):
 """
 
 import warnings
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -37,6 +37,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.runtime_context import get_parallel
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.hyv4_gate_a2a_overlap import DeferredHyv4Gate
 
 
 def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
@@ -523,6 +526,7 @@ def hyv4_dcp2_a2a_reduce(
     *,
     w_vc: Optional[torch.Tensor] = None,
     gate: Optional[torch.Tensor] = None,
+    deferred_gate: Optional["DeferredHyv4Gate"] = None,
 ) -> torch.Tensor:
     """Exchange native HYV4 FlashMLA partials and add the sink exactly once.
 
@@ -542,7 +546,11 @@ def hyv4_dcp2_a2a_reduce(
         raise ValueError("HYV4 fused A2A requires raw natural-log LSE and DCP2")
     if raw_lse.num_heads != 2 * local_sink.numel():
         raise ValueError("HYV4 sink shard must match the received head partition")
-    if (w_vc is None) != (gate is None):
+    if gate is not None and deferred_gate is not None:
+        raise ValueError("Supply either a materialized or deferred HYV4 gate")
+    if (w_vc is None and gate is not None) or (
+        w_vc is not None and gate is None and deferred_gate is None
+    ):
         raise ValueError("HYV4 fused V projection requires both weight and gate")
     dim = raw_output.shape[-1]
     send = torch.empty(
@@ -551,17 +559,27 @@ def hyv4_dcp2_a2a_reduce(
         device=raw_output.device,
     )
     recv = torch.empty_like(send)
-    fused_sanitize_pack(
-        raw_output,
-        raw_lse.lse,
-        raw_lse.valid_chunks,
-        send,
-        num_valid_rows=raw_lse.num_valid_rows,
+    # Fork before pack: gate consumes hidden_states and does not depend on
+    # the packed MLA partials. The original caller still owns pack and A2A.
+    from contextlib import nullcontext
+
+    overlap = (
+        deferred_gate.overlap() if deferred_gate is not None else nullcontext(gate)
     )
-    cp_group.all_to_all_single(
-        recv.reshape(-1).view(torch.uint8),
-        send.reshape(-1).view(torch.uint8),
-    )
+    with overlap as gate:
+        fused_sanitize_pack(
+            raw_output,
+            raw_lse.lse,
+            raw_lse.valid_chunks,
+            send,
+            num_valid_rows=raw_lse.num_valid_rows,
+        )
+        cp_group.all_to_all_single(
+            recv.reshape(-1).view(torch.uint8),
+            send.reshape(-1).view(torch.uint8),
+        )
+    # The context joins gate after the original receive dependency; neither
+    # result is consumed before it is ready, including pack/collective errors.
     if w_vc is not None:
         return dcp2_sink_project_gate(recv, local_sink, w_vc, gate)
     return dcp2_sink_combine(recv, local_sink)

@@ -1576,6 +1576,13 @@ class Envs:
     # only reached when FUSED_POST_ATTN is enabled; set to 0 to isolate pack/
     # sink-merge when benchmarking or validating numerical differences.
     SGLANG_HY4_DCP2_FUSED_VPROJ = EnvBool(True)
+    # Opt-in: fork gate to a dedicated stream after pack, beside DCP2 A2A.
+    # Mutually exclusive with the earlier gate/QKV projection overlap.
+    SGLANG_HY4_DCP2_GATE_A2A_OVERLAP = EnvBool(False)
+    # Eligibility cap on local gate input rows (including graph padding).
+    # Set 0 for unlimited rows; all other eligibility checks still apply.
+    # This is a conservative scope limit, not a measured performance threshold.
+    SGLANG_HY4_DCP2_GATE_A2A_MAX_TOKENS = EnvInt(32)
 
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
