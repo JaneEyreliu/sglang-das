@@ -432,8 +432,14 @@ class DeepseekMLARocmForwardMixin:
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
-            # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            # overlap qk norm. Skipped on HCU: the two norms are only ~10us at
+            # decode sizes while each graph cross-stream dependency costs ~12us,
+            # so the fork/join serializes them and adds ~25us per layer.
+            if (
+                self.alt_stream is not None
+                and get_is_capture_mode()
+                and not _is_hcu
+            ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
