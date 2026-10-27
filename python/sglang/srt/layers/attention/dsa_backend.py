@@ -530,7 +530,7 @@ class DeepseekSparseAttnBackend(
             and envs.SGLANG_HY4_DCP2_FUSED_POST_ATTN.get()
             and self.is_hy_v4
             and self.dcp_enabled
-            and self.dcp_size == 2
+            and self.dcp_size in (2, 4)
             and get_parallel().dcp_comm_backend == "a2a"
             and impl == "flashmla_kv"
             and q.dtype == torch.bfloat16

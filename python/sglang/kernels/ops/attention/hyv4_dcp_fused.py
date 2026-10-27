@@ -1,6 +1,6 @@
-"""HYV4 DCP2 post-attention kernels.
+"""HYV4 DCP2/4 post-attention kernels (legacy DCP2 entry-point names).
 
-The transport is BF16/FP16 ``[2, B, H_local, D + 2]``. The final two
+The transport is BF16/FP16 ``[N, B, H_local, D + 2]``, N in {2, 4}. The final two
 16-bit elements hold the *bits* of one natural-log FP32 LSE, not a converted
 16-bit LSE. Empty local partitions are represented by zero output and -inf
 LSE. The learnable zero-valued sink is added once, on the receiving rank.
@@ -17,24 +17,24 @@ import triton.language as tl
 
 
 def _transport_shape(buffer: torch.Tensor):
-    if buffer.ndim != 4 or buffer.shape[0] != 2:
-        raise ValueError("DCP2 transport must have shape [2, B, H_local, D + 2]")
+    if buffer.ndim != 4 or buffer.shape[0] not in (2, 4):
+        raise ValueError("DCP2/4 transport must have shape [N, B, H_local, D + 2]")
     if buffer.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("DCP2 transport requires BF16 or FP16 output")
+        raise ValueError("DCP2/4 transport requires BF16 or FP16 output")
     if not buffer.is_contiguous():
-        raise ValueError("DCP2 transport must be contiguous")
+        raise ValueError("DCP2/4 transport must be contiguous")
     _, batch, heads, packed_dim = buffer.shape
     dim = packed_dim - 2
     if dim <= 0 or dim % 2 or heads <= 0:
-        raise ValueError("DCP2 transport needs a positive even D and positive heads")
+        raise ValueError("DCP2/4 transport needs a positive even D and positive heads")
     return batch, heads, dim
 
 
 def _same_device(reference: torch.Tensor, *tensors: torch.Tensor):
     if reference.device.type != "cuda":
-        raise ValueError("HYV4 DCP2 fused kernels require a CUDA/HIP device")
+        raise ValueError("HYV4 DCP2/4 fused kernels require a CUDA/HIP device")
     if any(t.device != reference.device for t in tensors):
-        raise ValueError("HYV4 DCP2 tensors must reside on the same device")
+        raise ValueError("HYV4 DCP2/4 tensors must reside on the same device")
 
 
 @triton.jit
@@ -99,7 +99,7 @@ def fused_sanitize_pack(
 
     ``raw_output`` is [B_real, H_pad, D] or [B_real, 1, H_pad, D], with
     arbitrary strides. ``raw_lse`` is FP32 [B_real, H_pad] or
-    [B_real, H_pad, 1] (also [B_real, 1, H_pad]). Only the first 2*H_local
+    [B_real, H_pad, 1] (also [B_real, 1, H_pad]). Only the first N*H_local
     heads are transmitted. LSE must be natural-log and exclude the sink.
 
     ``valid_chunks`` is [B_valid, C] or [B_valid], containing nonzero flags
@@ -124,7 +124,7 @@ def fused_sanitize_pack(
         output_strides = raw_output.stride()
     else:
         raise ValueError("Raw output must be [B, H, D] or [B, 1, H, D]")
-    if raw_dim != dim or padded_heads < 2 * heads:
+    if raw_dim != dim or padded_heads < send_combined.shape[0] * heads:
         raise ValueError(
             "Raw output head count or latent dimension does not match transport"
         )
@@ -141,7 +141,7 @@ def fused_sanitize_pack(
         lse_strides = raw_lse.stride(0), raw_lse.stride(2)
     else:
         raise ValueError("Raw LSE must be [B, H], [B, H, 1], or [B, 1, H]")
-    if lse_heads < 2 * heads:
+    if lse_heads < send_combined.shape[0] * heads:
         raise ValueError("Raw LSE does not contain all DCP heads")
     if valid_chunks.ndim == 1:
         valid_rows, chunks = valid_chunks.shape[0], 1
@@ -163,7 +163,7 @@ def fused_sanitize_pack(
         )
     if batch == 0:
         return
-    _sanitize_pack_kernel[(batch, 2 * heads)](
+    _sanitize_pack_kernel[(batch, send_combined.shape[0] * heads)](
         raw_output,
         raw_lse,
         valid_chunks,
@@ -198,6 +198,21 @@ def _sink_weights(lse0, lse1, sink):
 
 
 @triton.jit
+def _sink_weights4(lse0, lse1, lse2, lse3, sink):
+    maximum = tl.maximum(
+        tl.maximum(tl.maximum(lse0, lse1), tl.maximum(lse2, lse3)), sink
+    )
+    maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
+    w0 = tl.exp(lse0 - maximum)
+    w1 = tl.exp(lse1 - maximum)
+    w2 = tl.exp(lse2 - maximum)
+    w3 = tl.exp(lse3 - maximum)
+    denominator = w0 + w1 + w2 + w3 + tl.exp(sink - maximum)
+    denominator = tl.where(denominator > 0, denominator, 1.0)
+    return w0 / denominator, w1 / denominator, w2 / denominator, w3 / denominator
+
+
+@triton.jit
 def _sink_combine_kernel(
     recv_ptr,
     lse_ptr,
@@ -210,6 +225,7 @@ def _sink_combine_kernel(
     B: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
+    RANKS: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     b = tl.program_id(0)
@@ -219,7 +235,12 @@ def _sink_combine_kernel(
     lse0 = tl.load(lse_ptr + row * ((D + 2) // 2) + D // 2)
     lse1 = tl.load(lse_ptr + (rank_rows + row) * ((D + 2) // 2) + D // 2)
     sink = tl.load(sink_ptr + h * sink_stride).to(tl.float32)
-    a0, a1 = _sink_weights(lse0, lse1, sink)
+    if RANKS == 4:
+        lse2 = tl.load(lse_ptr + (2 * rank_rows + row) * ((D + 2) // 2) + D // 2)
+        lse3 = tl.load(lse_ptr + (3 * rank_rows + row) * ((D + 2) // 2) + D // 2)
+        a0, a1, a2, a3 = _sink_weights4(lse0, lse1, lse2, lse3, sink)
+    else:
+        a0, a1 = _sink_weights(lse0, lse1, sink)
     ds = tl.arange(0, BLOCK_D)
     # Masked loads also prevent NaN * 0 if an empty input was not sanitized.
     o0 = tl.load(
@@ -233,6 +254,18 @@ def _sink_combine_kernel(
         other=0,
     ).to(tl.float32)
     combined = o0 * a0 + o1 * a1
+    if RANKS == 4:
+        o2 = tl.load(
+            recv_ptr + (2 * rank_rows + row) * (D + 2) + ds,
+            mask=(ds < D) & (a2 != 0),
+            other=0,
+        ).to(tl.float32)
+        o3 = tl.load(
+            recv_ptr + (3 * rank_rows + row) * (D + 2) + ds,
+            mask=(ds < D) & (a3 != 0),
+            other=0,
+        ).to(tl.float32)
+        combined = combined + o2 * a2 + o3 * a3
     tl.store(
         output_ptr + b * output_stride_b + h * output_stride_h + ds * output_stride_d,
         combined,
@@ -254,7 +287,7 @@ def dcp2_sink_combine(
     *,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Merge two local softmax states, adding one global zero-valued sink.
+    """Merge two or four local states, adding one global zero-valued sink.
 
     LSE and finite sink logits use natural logs; -inf sink disables the sink.
     Empty states have -inf LSE. A fully empty row without a sink returns zero.
@@ -284,6 +317,7 @@ def dcp2_sink_combine(
             B=batch,
             H=heads,
             D=dim,
+            RANKS=recv_combined.shape[0],
             BLOCK_D=triton.next_power_of_2(dim),
             num_warps=4,
             enable_fp_fusion=False,
@@ -312,6 +346,7 @@ def _sink_project_gate_kernel(
     H: tl.constexpr,
     D: tl.constexpr,
     V: tl.constexpr,
+    RANKS: tl.constexpr,
     PRESERVE_ROUNDING: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -334,7 +369,20 @@ def _sink_project_gate_kernel(
         other=-float("inf"),
     )
     sink = tl.load(sink_ptr + h * sink_stride).to(tl.float32)
-    a0, a1 = _sink_weights(lse0, lse1, sink)
+    if RANKS == 4:
+        lse2 = tl.load(
+            lse_ptr + (2 * rank_rows + rows) * ((D + 2) // 2) + D // 2,
+            mask=bs < B,
+            other=-float("inf"),
+        )
+        lse3 = tl.load(
+            lse_ptr + (3 * rank_rows + rows) * ((D + 2) // 2) + D // 2,
+            mask=bs < B,
+            other=-float("inf"),
+        )
+        a0, a1, a2, a3 = _sink_weights4(lse0, lse1, lse2, lse3, sink)
+    else:
+        a0, a1 = _sink_weights(lse0, lse1, sink)
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k_start in range(tl.cdiv(D, BLOCK_K)):
         ds = k_start * BLOCK_K + ks
@@ -348,7 +396,20 @@ def _sink_project_gate_kernel(
             mask=(bs[:, None] < B) & (ds[None, :] < D) & (a1[:, None] != 0),
             other=0,
         ).to(tl.float32)
-        merged = (o0 * a0[:, None] + o1 * a1[:, None]).to(recv_ptr.dtype.element_ty)
+        merged = o0 * a0[:, None] + o1 * a1[:, None]
+        if RANKS == 4:
+            o2 = tl.load(
+                recv_ptr + (2 * rank_rows + rows[:, None]) * (D + 2) + ds[None, :],
+                mask=(bs[:, None] < B) & (ds[None, :] < D) & (a2[:, None] != 0),
+                other=0,
+            ).to(tl.float32)
+            o3 = tl.load(
+                recv_ptr + (3 * rank_rows + rows[:, None]) * (D + 2) + ds[None, :],
+                mask=(bs[:, None] < B) & (ds[None, :] < D) & (a3[:, None] != 0),
+                other=0,
+            ).to(tl.float32)
+            merged = merged + o2 * a2[:, None] + o3 * a3[:, None]
+        merged = merged.to(recv_ptr.dtype.element_ty)
         weight = tl.load(
             weight_ptr
             + h * weight_stride_h
@@ -390,7 +451,7 @@ def dcp2_sink_project_gate(
     out: Optional[torch.Tensor] = None,
     preserve_intermediate_rounding: bool = True,
 ) -> torch.Tensor:
-    """Fuse DCP2 merge/sink, latent-to-value projection, sigmoid, and gate.
+    """Fuse DCP2/4 merge/sink, latent-to-value projection, sigmoid, and gate.
 
     ``w_vc`` is already-scaled [H_local, D, V], with arbitrary strides and
     the transport dtype. Quantized weights/scales and LoRA are not supported.
@@ -443,6 +504,7 @@ def dcp2_sink_project_gate(
             H=heads,
             D=dim,
             V=value_dim,
+            RANKS=recv_combined.shape[0],
             PRESERVE_ROUNDING=preserve_intermediate_rounding,
             BLOCK_M=16,
             BLOCK_N=32,

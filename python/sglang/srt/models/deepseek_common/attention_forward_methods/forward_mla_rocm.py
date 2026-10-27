@@ -932,9 +932,10 @@ class DeepseekMLARocmForwardMixin:
                     and self.w_scale == 1
                     and self.kv_lora_rank == 512
                     and self.v_head_dim == 256
-                    and self.num_local_heads == 32
+                    and self.num_local_heads in (16, 32)
+                    and self.num_local_heads * get_parallel().attn_dcp_size == 64
                     # B64 regressed versus rocBLAS in graph microbenchmarks;
-                    # keep only the tested winning gfx936 buckets.
+                    # retain the bounded gfx936 buckets for DCP2 and DCP4.
                     and lse.num_total_rows in (1, 2, 4, 8, 16, 32)
                     and getattr(
                         torch.cuda.get_device_properties(attn_output.device),

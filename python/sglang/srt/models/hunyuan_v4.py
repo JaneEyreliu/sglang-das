@@ -598,7 +598,7 @@ class HYV4Attention(DeepseekV2AttentionMLA):
             if (
                 is_hcu()
                 and get_parallel().dcp_enabled
-                and get_parallel().attn_dcp_size == 2
+                and get_parallel().attn_dcp_size in (2, 4)
                 and get_parallel().dcp_comm_backend == "a2a"
                 and envs.SGLANG_HY4_DCP2_FUSED_POST_ATTN.get()
                 and not self.gate_cp_shard_enabled
@@ -899,7 +899,7 @@ class HYV4Model(nn.Module):
                 envs.SGLANG_HY4_DCP2_GATE_A2A_OVERLAP.get()
                 and is_hcu()
                 and get_parallel().dcp_enabled
-                and get_parallel().attn_dcp_size == 2
+                and get_parallel().attn_dcp_size in (2, 4)
                 and get_parallel().dcp_comm_backend == "a2a"
                 and envs.SGLANG_HY4_DCP2_FUSED_POST_ATTN.get()
             )

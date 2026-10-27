@@ -530,6 +530,7 @@ def hyv4_dcp2_a2a_reduce(
 ) -> torch.Tensor:
     """Exchange native HYV4 FlashMLA partials and add the sink exactly once.
 
+    The legacy DCP2 entry point also accepts DCP4.
     Returns latent attention unless both projection operands are supplied;
     that variant returns the gated, flattened V projection for o_proj.
     Allocations during capture belong to the graph memory pool. They are
@@ -542,9 +543,10 @@ def hyv4_dcp2_a2a_reduce(
     )
     from sglang.srt.layers.hy4_dcp import Hyv4DcpRawLSE
 
-    if not isinstance(raw_lse, Hyv4DcpRawLSE) or cp_group.world_size != 2:
-        raise ValueError("HYV4 fused A2A requires raw natural-log LSE and DCP2")
-    if raw_lse.num_heads != 2 * local_sink.numel():
+    ranks = cp_group.world_size
+    if not isinstance(raw_lse, Hyv4DcpRawLSE) or ranks not in (2, 4):
+        raise ValueError("HYV4 fused A2A requires raw natural-log LSE and DCP2/4")
+    if raw_lse.num_heads != ranks * local_sink.numel():
         raise ValueError("HYV4 sink shard must match the received head partition")
     if gate is not None and deferred_gate is not None:
         raise ValueError("Supply either a materialized or deferred HYV4 gate")
@@ -554,7 +556,7 @@ def hyv4_dcp2_a2a_reduce(
         raise ValueError("HYV4 fused V projection requires both weight and gate")
     dim = raw_output.shape[-1]
     send = torch.empty(
-        (2, raw_lse.num_total_rows, local_sink.numel(), dim + 2),
+        (ranks, raw_lse.num_total_rows, local_sink.numel(), dim + 2),
         dtype=raw_output.dtype,
         device=raw_output.device,
     )

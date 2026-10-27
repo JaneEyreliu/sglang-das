@@ -1,4 +1,4 @@
-"""Run HYV4 attention gate beside DCP2 A2A, with an explicit fork and join."""
+"""Run HYV4 attention gate beside DCP2/4 A2A, with an explicit fork and join."""
 
 from __future__ import annotations
 
