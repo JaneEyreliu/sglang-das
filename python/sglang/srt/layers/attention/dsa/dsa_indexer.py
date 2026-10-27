@@ -228,7 +228,9 @@ def _hcu_paged_mqa_logits(
         block_tables,
         schedule_metadata,
         max_seq_len,
-        clean_logits=True,
+        # TopK reads only logits[:, :length]. The -inf fill is a separate
+        # kernel over the full page-table width.
+        clean_logits=False,
     )
 
 
@@ -247,7 +249,9 @@ def _hcu_mqa_logits(
         ks,
         ke,
         kv_scale=kv_scale,
-        clean_logit=True,
+        # TopK only reads [ks, ke). clean_logit writes -inf over the whole
+        # concatenated rectangle and is a separate kernel from the GEMM.
+        clean_logit=False,
     )
 
 
@@ -1286,7 +1290,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     else metadata.get_dsa_extend_len_cpu()
                 ),
             )
+            if sparse_route is not None and not hasattr(
+                self, "_hcu_sparse_mqa_hit_logged"
+            ):
+                logger.info(
+                    "DSA HCU sparse Page-MQA group_size=%s", sparse_route.group_size
+                )
+                self._hcu_sparse_mqa_hit_logged = True
             if sparse_route is None:
+                if use_mask_topk and not hasattr(self, "_hcu_sparse_mqa_skip_logged"):
+                    logger.info(
+                        "DSA HCU sparse Page-MQA not selected, using dense paged MQA"
+                    )
+                    self._hcu_sparse_mqa_skip_logged = True
                 logits = _hcu_paged_mqa_logits(
                     paged_q,
                     kv_cache,
@@ -1491,26 +1507,36 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 and logits_bytes <= configured_budget_bytes
             ):
                 return False, configured_budget_bytes
-            free_mem, total_mem = torch.cuda.mem_get_info(device_index)
-            try:
-                stats = torch.cuda.memory_stats(device_index)
-                reusable_mem = max(
-                    0,
-                    int(stats["reserved_bytes.all.current"])
-                    - int(stats["active_bytes.all.current"])
-                    - int(stats["inactive_split_bytes.all.current"]),
+            # mem_get_info / memory_stats sync the device. A packed prefill
+            # calls this once per layer, so cache the first large-batch result.
+            logits_budget_bytes = self._mqa_logits_budget_bytes.get(device_index)
+            if logits_budget_bytes is None:
+                free_mem, total_mem = torch.cuda.mem_get_info(device_index)
+                try:
+                    stats = torch.cuda.memory_stats(device_index)
+                    reusable_mem = max(
+                        0,
+                        int(stats["reserved_bytes.all.current"])
+                        - int(stats["active_bytes.all.current"])
+                        - int(stats["inactive_split_bytes.all.current"]),
+                    )
+                    free_mem = min(int(total_mem), int(free_mem) + reusable_mem)
+                except (KeyError, RuntimeError, TypeError, ValueError):
+                    pass
+                logits_budget_bytes = max(
+                    1,
+                    min(
+                        configured_budget_bytes,
+                        int(free_mem) // 2,
+                        int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION),
+                    ),
                 )
-                free_mem = min(int(total_mem), int(free_mem) + reusable_mem)
-            except (KeyError, RuntimeError, TypeError, ValueError):
-                pass
-            logits_budget_bytes = max(
-                1,
-                min(
-                    configured_budget_bytes,
-                    int(free_mem) // 2,
-                    int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION),
-                ),
-            )
+                self._mqa_logits_budget_bytes[device_index] = logits_budget_bytes
+                logger.info(
+                    "DSA mqa logits budget cached at %.2f GiB (configured %.2f GiB)",
+                    logits_budget_bytes / (1024**3),
+                    configured_budget_bytes / (1024**3),
+                )
             return logits_bytes > logits_budget_bytes, logits_budget_bytes
 
         # Quick static check for normal batches
@@ -1522,6 +1548,96 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         need_chunk = logits_bytes > logits_budget_bytes
         return need_chunk, logits_budget_bytes
+
+    def _hcu_request_spans(self, metadata, q_offset: int):
+        """Local Q span and concatenated-K span for each request.
+
+        CP round-robin keeps each request's local rows contiguous. The HCU
+        kernel grids over the whole K tensor, so one kernel per request avoids
+        scanning other requests' K. Returns None when the spans do not cover
+        ``q_offset`` exactly.
+        """
+        cached = getattr(metadata, "_hcu_request_spans", None)
+        if cached is not None and cached[0] == q_offset:
+            return cached[1]
+        extend_lens = list(metadata.get_dsa_extend_len_cpu())
+        seq_lens = metadata.get_indexer_seq_len_cpu()
+        if torch.is_tensor(seq_lens):
+            seq_lens = seq_lens.tolist()
+        if len(extend_lens) != len(seq_lens):
+            return None
+        spans = []
+        q_cursor = 0
+        k_base = 0
+        for q_len, k_len in zip(extend_lens, seq_lens):
+            q_len = int(q_len)
+            k_len = int(k_len)
+            if q_len < 0 or k_len < 0:
+                return None
+            spans.append((q_cursor, q_cursor + q_len, k_base, k_len))
+            q_cursor += q_len
+            k_base += k_len
+        if q_cursor != q_offset or len(spans) <= 1:
+            return None
+        object.__setattr__(metadata, "_hcu_request_spans", (q_offset, spans))
+        return spans
+
+    def _get_topk_ragged_hcu_sliced(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        topk_result: torch.Tensor,
+        ke: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        q_offset = ke.shape[0]
+        spans = self._hcu_request_spans(metadata, q_offset)
+        if not spans:
+            if not getattr(self, "_hcu_req_mqa_skip_logged", False):
+                logger.info("DSA HCU per-request mqa skipped")
+                self._hcu_req_mqa_skip_logged = True
+            return None
+        budget = self._mqa_logits_budget_bytes.get(ke.device.index, 0)
+        if budget <= 0:
+            budget = 8 * (1024**3)
+        elem = self._MQA_LOGITS_BYTES_PER_ELEM
+        for start, end, _k_base, k_len in spans:
+            if (end - start) * k_len * elem > budget:
+                return None
+        device = q_fp8.device
+        if not getattr(self, "_hcu_req_mqa_logged", False):
+            logger.info("DSA HCU per-request mqa requests=%s", len(spans))
+            self._hcu_req_mqa_logged = True
+        for start, end, k_base, k_len in spans:
+            if end == start or k_len <= 0:
+                continue
+            scale = k_scale[k_base : k_base + k_len]
+            if scale.data_ptr() % 16 != 0:
+                scale = scale.clone()
+            n_rows = end - start
+            rel_ke = (ke[start:end] - k_base).to(torch.int32)
+            local_ks = torch.zeros(n_rows, dtype=torch.int32, device=device)
+            offset = local_ks.new_full((n_rows,), k_base)
+            with self._with_real_sm_count():
+                logits = _hcu_mqa_logits(
+                    q_fp8[start:end],
+                    k_fp8[k_base : k_base + k_len],
+                    weights[start:end],
+                    local_ks,
+                    rel_ke,
+                    kv_scale=scale,
+                )
+            self._mask_init_and_local_tokens(logits, rel_ke)
+            topk_result[start:end] = metadata.topk_transform(
+                logits,
+                self.index_topk,
+                ks=local_ks,
+                ke_offset=rel_ke,
+                topk_indices_offset_override=offset,
+            )
+        return topk_result
 
     def _get_topk_ragged(
         self,
@@ -1621,6 +1737,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 k_fp8 = k_fp8.view(torch.float8_e4m3fn)
 
             k_scale = k_scale.view(torch.float32).squeeze(-1)
+            if _is_hcu:
+                sliced = self._get_topk_ragged_hcu_sliced(
+                    q_fp8=q_fp8,
+                    weights=weights,
+                    metadata=metadata,
+                    topk_result=topk_result,
+                    ke=ke,
+                    k_fp8=k_fp8,
+                    k_scale=k_scale,
+                )
+                if sliced is not None:
+                    return sliced
             kv_fp8 = (k_fp8, k_scale)
             k_offset = k_fp8.shape[0]
 
