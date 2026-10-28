@@ -1,5 +1,7 @@
 from typing import Optional
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -167,6 +169,15 @@ def _dequantize_k_cache_fast_kernel(
         tl.store(dst_ptr, data, mask=mask)
 
 
+# Number of complete paged KV tokens handled by one Triton program.
+# Set SGLANG_DEQUANT_K_CACHE_BLOCK_T=0 to use the original (N, 5) grid.
+_DEQUANT_PAGED_BLOCK_T = int(os.getenv("SGLANG_DEQUANT_K_CACHE_BLOCK_T", "16"))
+if _DEQUANT_PAGED_BLOCK_T not in (0, 1, 2, 4, 8, 16):
+    raise ValueError(
+        "SGLANG_DEQUANT_K_CACHE_BLOCK_T must be one of 0,1,2,4,8,16"
+    )
+
+
 def dequantize_k_cache_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
@@ -214,21 +225,42 @@ def dequantize_k_cache_paged(
     # [:, 528:]
     input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
 
-    _dequantize_k_cache_paged_kernel[(num_tokens, num_blocks_per_token)](
-        output,
-        input_nope_q,
-        input_nope_s,
-        input_rope,
-        page_table_1_flattened,
-        output.stride(0),
-        input_nope_q.stride(0),
-        input_nope_s.stride(0),
-        input_rope.stride(0),
-        NUM_NOPE_BLOCKS=num_tiles,
-        GROUP_SIZE=group_size,
-        DIM_NOPE=dim_nope,
-        DIM_ROPE=dim_rope,
-    )
+    if _DEQUANT_PAGED_BLOCK_T == 0:
+        _dequantize_k_cache_paged_kernel[(num_tokens, num_blocks_per_token)](
+            output,
+            input_nope_q,
+            input_nope_s,
+            input_rope,
+            page_table_1_flattened,
+            output.stride(0),
+            input_nope_q.stride(0),
+            input_nope_s.stride(0),
+            input_rope.stride(0),
+            NUM_NOPE_BLOCKS=num_tiles,
+            GROUP_SIZE=group_size,
+            DIM_NOPE=dim_nope,
+            DIM_ROPE=dim_rope,
+        )
+    else:
+        block_t = _DEQUANT_PAGED_BLOCK_T
+        _dequantize_k_cache_paged_tiled_kernel[(triton.cdiv(num_tokens, block_t),)](
+            output,
+            input_nope_q,
+            input_nope_s,
+            input_rope,
+            page_table_1_flattened,
+            num_tokens,
+            output.stride(0),
+            input_nope_q.stride(0),
+            input_nope_s.stride(0),
+            input_rope.stride(0),
+            BLOCK_T=block_t,
+            GROUP_SIZE_K=group_size,
+            NUM_GROUPS_K=num_tiles,
+            DIM_NOPE_K=dim_nope,
+            DIM_ROPE_K=dim_rope,
+            num_warps=4,
+        )
 
     return output
 
@@ -285,6 +317,76 @@ def _dequantize_k_cache_paged_kernel(
 
         data = tl.load(src_ptr, mask=mask).to(tl.bfloat16)
         tl.store(dst_ptr, data, mask=mask)
+
+
+@triton.jit
+def _dequantize_k_cache_paged_tiled_kernel(
+    output_ptr,
+    input_nope_q_ptr,
+    input_nope_s_ptr,
+    input_rope_ptr,
+    page_table_ptr,
+    num_tokens,
+    output_stride_0,
+    input_nope_q_stride_0,
+    input_nope_s_stride_0,
+    input_rope_stride_0,
+    BLOCK_T: tl.constexpr,
+    GROUP_SIZE_K: tl.constexpr,
+    NUM_GROUPS_K: tl.constexpr,
+    DIM_NOPE_K: tl.constexpr,
+    DIM_ROPE_K: tl.constexpr,
+):
+    """Gather and dequantize BLOCK_T complete KV tokens per program.
+
+    The original (N, 5) launch reloads page_table and schedules five programs
+    per token. This 1-D launch loads each page index once and handles four
+    128-element nope groups plus the 64-element rope tail in one program.
+    """
+    token_ids = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    token_mask = token_ids < num_tokens
+    paged = tl.load(page_table_ptr + token_ids, mask=token_mask, other=0).to(tl.int64)
+
+    elem = tl.arange(0, GROUP_SIZE_K)
+    for group in tl.static_range(0, NUM_GROUPS_K):
+        src = (
+            input_nope_q_ptr
+            + paged[:, None] * input_nope_q_stride_0
+            + group * GROUP_SIZE_K
+            + elem[None, :]
+        )
+        scale = tl.load(
+            input_nope_s_ptr + paged * input_nope_s_stride_0 + group,
+            mask=token_mask,
+            other=0.0,
+        )
+        q = tl.load(src, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        dst = (
+            output_ptr
+            + token_ids[:, None] * output_stride_0
+            + group * GROUP_SIZE_K
+            + elem[None, :]
+        )
+        tl.store(
+            dst,
+            (q * scale[:, None]).to(output_ptr.dtype.element_ty),
+            mask=token_mask[:, None],
+        )
+
+    rope_elem = tl.arange(0, DIM_ROPE_K)
+    rope_src = (
+        input_rope_ptr
+        + paged[:, None] * input_rope_stride_0
+        + rope_elem[None, :]
+    )
+    rope_dst = (
+        output_ptr
+        + token_ids[:, None] * output_stride_0
+        + DIM_NOPE_K
+        + rope_elem[None, :]
+    )
+    rope = tl.load(rope_src, mask=token_mask[:, None], other=0.0).to(tl.bfloat16)
+    tl.store(rope_dst, rope, mask=token_mask[:, None])
 
 
 # Tokens handled by one program of the vectorized gather kernel.  4 tokens
