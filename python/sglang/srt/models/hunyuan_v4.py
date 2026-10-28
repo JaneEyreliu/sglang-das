@@ -717,12 +717,24 @@ class HYV4DecoderLayer(nn.Module):
                 tp_size=mlp_tp_size,
             )
         else:
+            # DCP4 without SBO keeps both MoE branches on the caller stream.
+            # Passing alt_stream otherwise enables shared-expert overlap even
+            # with SBO disabled. Attention retains its independent streams,
+            # including the dedicated gate/A2A fork above.
+            moe_alt_stream = alt_stream
+            if (
+                is_hcu()
+                and get_parallel().dcp_enabled
+                and get_parallel().attn_dcp_size == 4
+                and not get_global_server_args().enable_single_batch_overlap
+            ):
+                moe_alt_stream = None
             self.mlp = DeepseekV2MoE(
                 config,
                 layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                alt_stream=alt_stream,
+                alt_stream=moe_alt_stream,
             )
             if hasattr(self.mlp, "shared_experts"):
                 # The SwiGLU limit applies to routed experts only. The shared
