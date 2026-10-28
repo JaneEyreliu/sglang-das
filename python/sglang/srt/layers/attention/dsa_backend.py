@@ -12,6 +12,7 @@ from typing import (
     TypeAlias,
 )
 
+import os
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
@@ -3103,6 +3104,24 @@ class DeepseekSparseAttnBackend(
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
+        if _is_hcu and os.environ.get(
+            "SGLANG_HCU_FORCE_SORTED_SPARSE_INDICES", "0"
+        ) == "1":
+            from flash_mla.flash_mla_interface import _safe_sort_sparse_indices_inplace
+
+            can_reuse_canonical_order = (
+                indices_are_sorted
+                and indices_input.stride(-1) == 1
+                and os.environ.get(
+                    "SGLANG_HCU_REUSE_CANONICAL_SPARSE_SORT", "0"
+                ) == "1"
+            )
+            if not can_reuse_canonical_order:
+                indices_input = _safe_sort_sparse_indices_inplace(
+                    indices_input, kv_cache.shape[0]
+                )
+            indices_are_sorted = True
+
         # topk_length is the per-row count of valid indices
         # (`dsa_cache_seqlens_int32` = seqlens clipped to `index_topk`). Rows
         # whose context is shorter than `index_topk` have their indices
@@ -3543,6 +3562,15 @@ class DeepseekSparseAttnBackend(
             kv_cache = quantize_k_cache(kv_cache)
 
         indices = page_table_1.unsqueeze(1)
+        if _is_hcu and os.environ.get(
+            "SGLANG_HCU_FORCE_SORTED_DECODE_INDICES", "0"
+        ) == "1":
+            from flash_mla.flash_mla_interface import _safe_sort_sparse_indices
+
+            # Indices address tokens, not pages. Avoid mutating shared metadata.
+            indices = _safe_sort_sparse_indices(
+                indices, kv_cache.shape[0] * self.real_page_size
+            )
         assert (
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel

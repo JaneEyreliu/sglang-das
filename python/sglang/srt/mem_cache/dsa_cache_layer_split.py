@@ -30,6 +30,7 @@ PD prefill workers under prefill-CP (see
 from __future__ import annotations
 
 import logging
+import os
 import weakref
 from collections.abc import Sequence
 from contextlib import nullcontext
@@ -677,6 +678,57 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         src_tensor: Optional[torch.Tensor] = None,
         use_layer_broadcast_comm: bool = False,
     ) -> torch.Tensor:
+        # Broadcast encoded history pages only; retain physical cache indexing.
+        index_cache = getattr(self, "index_key_cache", None)
+        page_plan = getattr(self, "_active_main_kv_page_plan", None)
+        if (
+            os.environ.get("SGLANG_HCU_COMPACT_INDEX_BROADCAST", "0") == "1"
+            and index_cache is not None
+            and tensor is index_cache.remote_buffer
+            and page_plan is not None
+        ):
+            page_ids = page_plan.history_page_ids
+            num_pages = page_ids.numel()
+            if num_pages == 0:
+                return tensor
+            payload_shape = (num_pages, *tensor.shape[1:])
+            payload = getattr(index_cache, "compact_history_payload", None)
+            if payload is None or tuple(payload.shape) != payload_shape:
+                payload = torch.empty(
+                    payload_shape, dtype=tensor.dtype, device=tensor.device
+                )
+                index_cache.compact_history_payload = payload
+            # A fallback can reuse the payload on the forward stream after
+            # allocation/prefetch on the side stream. Track its last users so
+            # resizing for the next batch cannot recycle storage prematurely.
+            if payload.is_cuda:
+                payload.record_stream(torch.cuda.current_stream(payload.device))
+                if not getattr(index_cache, "compact_history_logged", False):
+                    logger.info(
+                        "Compact Index-K history broadcast: rank=%s layer=%s "
+                        "pages=%s/%s payload_bytes=%s full_bytes=%s",
+                        self.layer_shard_rank, layer_id, num_pages,
+                        tensor.shape[0], payload.nbytes, tensor.nbytes,
+                    )
+                    index_cache.compact_history_logged = True
+            owner_rank = self._get_layer_owner_rank(layer_id)
+            is_owner = self.layer_shard_rank == owner_rank
+            if is_owner:
+                assert src_tensor is not None
+                torch.index_select(src_tensor, 0, page_ids, out=payload)
+            with torch.profiler.record_function(
+                "layersplit_compact_index_broadcast "
+                f"layer={layer_id} pages={num_pages} bytes={payload.nbytes}"
+            ):
+                self._broadcast_tensor_from_owner(
+                    payload,
+                    layer_id,
+                    src_tensor=(payload if is_owner else None),
+                    use_layer_broadcast_comm=use_layer_broadcast_comm,
+                )
+                tensor.index_copy_(0, page_ids, payload)
+            return tensor
+
         owner_rank = self._get_layer_owner_rank(layer_id)
         if self.layer_shard_rank == owner_rank:
             assert src_tensor is not None
@@ -1224,7 +1276,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         # a side stream after HiCache reload. Match the GLM5-Next path: keep
         # both draft Main-KV and Index-K on the forward stream, while target
         # layers retain asynchronous prefetch.
-        if self.shares_layer_split_scratch:
+        if self.shares_layer_split_scratch or os.environ.get(
+            "SGLANG_HCU_LAYER_SPLIT_SYNC_PREFETCH", "0"
+        ) == "1":
             return self.device_module.current_stream()
         return self.kv_broadcast_stream
 

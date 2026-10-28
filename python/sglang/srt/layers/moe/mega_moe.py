@@ -516,6 +516,7 @@ def _run_mega_routed(
         if getattr(moe.experts, "_mega_moe_hcu_w4a8_weights", False):
             y = _run_standalone_hcu_w4a8_mega_moe(
                 hidden_states, topk_ids, topk_weights, moe, buf,
+                dispatch_num_tokens,
             )
         elif runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
             y = _run_standalone_hcu_w8a8_mega_moe(
@@ -719,7 +720,7 @@ def _run_standalone_hcu_w8a8_mega_moe(
     return y[:num_tokens]
 
 
-def _run_standalone_hcu_w4a8_mega_moe(hidden_states, topk_ids, topk_weights, moe, buf):
+def _run_standalone_hcu_w4a8_mega_moe(hidden_states, topk_ids, topk_weights, moe, buf, dispatch_num_tokens):
     from lightop.quant import per_token_quant_int8
     from megamoe.w4a8 import w4a8_mega_moe
 
@@ -736,6 +737,10 @@ def _run_standalone_hcu_w4a8_mega_moe(hidden_states, topk_ids, topk_weights, moe
         y, moe.experts.mega_l1_weights, moe.experts.mega_l2_weights, buf,
         activation_clamp=getattr(moe.config, "swiglu_limit", None),
         combine_group_map=getattr(moe.experts, "mega_w4a8_combine_groups", None),
+        # Bound routing/gather/scatter grids to this dispatch capacity (max
+        # tokens across DP ranks) instead of num_max_tokens_per_rank, mirroring
+        # the fp8 mega_moe path. Activates the GLM5.2 scan_tokens path for Hy4.
+        capacity_num_tokens=dispatch_num_tokens,
     )
     return y
 

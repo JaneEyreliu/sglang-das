@@ -33,7 +33,7 @@ SIZE = PAGE_SIZE * 3  # a few pages
 PORT = 29711
 
 
-def _run(rank: int, world: int, port: int):
+def _run(rank: int, world: int, port: int, compact_index: bool = False):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
@@ -104,10 +104,11 @@ def _run(rank: int, world: int, port: int):
     # Indexer buffer owner-broadcast: owner writes a layer-distinct value, then
     # every rank must read it back for every layer.
     for layer_id in range(LAYER_NUM):
-        store_buf = pool.get_index_k_with_scale_buffer(layer_id)
-        assert (
-            store_buf.data_ptr() == pool.index_k_with_scale_buffer[layer_id].data_ptr()
-        )
+        # Use the format-independent storage: HCU BF16 pools intentionally
+        # have no scaled Index-K accessor, while FP8 pools use packed bytes.
+        store_buf = pool.index_key_cache.buffer[
+            pool._get_indexer_cache_index(layer_id)
+        ]
         if pool._is_layer_owned(layer_id):
             store_buf.fill_(layer_id + 10)
     torch.cuda.synchronize()
@@ -134,6 +135,52 @@ def _run(rank: int, world: int, port: int):
             ok = False
     assert ok, f"rank {rank} prefetch path returned incorrect contents"
 
+    if compact_index:
+        from sglang.srt.mem_cache.dsa_cache_layer_split import MainKVPagePlan
+
+        class BatchMarker:
+            pass
+
+        os.environ["SGLANG_HCU_COMPACT_INDEX_BROADCAST"] = "1"
+        cache = pool.index_key_cache
+        for history in ([], [1], [1, 2], [2], [], [1, 2]):
+            marker = BatchMarker()
+            page_ids = torch.tensor(history, dtype=torch.long, device=f"cuda:{rank}")
+            all_pages = torch.tensor(
+                sorted(set(history) | {3}), dtype=torch.long, device=f"cuda:{rank}"
+            )
+            pool.configure_main_kv_page_plan(
+                MainKVPagePlan(page_ids, all_pages), marker
+            )
+            for layer_id in range(LAYER_NUM):
+                cache.finalize_pending(set_remote_layer_id=False)
+                cache.remote_layer_id = None
+                cache.remote_buffer.fill_(17)
+                cache.remote_buffer[0].zero_()
+                reference = (
+                    torch.arange(
+                        cache.remote_buffer.numel(),
+                        dtype=torch.int64,
+                        device=cache.remote_buffer.device,
+                    )
+                    .remainder(251)
+                    .reshape(cache.remote_buffer.shape)
+                    .to(cache.remote_buffer.dtype)
+                )
+                if pool._is_layer_owned(layer_id):
+                    cache.buffer[pool._get_indexer_cache_index(layer_id)].copy_(
+                        reference
+                    )
+                expected = cache.remote_buffer.clone()
+                expected[page_ids] = reference[page_ids]
+                pool.prefetch_index_buffer(layer_id)
+                actual = pool._get_broadcastable_index_buffer(layer_id)
+                assert torch.equal(actual, expected), (
+                    rank, layer_id, history
+                )
+        pool.configure_main_kv_page_plan(None, BatchMarker())
+        os.environ["SGLANG_HCU_COMPACT_INDEX_BROADCAST"] = "0"
+
     print(f"[rank {rank}] OK: all {LAYER_NUM} layers read correct owner contents")
     torch.distributed.barrier()
 
@@ -144,6 +191,12 @@ class TestLayerSplitDSABroadcast(CustomTestCase):
         if world < 2:
             self.skipTest("LayerSplitDSATokenToKVPool broadcast test needs >= 2 GPUs")
         mp.spawn(_run, args=(world, PORT), nprocs=world, join=True)
+
+    def test_compact_index_history_broadcast(self):
+        world = min(4, torch.cuda.device_count())
+        if world < 2:
+            self.skipTest("LayerSplit compact index broadcast test needs >= 2 GPUs")
+        mp.spawn(_run, args=(world, PORT + 1, True), nprocs=world, join=True)
 
 
 if __name__ == "__main__":
