@@ -43,6 +43,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.mem_cache.hyv4_dcp_write_locs import scoped_hyv4_dcp_write_locs
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
@@ -297,6 +298,17 @@ class HYV4ModelNextN(nn.Module):
             device=hidden_states.device,
         )
         index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
+        if get_parallel().enable_dsa_cache_layer_split:
+            # The draft layer has a single owner rank, and HiCache load-back
+            # restores (and invalidates) the draft pool only on that rank. The
+            # Index-K fallback broadcast is gated on rank-local cache state, so
+            # the owner alone would issue an extra collective and deadlock the
+            # CP group. Reset on every rank so all ranks rebroadcast together.
+            reset_layer_broadcast_cache = getattr(
+                get_token_to_kv_pool(), "reset_layer_broadcast_cache", None
+            )
+            if reset_layer_broadcast_cache is not None:
+                reset_layer_broadcast_cache()
         # CP-split tokens differ across ranks, so the gate shard must gather
         # full gate weights before computing its local activation slice.
         if self.gate_cp_chain is not None:

@@ -1467,6 +1467,23 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     def invalidate_index_buffer_for_layer(self, layer_id: int) -> None:
         self.index_key_cache.invalidate(layer_id)
 
+    def reset_layer_broadcast_cache(self) -> None:
+        """Drop every cached remote copy so the next read rebroadcasts.
+
+        Whether a fallback broadcast is issued depends on rank-local
+        ``remote_layer_id`` state. Callers that cannot guarantee that state is
+        identical on every CP rank (e.g. HiCache load-back restores the MTP
+        draft pool only on its owner rank) must call this on all ranks so the
+        dedicated communicator sees the same collective sequence everywhere.
+        """
+
+        self._drain_pending_layer_broadcasts(
+            discard_index=True,
+            discard_main=True,
+        )
+        self.index_key_cache.remote_layer_id = None
+        self.remote_kv_layer_id = None
+
     def _get_broadcastable_index_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_key_cache.get_broadcastable_buffer(layer_id)
 
