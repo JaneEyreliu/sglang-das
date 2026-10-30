@@ -3528,8 +3528,19 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | Hyv4DcpRawLSE]:
         # HY4 applies its sink once to both output and LSE below. Do not also
         # fold it into FlashMLA's native denominator (or count it per rank).
-        if getattr(layer, "hyv4_sink_getter", None) is not None:
-            attn_sink = None
+        # Exception: on HCU without DCP merge / compact prefix, the kernel's
+        # native attn_sink computes exactly o * exp(lse) / (exp(lse) +
+        # exp(sink)) (same as apply_hyv4_sink, zero-KV rows stay 0), which
+        # removes ~14 tiny post-processing kernels per layer.
+        hyv4_sink_getter = getattr(layer, "hyv4_sink_getter", None)
+        hyv4_native_sink = (
+            hyv4_sink_getter is not None
+            and _is_hcu
+            and not return_lse
+            and dcp_compact_entry is None
+        )
+        if hyv4_sink_getter is not None:
+            attn_sink = hyv4_sink_getter() if hyv4_native_sink else None
         if return_lse and attn_sink is not None:
             raise NotImplementedError(
                 "DCP attention sinks require model-specific output/LSE correction"
@@ -3728,7 +3739,9 @@ class DeepseekSparseAttnBackend(
             return o, lse
 
         sink_getter = getattr(layer, "hyv4_sink_getter", None)
-        if sink_getter is not None:
+        if sink_getter is not None and hyv4_native_sink:
+            pass  # sink already applied inside the FlashMLA kernel
+        elif sink_getter is not None:
             from sglang.srt.layers.hy4_dcp import apply_hyv4_sink
 
             o, _ = apply_hyv4_sink(
