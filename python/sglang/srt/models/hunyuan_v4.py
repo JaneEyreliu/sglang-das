@@ -21,6 +21,7 @@
 #     (gated MLA) and learnable attention sinks.
 
 import logging
+from contextlib import nullcontext
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -33,6 +34,9 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import get_attn_tp_group, get_pp_group
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
@@ -82,6 +86,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.mem_cache.hyv4_dcp_write_locs import scoped_hyv4_dcp_write_locs
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
@@ -1109,14 +1118,21 @@ class HYV4Model(nn.Module):
             maybe_prefetch_full_attention_kv(forward_batch, self.start_layer)
         try:
             for i in range(self.start_layer, self.end_layer):
-                hidden_states, topk_indices = self.layers[i](
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    zero_allocator,
-                    prev_topk_indices=index_topk_share.topk_indices,
-                    next_full_attention_layer_id=self.next_full_attention_layer_id.get(i),
+                # NOTE: torch dynamo does not support graph break in context manager
+                ctx = (
+                    nullcontext()
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
+                with ctx:
+                    hidden_states, topk_indices = self.layers[i](
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        zero_allocator,
+                        prev_topk_indices=index_topk_share.topk_indices,
+                        next_full_attention_layer_id=self.next_full_attention_layer_id.get(i),
+                    )
                 index_topk_share.update(topk_indices)
         finally:
             if self.gate_cp_chain is not None:
