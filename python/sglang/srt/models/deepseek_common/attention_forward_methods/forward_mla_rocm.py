@@ -16,6 +16,7 @@ import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
+    per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.environ import envs
@@ -190,11 +191,53 @@ def rocm_absorb_q_bmm(
     return q_nope_out
 
 
+def prepare_hy4_fp8_v_up_proj(attn: DeepseekV2AttentionMLA) -> None:
+    """Keep BF16 MLA weights; prepare a separate FP8 V-only copy after loading."""
+    attn.use_hipblaslt_fp8_v_up_proj = envs.SGLANG_HY4_FP8_V_UP_PROJ.get()
+    if not attn.use_hipblaslt_fp8_v_up_proj:
+        return
+    if (
+        not _is_hcu
+        or attn.w_vc.dtype != torch.bfloat16
+        or attn.use_deep_gemm_bmm
+        or _use_aiter_gfx95
+    ):
+        raise ValueError(
+            "HY4 FP8 V projection requires HCU BF16 MLA weights "
+            "without AITER/DeepGEMM BMM"
+        )
+
+    from sglang.kernels.ops.gemm import load_hipblaslt_fp8_bmm
+    from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+
+    load_hipblaslt_fp8_bmm()
+    # Existing w_vc is [H,K,V]. BLASLt's TN path consumes contiguous [H,V,K].
+    weight = _scaled_bmm_weight(attn.w_vc, attn.w_scale).transpose(1, 2).contiguous()
+    attn.w_vc_fp8, attn.w_vc_fp8_scale = input_to_float8(weight, dtype=fp8_dtype)
+
+
 def rocm_absorb_v_bmm(
     attn: DeepseekV2AttentionMLA,
     attn_output: torch.Tensor,
 ) -> torch.Tensor:
     """Absorb ``attn_output @ w_vc`` (+ optional fused flatten quant) on HIP."""
+    if getattr(attn, "use_hipblaslt_fp8_v_up_proj", False):
+        from sglang.kernels.ops.gemm import hipblaslt_fp8_bmm
+
+        if attn_output.dtype != torch.bfloat16:
+            raise ValueError("HY4 FP8 V projection requires BF16 activations")
+        output = attn_output.new_empty(
+            (attn_output.shape[0], attn.num_local_heads, attn.v_head_dim)
+        )
+        if attn_output.shape[0] == 0:
+            return output.flatten(1, 2)
+        # The MLA quantizer accepts contiguous 3D data; its scalar scale covers
+        # all tokens and heads. Keep token-major layout for the native BMM.
+        scale = torch.zeros(1, dtype=torch.float32, device=attn_output.device)
+        quant, scale = per_tensor_quant_mla_fp8(attn_output.contiguous(), scale)
+        hipblaslt_fp8_bmm(quant, attn.w_vc_fp8, scale, attn.w_vc_fp8_scale, output)
+        return output.flatten(1, 2)
+
     # TODO(haishaw): add bmm_fp8 to ROCm
     if _use_aiter_gfx95 and attn.w_vc.dtype == torch.uint8:
         x = attn_output.transpose(0, 1)
@@ -923,6 +966,7 @@ class DeepseekMLARocmForwardMixin:
                 )
                 if (
                     envs.SGLANG_HY4_DCP2_FUSED_VPROJ.get()
+                    and not getattr(self, "use_hipblaslt_fp8_v_up_proj", False)
                     and not self.use_deep_gemm_bmm
                     and not _SGLANG_EXPERIMENTAL_LORA_OPTI
                     and not is_kv_b_lora_active(self)

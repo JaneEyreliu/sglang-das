@@ -1570,6 +1570,8 @@ class Envs:
     # ===================================================================
     SGLANG_OPT_HY4_IHC_TILELANG = EnvBool(False)
     SGLANG_HY4_COMPACT_PD_INDEX_K = EnvBool(False)
+    # HY4 V expansion only: per-tensor FP8 operands, HIPBLASLt BMM, BF16 output.
+    SGLANG_HY4_FP8_V_UP_PROJ = EnvBool(False)
     # HCU HYV4 DCP2/4 (legacy names): raw LSE pack and one sink after A2A.
     SGLANG_HY4_DCP2_FUSED_POST_ATTN = EnvBool(False)
     # Fused receive-side V projection/gate for measured BF16 shapes. This is

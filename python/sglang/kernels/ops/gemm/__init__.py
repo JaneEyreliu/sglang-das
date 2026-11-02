@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import cache
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
@@ -111,6 +113,32 @@ def bmm_fp8(
     )
 
 
+@cache
+def load_hipblaslt_fp8_bmm():
+    """Build once, before graph capture; disabled paths never load HIPBLASLt."""
+    from torch.utils.cpp_extension import load
+
+    source = Path(__file__).resolve().parents[2] / "jit/csrc/gemm/hipblaslt_fp8_bmm.cu"
+    return load(
+        name="sglang_hipblaslt_fp8_bmm",
+        sources=[str(source)],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "-DUSE_ROCM=1"],
+        extra_ldflags=["-lhipblaslt"],
+    )
+
+
+def hipblaslt_fp8_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """FP8 X[T,H,K] @ W[H,V,K], scalar scales, BF16 Out[T,H,V]."""
+    load_hipblaslt_fp8_bmm().bmm(x, weight, x_scale, weight_scale, out)
+
+
 def dsv3_fused_a_gemm(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
@@ -133,7 +161,13 @@ def dsv3_router_gemm(
     return impl(hidden_states, router_weights, out_dtype, output)
 
 
-__all__ = ["fp8_scaled_mm", "bmm_fp8", "dsv3_fused_a_gemm", "dsv3_router_gemm"]
+__all__ = [
+    "fp8_scaled_mm",
+    "bmm_fp8",
+    "hipblaslt_fp8_bmm",
+    "dsv3_fused_a_gemm",
+    "dsv3_router_gemm",
+]
 
 
 # LoRA SGMV Triton kernels migrated into this group (from lora/triton_ops);
