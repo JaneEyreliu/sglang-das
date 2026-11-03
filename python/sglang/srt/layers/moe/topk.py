@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_forward,
     get_lora,
     get_parallel,
@@ -3003,12 +3004,19 @@ def _post_process_topk_ids(
     )
     _fold_pad_into_append = False
     recorder_was_fused = False
-    # HCU W8A8 deployments can select DeepGEMM through the legacy env while
-    # the global runner backend remains AUTO, so recognize both selectors.
+    # HCU DeepEP must omit padding for both DeepGEMM and W4A8 Marlin.
+    # These paths can leave the runner backend at AUTO: DeepGEMM has a legacy
+    # env selector, while W4A8 Marlin is selected by the quantization config.
+    # Zero weights alone still dispatch padded IDs of 0 to expert 0, inflating
+    # its received-token count and serial work in the masked activation kernel.
     skip_deepep_padded_tokens = (
         _is_hcu
         and get_moe_a2a_backend().is_deepep()
-        and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
+        and (
+            get_moe_runner_backend().is_deep_gemm()
+            or _use_deepgemm_moe
+            or get_flags().moe.quantization == "slimquant_w4a8_marlin"
+        )
     )
     hip_deepep_postprocessed = False
     _fold_pad_weights_into_append = False
@@ -3063,13 +3071,13 @@ def _post_process_topk_ids(
     elif _is_hip:
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely
         # (negative indices cause illegal memory access). Keep their padded IDs
-        # in range and zero their weights below. HCU DeepEP + DeepGEMM instead
-        # masks the final IDs to -1 after shared-expert remapping so dispatch can
+        # in range and zero their weights below. HCU DeepEP with DeepGEMM or
+        # W4A8 Marlin masks IDs to -1 after shared-expert remapping so dispatch can
         # omit padded tokens, matching the pre-forward-port behavior.
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
         eplb_remap_enabled = is_expert_remapping_enabled()
-        remap_info = expert_location_dispatch_info if is_expert_remapping_enabled() else None
+        remap_info = expert_location_dispatch_info if eplb_remap_enabled else None
         if deepep_ids_finalized:
             # Only the explicit DeepEP producer contract permits this skip.
             # Legacy fused gates mask IDs to 0 and still require postprocessing.

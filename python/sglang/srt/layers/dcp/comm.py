@@ -20,7 +20,7 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -40,6 +40,9 @@ from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_fi_a2a_supported
 
 _is_hip = is_hip()
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.hyv4_gate_a2a_overlap import DeferredHyv4Gate
 
 
 def _ag_lse(cp_attn_lse: torch.Tensor, cp_group: GroupCoordinator) -> torch.Tensor:
@@ -535,6 +538,75 @@ def dcp_a2a_lse_reduce(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
     )
     return combined
+
+
+def hyv4_dcp2_a2a_reduce(
+    raw_output: torch.Tensor,
+    raw_lse,
+    local_sink: torch.Tensor,
+    cp_group: "GroupCoordinator",
+    *,
+    w_vc: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
+    deferred_gate: Optional["DeferredHyv4Gate"] = None,
+) -> torch.Tensor:
+    """Exchange native HYV4 FlashMLA partials and add the sink exactly once.
+
+    The legacy DCP2 entry point also accepts DCP4.
+    Returns latent attention unless both projection operands are supplied;
+    that variant returns the gated, flattened V projection for o_proj.
+    Allocations during capture belong to the graph memory pool. They are
+    per invocation, so overlapping steps never share mutable transport state.
+    """
+    from sglang.kernels.ops.attention.hyv4_dcp_fused import (
+        dcp2_sink_combine,
+        dcp2_sink_project_gate,
+        fused_sanitize_pack,
+    )
+    from sglang.srt.layers.hy4_dcp import Hyv4DcpRawLSE
+
+    ranks = cp_group.world_size
+    if not isinstance(raw_lse, Hyv4DcpRawLSE) or ranks not in (2, 4):
+        raise ValueError("HYV4 fused A2A requires raw natural-log LSE and DCP2/4")
+    if raw_lse.num_heads != ranks * local_sink.numel():
+        raise ValueError("HYV4 sink shard must match the received head partition")
+    if gate is not None and deferred_gate is not None:
+        raise ValueError("Supply either a materialized or deferred HYV4 gate")
+    if (w_vc is None and gate is not None) or (
+        w_vc is not None and gate is None and deferred_gate is None
+    ):
+        raise ValueError("HYV4 fused V projection requires both weight and gate")
+    dim = raw_output.shape[-1]
+    send = torch.empty(
+        (ranks, raw_lse.num_total_rows, local_sink.numel(), dim + 2),
+        dtype=raw_output.dtype,
+        device=raw_output.device,
+    )
+    recv = torch.empty_like(send)
+    # Fork before pack: gate consumes hidden_states and does not depend on
+    # the packed MLA partials. The original caller still owns pack and A2A.
+    from contextlib import nullcontext
+
+    overlap = (
+        deferred_gate.overlap() if deferred_gate is not None else nullcontext(gate)
+    )
+    with overlap as gate:
+        fused_sanitize_pack(
+            raw_output,
+            raw_lse.lse,
+            raw_lse.valid_chunks,
+            send,
+            num_valid_rows=raw_lse.num_valid_rows,
+        )
+        cp_group.all_to_all_single(
+            recv.reshape(-1).view(torch.uint8),
+            send.reshape(-1).view(torch.uint8),
+        )
+    # The context joins gate after the original receive dependency; neither
+    # result is consumed before it is ready, including pack/collective errors.
+    if w_vc is not None:
+        return dcp2_sink_project_gate(recv, local_sink, w_vc, gate)
+    return dcp2_sink_combine(recv, local_sink)
 
 
 def _dcp_fi_a2a_lse_reduce(

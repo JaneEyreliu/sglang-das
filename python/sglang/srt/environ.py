@@ -682,6 +682,9 @@ class Envs:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
+    # Keep plain PD on the elastic-DP path unless the dedicated scheduler
+    # StepInfo/Gloo protocol is explicitly requested.
+    SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
@@ -1072,6 +1075,10 @@ class Envs:
     SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(False)
 
     SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED = EnvBool(False)
+    # Route the DSA fp8 sparse-MLA prefill prefix dequant
+    # (dequantize_k_cache_paged) through the lightop kernel
+    # prefill_gather_and_upconvert_fp8_kv_cache. Opt-in, default off.
+    SGLANG_DSA_LIGHTOP_PREFILL_DEQUANT_KV = EnvBool(False)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
@@ -1770,7 +1777,16 @@ class Envs:
     # ===================================================================
     # Hunyuan V4
     # ===================================================================
+    # HCU HY4: produce DCP KV write locations once per forward and reuse them
+    # across layers. Every captured forward records its own GPU producer.
+    SGLANG_HY4_DCP_FUSED_KV_WRITE_LOCS = EnvBool(False)
     SGLANG_OPT_HY4_IHC_TILELANG = EnvBool(False)
+
+    # Overlap the HYV4 gated-MLA attention output-gate GEMM (``linear_gate`` /
+    # "g_proj") with the Q/KV projection GEMMs on a dedicated side stream.
+    # Ported from the vLLM-HCU PCP+EP ``gate_proj`` overlap. Off by default;
+    # only takes effect when expert parallelism is active (moe_ep_size > 1).
+    SGLANG_ENABLE_HYV4_GATE_PROJ_PARALLEL = EnvBool(False)
 
     # ===================================================================
     # DeepSeek V4
@@ -2080,11 +2096,31 @@ class Envs:
     SGLANG_INKLING_RS_MM_PREPROCESS = EnvBool(True)
 
     # ===================================================================
+    SGLANG_OPT_HY4_IHC_TILELANG = EnvBool(False)
+    SGLANG_HY4_COMPACT_PD_INDEX_K = EnvBool(False)
+    # HY4 V expansion only: per-tensor FP8 operands, HIPBLASLt BMM, BF16 output.
+    SGLANG_HY4_FP8_V_UP_PROJ = EnvBool(False)
+    # HCU HYV4 DCP2/4 (legacy names): raw LSE pack and one sink after A2A.
+    SGLANG_HY4_DCP2_FUSED_POST_ATTN = EnvBool(False)
+    # Fused receive-side V projection/gate for measured BF16 shapes. This is
+    # only reached when FUSED_POST_ATTN is enabled; set to 0 to isolate pack/
+    # sink-merge when benchmarking or validating numerical differences.
+    SGLANG_HY4_DCP2_FUSED_VPROJ = EnvBool(True)
+    # Opt-in: fork gate before pack to a dedicated stream beside DCP2/4 A2A.
+    # Mutually exclusive with the earlier gate/QKV projection overlap.
+    SGLANG_HY4_DCP2_GATE_A2A_OVERLAP = EnvBool(False)
+    # Eligibility cap on local gate input rows (including graph padding).
+    # Set 0 for unlimited rows; all other eligibility checks still apply.
+    # This is a conservative scope limit, not a measured performance threshold.
+    SGLANG_HY4_DCP2_GATE_A2A_MAX_TOKENS = EnvInt(32)
+
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
+    # HCU raw Top2048 via LightOp; page lookup / DCP mapping stays unfused.
+    SGLANG_DSA_HCU_LIGHTOP_TOPK = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
@@ -2105,6 +2141,17 @@ class Envs:
     SGLANG_DSA_HCU_INT8_INDEX_K_CACHE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HCU_INT8_INDEX_K_CACHE"
     )
+    # HCU HY4: select a K-only indexer graph only when a CPU-known conservative
+    # KV length bound fits TopK. Missing bounds keep the full indexer path.
+    SGLANG_HY4_HCU_DSA_SHORT_CONTEXT_K_ONLY = EnvBool(False)
+    # HY4 linear_gate CP sharding: each attention-CP rank keeps 1/cp of the
+    # gate's output rows. Prefill-CP batches all-gather the weight per layer
+    # into two shared ping-pong buffers, prefetched on a side stream while the
+    # preceding compute runs; replicated small batches (decode/verify/draft,
+    # CUDA graph) gather the local GEMM output instead. Saves ~13 GiB on CP8.
+    # Requires attn_cp_size > 1, attn_tp_size == 1, no DCP, and linear_gate
+    # resolving to UnquantizedLinearMethod (true under slimquant_w4a8_marlin).
+    SGLANG_HY4_LINEAR_GATE_CP_SHARD = EnvBool(False)
     # Opt-in HCU AOT kernel for concatenating absorbed MLA Q components.
     SGLANG_ENABLE_HCU_CONCAT_MLA_ABSORB_Q = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
@@ -2128,6 +2175,11 @@ class Envs:
     # blocks contain only -1 pads, and -1 entries inside the consumed range
     # still take the in-kernel clamp+mask path.
     SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH = EnvBool(False)
+    # Opt-in HCU flashmla_kv FP8/BF16-Q TopK2048 compaction: single rank or
+    # DCP2/4/8, decode/verify/ordinary prefill/draft. Exact local lengths skip
+    # invalid tails; explicitly sharing target layers also reuse scheduling.
+    # Independent of the old FLASHMLA_KV_TOPK_LENGTH patch/flag.
+    SGLANG_ENABLE_DSA_FLASHMLA_DCP_GROUPED_TOPK = EnvBool(False)
     # Opt-in: run the born-fp8 q-prep (absorbed bmm + concat + fp8 cast,
     # ~173us/layer-call) on alt_stream underneath the DSA indexer — the two
     # chains fork independently from the q_a_layernorm output.  Requires

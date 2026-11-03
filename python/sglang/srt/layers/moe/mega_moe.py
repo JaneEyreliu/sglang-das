@@ -788,6 +788,7 @@ def run_mega_routed_experts(
                 experts,
                 buf,
                 activation_clamp=activation_clamp,
+                dispatch_num_tokens=dispatch_num_tokens,
             )
             if routed_scaling_factor != 1.0:
                 y.mul_(routed_scaling_factor)
@@ -1035,7 +1036,14 @@ def _run_standalone_hcu_w8a8_mega_moe(
 
 
 def _run_standalone_hcu_w4a8_mega_moe(
-    hidden_states, topk_ids, topk_weights, experts, buf, *, activation_clamp=None
+    hidden_states,
+    topk_ids,
+    topk_weights,
+    experts,
+    buf,
+    *,
+    activation_clamp=None,
+    dispatch_num_tokens=None,
 ):
     from lightop.quant import per_token_quant_int8
     from megamoe.w4a8 import w4a8_mega_moe
@@ -1056,6 +1064,10 @@ def _run_standalone_hcu_w4a8_mega_moe(
         buf,
         activation_clamp=activation_clamp,
         combine_group_map=getattr(experts, "mega_w4a8_combine_groups", None),
+        # Bound routing/gather/scatter grids to this dispatch capacity (max
+        # tokens across DP ranks) instead of num_max_tokens_per_rank, mirroring
+        # the fp8 mega_moe path. Activates the GLM5.2 scan_tokens path for Hy4.
+        capacity_num_tokens=dispatch_num_tokens,
     )
     return y
 

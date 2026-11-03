@@ -29,6 +29,7 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
     is_deepseek_dsa,
     is_deepseek_v4,
+    is_hy_v4,
     is_minimax_sparse,
 )
 from sglang.srt.distributed.utils import get_pp_indices
@@ -81,6 +82,7 @@ from sglang.srt.mem_cache.memory_pool import (
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
     get_minimax_sparse_index_dtype,
+    compute_hcu_dcp_graph_kv_padding_capacity,
 )
 from sglang.srt.mem_cache.page_interleave import (
     PageShardSpec,
@@ -117,6 +119,7 @@ from sglang.srt.utils.common import (
     get_available_gpu_memory,
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
+    is_hcu,
     is_hip,
     is_npu,
 )
@@ -502,6 +505,20 @@ class KVCacheConfigurator:
     @property
     def pool_page_size(self) -> int:
         return get_schedule().page_size * self.loc_space_scale
+
+    @property
+    def graph_kv_padding_capacity(self) -> int:
+        graph_config = get_exec().graph.cuda_graph_config.decode
+        return compute_hcu_dcp_graph_kv_padding_capacity(
+            pool_page_size=self.pool_page_size,
+            page_size=get_schedule().page_size,
+            dcp_enabled=get_parallel().dcp_enabled,
+            is_hcu_platform=is_hcu(),
+            speculative_algorithm=self.server_args.speculative_algorithm,
+            decode_cuda_graph_backend=graph_config.backend,
+            decode_cuda_graph_max_bs=graph_config.max_bs,
+            speculative_num_draft_tokens=max_speculative_num_draft_tokens(),
+        )
 
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
         max_total_num_tokens = config.max_total_num_tokens
@@ -2217,6 +2234,31 @@ class KVCacheConfigurator:
             pool_kwargs["indexer_prefetch_layer_ids"] = full_indexer_layer_ids
         if not get_memory().enable_hisparse:
             pool_kwargs["indexer_layer_ids"] = indexer_layer_ids
+        if is_hy_v4(self.model_config.hf_config):
+            # The allocator reserves virtual page 0 (64 * DCP slots). Index-K
+            # indexes raw virtual locs on both the target and replicated draft.
+            pool_kwargs["index_padding_capacity"] = (
+                get_schedule().page_size * get_parallel().attn_dcp_size
+            )
+        if self.is_draft_worker and self.loc_space_scale > 1:
+            # The replicated draft stores global virtual token ids, so its KV
+            # page spans DCP ranks. HCU DSA indexer kernels still consume
+            # physical page-64 index-K storage indexed by those raw ids.
+            pool_kwargs["index_page_size"] = get_schedule().page_size
+            pool_kwargs["index_buf_size"] = max_total_num_tokens
+            if is_hy_v4(self.model_config.hf_config):
+                # Keep target/draft index-K ABIs identical for P/D transfer.
+                # Only the draft KV pool uses virtual pages; INT8 index-K
+                # allocation, stores and reads use physical page-64 storage.
+                pool_kwargs["allow_int8_virtual_index_pages"] = True
+                logger.info(
+                    "HYV4 DCP draft uses independent index-K pages: KV page_size=%d, "
+                    "index_page_size=%d; index-K format follows the target setting.",
+                    self.pool_page_size,
+                    get_schedule().page_size,
+                )
+        if self.graph_kv_padding_capacity > self.pool_page_size:
+            pool_kwargs["padding_capacity"] = self.graph_kv_padding_capacity
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -2771,11 +2813,22 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
                     else:
-                        paged_allocator_cls = (
+                        allocator_cls = (
                             current_platform.get_paged_allocator_cls()
                             or PagedTokenToKVPoolAllocator
                         )
-                        token_to_kv_pool_allocator = paged_allocator_cls(
+                        allocator_kwargs = {}
+                        if (
+                            is_hy_v4(self.model_config.hf_config)
+                            and get_parallel().dcp_enabled
+                        ):
+                            from sglang.srt.mem_cache.allocator.hyv4 import (
+                                HYV4DCPAllocator,
+                            )
+
+                            allocator_cls = HYV4DCPAllocator
+                            allocator_kwargs["dcp_rank"] = get_parallel().attn_dcp_rank
+                        token_to_kv_pool_allocator = allocator_cls(
                             sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
                             page_size=get_schedule().page_size
                             * get_parallel().attn_dcp_size,
@@ -2783,6 +2836,7 @@ class KVCacheConfigurator:
                             device=self.device,
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
+                            **allocator_kwargs,
                         )
 
             if get_memory().enable_hisparse and is_dsv4_model:
@@ -2834,6 +2888,14 @@ class KVCacheConfigurator:
                     token_to_kv_pool.register_mapping(
                         swa_allocator.full_to_swa_index_mapping
                     )
+        if (
+            self.is_draft_worker
+            and is_hy_v4(self.model_config.hf_config)
+            and get_parallel().dcp_enabled
+        ):
+            # The shared allocator owns retraction of both pools, including the
+            # replicated draft state whose slots will otherwise be reused.
+            token_to_kv_pool_allocator.register_draft_pool(token_to_kv_pool)
         return token_to_kv_pool_allocator
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
@@ -2954,7 +3016,7 @@ class KVCacheConfigurator:
             token_capacity = min(token_capacity, user_limit)
 
         # Sync across PP ranks (each may have different layer counts)
-        if get_parallel().pp_size > 1:
+        if get_parallel().pp_size > 1 and not self.is_draft_worker:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,

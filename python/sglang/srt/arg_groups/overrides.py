@@ -834,6 +834,13 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             if hcu_hyv4_fp8_sink
             else "flashmla_sparse",
         }
+        if (
+            _is_hcu
+            and model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN")
+            and view.dcp_size > 1
+        ):
+            # DCP needs the FlashMLA output/LSE contract on both phases.
+            backends = dict.fromkeys(backends, "flashmla_kv")
         for field, backend in backends.items():
             value = getattr(view, field)
             if value is not None and value != backend:

@@ -16,17 +16,21 @@ from sglang.srt.utils.common import is_hcu
 logger = logging.getLogger(__name__)
 
 
-def _dsa_dcp_overrides(cfg: Any) -> dict:
+def _dsa_dcp_overrides(cfg: Any, hcu_hyv4: bool = False) -> dict:
     if cfg.dcp_size <= 1:
         return {}
     if cfg.enable_hisparse or cfg.enable_hierarchical_cache:
         raise ValueError("DSA DCP does not support HiSparse or HiCache.")
-    if cfg.disaggregation_mode != "null":
+    # HCU HYV4 runs DCP on the PD decode server.
+    if cfg.disaggregation_mode != "null" and not hcu_hyv4:
         raise ValueError("DSA DCP does not support PD disaggregation.")
     if cfg.speculative_eagle_topk not in (None, 1):
         raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
+    # HCU HYV4 DCP needs FlashMLA's output/LSE contract and the model-specific
+    # sink correction; the launch validator checks explicit backends.
+    backend = "flashmla_kv" if hcu_hyv4 else "trtllm"
     overrides = {
-        name: "trtllm"
+        name: backend
         for name in ("dsa_prefill_backend", "dsa_decode_backend")
         if getattr(cfg, name) is None
     }
@@ -60,16 +64,11 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     )
 
     model_arch = (getattr(hf_config, "architectures", None) or [None])[0]
+    hcu_hyv4 = is_hcu() and model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN")
     if model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
-        if cfg.enable_prefill_cp:
-            raise ValueError(
-                "--enable-prefill-cp is not supported for HYV4 because its "
-                "attention path does not implement DSA context-parallel metadata "
-                f"and sharding. Got architecture={model_arch!r} and "
-                f"enable_prefill_cp={cfg.enable_prefill_cp!r}."
-            )
         dcp_size = getattr(cfg, "dcp_size", 1)
-        if dcp_size > 1:
+        # HCU applies the HYV4 sink once per DCP group (see dsa_backend).
+        if dcp_size > 1 and not hcu_hyv4:
             raise ValueError(
                 "--dcp-size > 1 is not supported for HYV4 because decode context "
                 "parallelism gathers query heads across DCP ranks but does not "
@@ -99,7 +98,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
-        overrides.update(_dsa_dcp_overrides(cfg))
+        overrides.update(_dsa_dcp_overrides(cfg, hcu_hyv4=hcu_hyv4))
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"

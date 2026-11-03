@@ -136,6 +136,12 @@ class TestPdDcpGather(CustomTestCase):
                     enable_custom_mem_pool=custom_pool,
                     enable_deferred_decode_kv_release=False,
                     _transfer_data=transfer,
+                    _transfer_addrs=lambda mooncake_session_id, src_addrs, dst_addrs, lengths: (
+                        transfer(
+                            mooncake_session_id,
+                            list(zip(src_addrs, dst_addrs, lengths)),
+                        )
+                    ),
                 )
                 manager._await_transfer_futures = lambda futures: (
                     MooncakeKVManager._await_transfer_futures(manager, futures)

@@ -771,6 +771,9 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         w8a8_include: Optional[list[str]] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         compressed_tensors_packed: bool = False,
+        checkpoint_format: Optional[str] = None,
+        linear_targets: Optional[list[str]] = None,
+
     ):
         super().__init__()
         self.ignore = ignore
@@ -782,6 +785,15 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         self.w8a8_include = list(w8a8_include or [])
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.compressed_tensors_packed = compressed_tensors_packed
+        self.checkpoint_format = checkpoint_format
+        self.linear_targets = linear_targets
+        if checkpoint_format == "hy4_w4a8_v1":
+            logger.info(
+                "[slimquant_w4a8_marlin] checkpoint_format=hy4_w4a8_v1: "
+                "convert low-nibble-even INT4 and true scales to the legacy "
+                "high-nibble-even / scale-divided-by-16 convention before repacking"
+            )
+
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -805,13 +817,67 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         experts_only_linear = any(arch in _QWEN4_EXP_ARCHS for arch in archs)
         mixed = config.get("mixed_precision") or {}
         w8a8 = mixed.get("w8a8_include") or {}
+        checkpoint_format = config.get("checkpoint_format")
+        linear_targets = None
+        compressed_tensors_packed = config.get("format") == "pack-quantized"
+        if config.get("quant_method") == "compressed-tensors" and any(
+            arch.startswith("HYV4") for arch in archs
+        ):
+            # HYV4 mixed INT4/INT8 checkpoints are adapted by the model loader
+            # and normalized after EP slicing; skip the generic CT conversion.
+            if not cls._supports_compressed_config(config):
+                raise ValueError("Unsupported compressed-tensors W4A8 scheme")
+            checkpoint_format = "hy4_compressed_tensors_w4a8"
+            compressed_tensors_packed = False
+            linear_targets = [
+                target
+                for group in config["config_groups"].values()
+                if group["weights"]["num_bits"] == 8
+                for target in group["targets"]
+            ]
+
         return cls(
             ignore=config.get("ignore"),
             experts_only_linear=experts_only_linear,
             w8a8_include=list(w8a8.get("modules") or []),
             packed_modules_mapping=config.get("packed_modules_mapping") or {},
-            compressed_tensors_packed=config.get("format") == "pack-quantized",
+            compressed_tensors_packed=compressed_tensors_packed,
+            checkpoint_format=checkpoint_format,
+            linear_targets=linear_targets,
         )
+
+    @staticmethod
+    def _supports_compressed_config(config):
+        groups = config.get("config_groups", {})
+        if not groups:
+            return False
+        has_int4 = False
+        for group in groups.values():
+            weight = group.get("weights") or {}
+            act = group.get("input_activations") or {}
+            bits = weight.get("num_bits")
+            if not (
+                bits in (4, 8)
+                and weight.get("type") == "int"
+                and weight.get("strategy") == "channel"
+                and weight.get("symmetric") is True
+                and not weight.get("dynamic")
+                and weight.get("group_size") in (None, -1)
+                and weight.get("actorder") is None
+                and act.get("num_bits") == 8
+                and act.get("type") == "int"
+                and act.get("strategy") == "token"
+                and act.get("symmetric") is True
+                and act.get("dynamic") is True
+                and group.get("output_activations") is None
+                and group.get("format", config.get("format"))
+                == ("pack-quantized" if bits == 4 else "int-quantized")
+                and group.get("targets")
+            ):
+                return False
+            has_int4 |= bits == 4
+        return has_int4
+
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
@@ -836,9 +902,18 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
                     and activation.get("symmetric") is True
                     and activation.get("dynamic") is True
                 ):
-                    return None
-            if groups:
-                return cls.get_name()
+                    break
+            else:
+                if groups:
+                    return cls.get_name()
+        if (
+            user_quant == cls.get_name()
+            and hf_quant_cfg.get("quant_method") == "compressed-tensors"
+            and cls._supports_compressed_config(hf_quant_cfg)
+        ):
+            # HYV4 mixed INT4 experts + INT8 dense Linear.
+            return cls.get_name()
+
         if hf_quant_cfg.get("quant_method") == "slimquant_w4a8" and user_quant in (
             "slimquant_w4a8_marlin",
             "slimquant_marlin",
@@ -858,6 +933,14 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
 
         if isinstance(layer, LinearBase):
             fused_mapping = getattr(self, "packed_modules_mapping", {}) or {}
+            # HY4 v1 quantizes shared experts too. Once kept separate from the
+            # routed MoE (different activation clipping), they still need to
+            # load packed INT4 weights rather than the default BF16 linear.
+            if (
+                self.checkpoint_format == "hy4_w4a8_v1"
+                and ".mlp.shared_experts." in prefix
+            ):
+                return HYV4SharedExpertLinearMethod(self)
             # Kimi-K3 INT4 (from mxfp4_to_int4.py) only quantizes the routed
             # experts; dense layers stay in BF16 and are listed in the
             # checkpoint's ignore list (native compressed-tensors style, with
@@ -870,6 +953,10 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
                 fused_mapping=fused_mapping,
             ):
                 return UnquantizedLinearMethod()
+            if self.linear_targets is not None:
+                if should_ignore_layer(prefix, self.linear_targets, fused_mapping):
+                    return SlimQuantW4A8Int8LinearMethod(self)
+                return UnquantizedLinearMethod()
             # Qwen3.8 Flash-Next: MoE experts are W4; denselinears are BF16
             # unless listed in mixed_precision.w8a8_include (W8A8). Without
             # that include list, keep Unquant so int8 weights are never run
@@ -877,8 +964,14 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
             if self.experts_only_linear:
                 if _layer_in_w8a8_include(prefix, self.w8a8_include, fused_mapping):
                     return SlimQuantW4A8Int8LinearMethod(self)
+
                 return UnquantizedLinearMethod()
-            return SlimQuantW4A8Int8LinearMethod(self)
+            if self.ignore:
+                return SlimQuantW4A8Int8LinearMethod(self)
+            # ChannelWise W4A8/W4A16 ckpts quantize MoE experts only and often
+            # have no ignore list; attn / linear_attn / router / lm_head stay
+            # BF16 and must not use the int8 Linear path.
+            return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
@@ -952,6 +1045,30 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
             )
             return quant_method
         return None
+
+    def normalize_checkpoint_weights(self, layer: torch.nn.Module) -> None:
+        """Convert HY4 v1 local expert shards to the existing backend contract.
+
+        HY4 v1 stores signed INT4 with even K in the LOW nibble and true
+        per-channel scales. The legacy loaders expect even K in the HIGH
+        nibble and scale/16. Normalize after EP/TP slicing, so every rank
+        converts only its own routed and fused shared experts. DeepGEMM HIPC
+        in the 20260915 image consumes these divided scales directly; other
+        backends retain their own scale conversion.
+        """
+        if self.checkpoint_format not in (
+            "hy4_w4a8_v1",
+            "hy4_compressed_tensors_w4a8",
+        ):
+            return
+        for name in ("w13_weight", "w2_weight"):
+            packed = getattr(layer, name).data.view(torch.uint8)
+            if self.checkpoint_format == "hy4_compressed_tensors_w4a8":
+                # compressed-tensors stores q + 8 per nibble; convert to
+                # signed two's complement before the legacy nibble swap.
+                packed.bitwise_xor_(0x88)
+            packed.copy_((packed << 4) | (packed >> 4))
+            getattr(layer, name + "_scale").data.div_(16.0)
 
     def get_scaled_act_names(self) -> List[str]:
         return []
@@ -1153,6 +1270,46 @@ class HCUW4A8Int8DeepEPMoEMethod(FusedMoEMethodBase):
         return SlimQuantW4A8Int8MarlinMoEMethod.apply_ep(self, **kwargs)
 
 
+class HYV4SharedExpertLinearMethod(SlimQuantW4A8Int8LinearMethod):
+    """Load HY4's signed INT4 shared weights into the existing INT8 GEMM.
+
+    Expanding each nibble to an INT8 value is lossless. Keep the checkpoint's
+    true per-channel scales, and retain dynamic INT8 activation quantization.
+    Only shared experts take this path; routed experts keep packed INT4 GEMM.
+    """
+
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        if input_size_per_partition % 2:
+            raise ValueError("HY4 packed INT4 requires an even local input width")
+        super().create_weights(
+            layer,
+            input_size_per_partition // 2,
+            output_partition_sizes,
+            input_size // 2,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def process_weights_after_loading(self, layer):
+        # HY4 v1 stores even K in the low nibble, with signed two's-complement
+        # values. Do not use the fused MoE's scale/16 normalization here.
+        packed = layer.weight.data.view(torch.int8)
+        low = (packed << 4) >> 4
+        high = packed >> 4
+        layer.weight.data = torch.stack((low, high), dim=-1).flatten(-2)
+        super().process_weights_after_loading(layer)
+
+
 class SlimQuantW4A8Int8MarlinMoEMethod:
     """MoE method for W4A8INT8 Marlin.
     Supports loading INT8 checkpoints with static weight scale and
@@ -1246,6 +1403,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.quant_config.normalize_checkpoint_weights(layer)
         if get_moe_a2a_backend().is_megamoe():
             from sglang.srt.layers.moe.mega_moe import (
                 build_hcu_w4a8_mega_moe_experts_weights,
@@ -1658,6 +1816,7 @@ class SlimQuantW4A8Int8TritonMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.quant_config.normalize_checkpoint_weights(layer)
         layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
         layer.w13_weight_scale = Parameter(
@@ -1913,6 +2072,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.quant_config.normalize_checkpoint_weights(layer)
         if self.use_deepep:
             # DeepEP grouped GEMM consumes the HIPC pack, not the Aiter TP
             # shuffle layout. The HIPC kernel applies the checkpoint's x16

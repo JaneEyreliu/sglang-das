@@ -46,6 +46,9 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.attention.dsa.hyv4_short_context import (
+    create_hyv4_short_context_graph_variants,
+)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.graph_variants import (
     AttentionGraphVariants,
@@ -319,7 +322,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
             self.dllm_attention.graph_variants(self.captured_req_width)
             if self.dllm_attention is not None and self.is_dllm
-            else create_attention_graph_variants(model_runner.model_config.hf_config)
+            else create_hyv4_short_context_graph_variants(
+                model_runner.model_config.hf_config, self.captured_req_width
+            )
+            or create_attention_graph_variants(model_runner.model_config.hf_config)
             or create_dsv41_candidate_graph_variants(
                 model_runner, self.capture_forward_mode, self.captured_req_width
             )

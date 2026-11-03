@@ -1687,6 +1687,13 @@ class DeepseekV2MoE(nn.Module):
             sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
         )
 
+        # Shared experts on alt_stream. Skipped on HCU under graph capture: the
+        # replayed graph runs the two branches back to back (the routed branch
+        # starts only after the shared experts finish), so the fork/join gives
+        # no overlap and only adds two ~15us cross-stream hops per MoE layer.
+        shared_on_alt_stream = self.alt_stream is not None and not (
+            _is_hcu and get_is_capture_mode()
+        )
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             use_vision_topk = self.gate.e_score_correction_bias_vl is not None and (
@@ -1705,7 +1712,7 @@ class DeepseekV2MoE(nn.Module):
                 else self.gate(hidden_states, forward_batch=forward_batch)
             )
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
-                if self.alt_stream is not None:
+                if shared_on_alt_stream:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
@@ -1767,7 +1774,13 @@ class DeepseekV2MoE(nn.Module):
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
-                    compute_overlap_args(dispatch_output, self.alt_stream)
+                    compute_overlap_args(
+                        dispatch_output,
+                        self.alt_stream,
+                        supports_down_gemm_overlap=getattr(
+                            self.experts, "supports_down_gemm_overlap", True
+                        ),
+                    )
                 )
                 dispatcher.set_overlap_args(
                     combine_overlap_args=combine_overlap_args,
@@ -1806,7 +1819,13 @@ class DeepseekV2MoE(nn.Module):
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
-                    compute_overlap_args(dispatch_output, self.alt_stream)
+                    compute_overlap_args(
+                        dispatch_output,
+                        self.alt_stream,
+                        supports_down_gemm_overlap=getattr(
+                            self.experts, "supports_down_gemm_overlap", True
+                        ),
+                    )
                 )
                 dispatcher.set_overlap_args(
                     combine_overlap_args=combine_overlap_args,
@@ -1860,7 +1879,13 @@ class DeepseekV2MoE(nn.Module):
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
-                    compute_overlap_args(dispatch_output, self.alt_stream)
+                    compute_overlap_args(
+                        dispatch_output,
+                        self.alt_stream,
+                        supports_down_gemm_overlap=getattr(
+                            self.experts, "supports_down_gemm_overlap", True
+                        ),
+                    )
                 )
                 dispatcher.set_overlap_args(
                     combine_overlap_args=combine_overlap_args,
@@ -1908,7 +1933,7 @@ class DeepseekV2MoE(nn.Module):
             hidden_states.shape[0] > 0
             and not sbo_enabled_flag
             and self.num_fused_shared_experts == 0
-            and self.alt_stream is not None
+            and shared_on_alt_stream
             and not is_in_breakable_cuda_graph()
         ):
             torch.cuda.current_stream().wait_event(shared_event)
@@ -2434,6 +2459,7 @@ class DeepseekV2AttentionMLA(
         )
         # Reused DSA TopK indices were already sorted by the producing layer.
         self.attn_mqa.reuse_topk_indices = bool(self.skip_topk and not self.is_nextn)
+        self.attn_mqa.is_nextn = self.is_nextn
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
         if self.dcp_size > 1:
             self.attn_mqa_for_dcp_decode = RadixAttention(
@@ -2446,6 +2472,11 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 prefix=add_prefix("attn_mqa", prefix),
             )
+
+            self.attn_mqa_for_dcp_decode.reuse_topk_indices = (
+                self.attn_mqa.reuse_topk_indices
+            )
+            self.attn_mqa_for_dcp_decode.is_nextn = self.is_nextn
 
         self.attn_mha = RadixAttention(
             self.num_local_heads,

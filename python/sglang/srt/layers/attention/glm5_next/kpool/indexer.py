@@ -15,7 +15,8 @@ from transformers import PretrainedConfig
 from sglang.srt.configs.model_config import get_dsa_index_kpool
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.glm5_next.dsa_backend import TopkTransformMethod
+# Module import: dsa_backend imports this package, so a name import is circular.
+from sglang.srt.layers.attention.glm5_next import dsa_backend as _glm5_dsa_backend
 from sglang.srt.layers.attention.glm5_next.indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
     BaseIndexerMetadata,
@@ -790,7 +791,7 @@ class IndexerKPool(Indexer):
             return None, None, None
 
         method = metadata.topk_transform_method
-        if method == TopkTransformMethod.PAGED:
+        if method == _glm5_dsa_backend.TopkTransformMethod.PAGED:
             page_table = (
                 paged_page_table
                 if paged_page_table is not None
@@ -802,7 +803,7 @@ class IndexerKPool(Indexer):
                 paged_page_table_row_index if paged_page_table is not None else None
             )
             return page_table, None, row_index
-        if method == TopkTransformMethod.RAGGED:
+        if method == _glm5_dsa_backend.TopkTransformMethod.RAGGED:
             return None, metadata.attn_metadata.topk_indices_offset, None
         return None, None, None
 
@@ -824,7 +825,7 @@ class IndexerKPool(Indexer):
             # cross-worker representation. The attention backend localizes a
             # temporary copy against the current worker's allocator.
             topk_full = token_ids.to(torch.int32)
-        elif metadata.topk_transform_method == TopkTransformMethod.PAGED:
+        elif metadata.topk_transform_method == _glm5_dsa_backend.TopkTransformMethod.PAGED:
             page_table = metadata.attn_metadata.page_table_1
             if page_table.shape[0] != rows:
                 token_to_batch_idx = metadata.get_token_to_batch_idx()
@@ -841,7 +842,7 @@ class IndexerKPool(Indexer):
                     )
             safe_ids = token_ids.clamp(min=0, max=page_table.shape[1] - 1)
             topk_full = torch.gather(page_table, dim=1, index=safe_ids).to(torch.int32)
-        elif metadata.topk_transform_method == TopkTransformMethod.RAGGED:
+        elif metadata.topk_transform_method == _glm5_dsa_backend.TopkTransformMethod.RAGGED:
             offsets = metadata.attn_metadata.topk_indices_offset
             if offsets is not None:
                 if offsets.ndim == 2:
@@ -1376,7 +1377,7 @@ class IndexerKPool(Indexer):
         # (full-seq metadata copy would shape-mismatch logits.shape[0]).
         page_table_all: Optional[torch.Tensor] = None
         if self._uses_fused_topk_mapping(metadata) and (
-            metadata.topk_transform_method == TopkTransformMethod.PAGED
+            metadata.topk_transform_method == _glm5_dsa_backend.TopkTransformMethod.PAGED
         ):
             page_table_all = bt_row.unsqueeze(0).expand(actual_seq_q, -1)
 

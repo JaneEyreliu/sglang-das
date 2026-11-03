@@ -53,6 +53,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
     moe_forward_piecewise_cuda_graph_impl,
 )
+from sglang.srt.layers.moe.hcu_w4a8_sbo import run_hcu_w4a8_hipc
 from sglang.srt.layers.moe.moe_runner.deep_gemm import copy_list_to_gpu_no_ce
 from sglang.srt.layers.moe.token_dispatcher.aiter_utils import should_use_aiter_runner
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -507,6 +508,8 @@ def m_grouped_w4a8_gemm_nt_masked_fake(
 ) -> torch.Tensor:
     return d
 
+    return d
+
 
 def m_grouped_w4a8_gemm_nt_masked_hipc_fake(
     a0: torch.Tensor,
@@ -722,6 +725,16 @@ class DeepEPMoE(FusedMoE):
             and type(scheme).__name__ == "CompressedTensorsW8A8Int8MoE"
         )
 
+    @property
+    def supports_down_gemm_overlap(self) -> bool:
+        if self.deprecate_flag:
+            return True
+        if self.use_w4a8_marlin:
+            return _is_hcu and _use_w4a8_masked_hipc
+        if _is_hcu and self.use_fp8_w8a8:
+            return self._hcu_fp8_pair32
+        return True
+
     def __init__(
         self,
         num_experts: int,
@@ -920,6 +933,8 @@ class DeepEPMoE(FusedMoE):
                 is_hcu_gfx936() and not _use_int8_deepgemm_asm
             )
             self.use_w8a8_marlin = False
+
+        self._hcu_fp8_pair32 = False
 
         self.deepep_mode = get_deepep_mode()
 
@@ -2535,6 +2550,13 @@ class DeepEPMoE(FusedMoE):
             if _use_w4a8_masked_hipc
             else torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked
         )
+        overlap_state = self.runner if hasattr(self, "runner") else self
+        down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = getattr(
+            overlap_state, "down_gemm_overlap_args", None
+        )
+        meta_overlap_args: Optional[dict] = getattr(
+            overlap_state, "meta_overlap_args", None
+        )
 
         # ---- first GEMM ----
         grouped_w4a8_op(
@@ -2581,15 +2603,26 @@ class DeepEPMoE(FusedMoE):
             (num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16
         )
 
-        grouped_w4a8_op(
-            q_a2_all,
-            q_a2_scale,
-            w2_weight,
-            w2_scales,
-            down_output,
-            masked_m,
-            expected_m,
-        )
+        if down_gemm_overlap_args is not None:
+            run_hcu_w4a8_hipc(
+                (q_a2_all, q_a2_scale),
+                (w2_weight, w2_scales),
+                down_output,
+                masked_m,
+                expected_m,
+                overlap_args=down_gemm_overlap_args,
+                meta_overlap_args=meta_overlap_args,
+            )
+        else:
+            grouped_w4a8_op(
+                q_a2_all,
+                q_a2_scale,
+                w2_weight,
+                w2_scales,
+                down_output,
+                masked_m,
+                expected_m,
+            )
 
         return down_output
 
@@ -2665,13 +2698,16 @@ class DeepEPMoE(FusedMoE):
         hidden_states, hidden_states_scale, topk_ids, _, masked_m, expected_m = (
             dispatch_output
         )
-        # This HCU low-latency DeepGEMM path predates the MoeRunner refactor.
-        # Its overlap state is therefore stored directly on DeepEPMoE by
-        # FusedMoE.set_overlap_args(), and no ``self.runner`` is constructed.
+        # Match FusedMoE.set_overlap_args()/clear_overlap_args(): modern
+        # layers store overlap state on the runner; legacy layers use self.
+        # Keep the shared metadata object so DeepEP sees the GEMM signal layout.
+        overlap_state = self.runner if hasattr(self, "runner") else self
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = getattr(
-            self, "down_gemm_overlap_args", None
+            overlap_state, "down_gemm_overlap_args", None
         )
-        meta_overlap_args: Optional[dict] = getattr(self, "meta_overlap_args", None)
+        meta_overlap_args: Optional[dict] = getattr(
+            overlap_state, "meta_overlap_args", None
+        )
         assert self.moe_runner_config.activation == "silu"
         # base shapes
         num_groups, m, k = hidden_states.size()
@@ -2692,7 +2728,11 @@ class DeepEPMoE(FusedMoE):
 
         from deepgemm import m_grouped_fp8_gemm_nt_masked
 
-        m_grouped_fp8_gemm_nt_masked(
+        from sglang.srt.layers.moe.hcu_fp8_sbo import run_hcu_fp8_pair32
+
+        pair32 = self._hcu_fp8_pair32
+        grouped_fp8_op = run_hcu_fp8_pair32 if pair32 else m_grouped_fp8_gemm_nt_masked
+        grouped_fp8_op(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scales),
             gateup_output,
@@ -2716,6 +2756,18 @@ class DeepEPMoE(FusedMoE):
         )
 
         enable_overlap = down_gemm_overlap_args is not None
+        if pair32:
+            run_hcu_fp8_pair32(
+                (q_a2_all, q_a2_scale),
+                (w2_weight, w2_scales),
+                down_output,
+                masked_m,
+                expected_m,
+                overlap_args=down_gemm_overlap_args,
+                meta_overlap_args=meta_overlap_args,
+            )
+            return down_output
+
         if enable_overlap:
             raise RuntimeError(
                 "DeepGEMM FP8 does not support down-GEMM completion "

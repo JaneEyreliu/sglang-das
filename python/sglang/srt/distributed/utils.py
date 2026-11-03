@@ -32,6 +32,19 @@ reduce_scatter_single = _reduce_scatter_single
 logger = logging.getLogger(__name__)
 
 
+def is_pp_mtp_prefill(server_args=None) -> bool:
+    """PP speculative execution is limited to EAGLE prefill on the last stage."""
+    if server_args is None:
+        from sglang.srt.runtime_context import get_server_args
+
+        server_args = get_server_args()
+    return (
+        server_args.pp_size > 1
+        and server_args.disaggregation_mode == "prefill"
+        and server_args.speculative_algorithm == "EAGLE"
+    )
+
+
 def set_global_tcp_store(store: TCPStore) -> None:
     """Install the shared TCPStore created during distributed initialization;
     the handle lives on ``ctx.resources``."""
@@ -128,9 +141,19 @@ def get_pp_indices(
                 "Invalid partition string: {}".format(partition_list_str)
             ) from err
         if len(partitions) != pp_size:
-            raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
+            raise ValueError(
+                f"SGLANG_PP_LAYER_PARTITION={partition_list_str!r} has "
+                f"{len(partitions)} entries but pp_size={pp_size}; give exactly one "
+                f"per-stage layer count, or unset it to auto-split evenly."
+            )
         if sum(partitions) != num_hidden_layers:
-            raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
+            raise ValueError(
+                f"SGLANG_PP_LAYER_PARTITION={partition_list_str!r} sums to "
+                f"{sum(partitions)} but the model has num_hidden_layers="
+                f"{num_hidden_layers}; per-stage counts must sum to exactly the "
+                f"transformer-layer count (MTP/nextn layers are not included). "
+                f"Fix or unset the env var."
+            )
         start_layer = sum(partitions[:pp_rank])
         end_layer = start_layer + partitions[pp_rank]
     else:

@@ -63,7 +63,6 @@ from sglang.srt.utils import (
 
 _is_hcu = is_hcu()
 _is_npu = is_npu()
-_is_hcu = is_hcu()
 _use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 
 if TYPE_CHECKING:
@@ -663,6 +662,12 @@ class DeepEPConfig(BaseDispatcherConfig):
 
             assert config_dispatch["num_sms"] == config_combine["num_sms"]
             self.num_sms = config_dispatch["num_sms"]
+            # HCU DeepEP sizes the rocSHMEM context pool (ROCSHMEM_MAX_NUM_CONTEXTS)
+            # from the class-level Buffer.num_sms at Buffer creation, and every
+            # high-throughput kernel workgroup takes one context; keep them in sync
+            # or workgroups beyond the pool run with an invalid (null) ctx.
+            if hasattr(Buffer, "set_num_sms"):
+                Buffer.set_num_sms(self.num_sms)
         else:
             self.normal_dispatch_config = None
             self.normal_combine_config = None
@@ -1425,6 +1430,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         if self._combine_input_ready_event_pending:
             combine_stream.wait_event(self._combine_input_ready_event)
             self._combine_input_ready_event_pending = False
+
+        # The HCU DeepEP API uses comp_signal, without an overlap keyword.
+        if _is_hcu:
+            overlap_args_dict.pop("overlap", None)
 
         with ctx:
             _deepep_precompile_tp_barrier()

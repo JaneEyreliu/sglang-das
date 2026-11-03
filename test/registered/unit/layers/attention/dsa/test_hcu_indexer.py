@@ -147,7 +147,7 @@ class TestHCUDSAIndexerLightOpContracts(CustomTestCase):
             sentinel.block_tables,
             None,
             4096,
-            clean_logits=True,
+            clean_logits=False,
         )
         self.assertIs(ragged_result, sentinel.ragged_logits)
         lightop_attention.mqa_logits.assert_called_once_with(
@@ -157,7 +157,7 @@ class TestHCUDSAIndexerLightOpContracts(CustomTestCase):
             sentinel.ks,
             sentinel.ke,
             kv_scale=sentinel.kv_scale,
-            clean_logit=True,
+            clean_logit=False,
         )
 
     def test_paged_cache_layout_selects_bf16_or_fp8(self):

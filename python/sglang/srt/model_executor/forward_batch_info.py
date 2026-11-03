@@ -608,6 +608,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     seq_lens_cpu: Optional[torch.Tensor] = None
     # Fresh only for non-speculative extend; speculative modes use device slots.
     req_pool_indices_cpu: Optional[torch.Tensor] = None
+    # Runtime host allocation bound for opt-in HYV4 HCU K-only graph dispatch.
+    # Capture-created batches leave this unset; the selected graph variant is
+    # fixed during capture, then chosen anew for each runtime forward.
+    hyv4_dsa_kv_len_upper_bound: Optional[int] = None
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
@@ -839,9 +843,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Whether the forward path may re-plan this batch when its shapes no
     # longer match the plan record. Only mark sites where the forward
     # path's own init_forward_metadata is equivalent to the pre-plan
-    # (same backend object, no special context) may opt in; multi-step
-    # wrapper plans and view-context plans must keep this False — a
-    # forward-path re-plan would clobber their metadata.
+    # (same active backend object) may opt in. Multi-step wrappers may
+    # opt in only if each step can independently rebuild its metadata
+    # from the live batch; other wrapper/view-context plans keep False.
     forward_metadata_replan_equivalent: bool = False
 
     def mark_forward_metadata_ready(self, replan_equivalent: bool = False):
@@ -1110,6 +1114,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
 
+        hyv4_dsa_kv_len_upper_bound = None
+        if envs.SGLANG_HY4_HCU_DSA_SHORT_CONTEXT_K_ONLY.get():
+            from sglang.srt.layers.attention.dsa.hyv4_short_context import (
+                hyv4_short_context_enabled,
+                request_kv_upper_bound,
+            )
+
+            if hyv4_short_context_enabled(
+                model_runner.model_config.hf_config, is_hcu=_is_hcu
+            ):
+                from sglang.srt.mem_cache.allocation_sizing import (
+                    get_alloc_reserve_per_decode,
+                )
+
+                hyv4_dsa_kv_len_upper_bound = request_kv_upper_bound(
+                    batch.reqs, get_alloc_reserve_per_decode()
+                )
+
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
         # (incl. seq_lens_sum) is slated for removal in favor of kv-committed
         # lengths, so this init_new-time backfill onto the ScheduleBatch is
@@ -1142,6 +1164,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if batch.forward_mode.is_extend_without_speculative()
                 else None
             ),
+            hyv4_dsa_kv_len_upper_bound=hyv4_dsa_kv_len_upper_bound,
             orig_seq_lens=batch.orig_seq_lens,
             orig_seq_lens_cpu=(
                 getattr(batch, "orig_seq_lens_cpu", None)

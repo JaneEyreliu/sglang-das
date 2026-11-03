@@ -506,7 +506,12 @@ class ModelRunner:
         )
 
         if get_parallel().pp_size > 1:
-            if not (envs.SGLANG_ENABLE_PP_SPEC.get() and self.is_draft_worker):
+            from sglang.srt.distributed.utils import is_pp_mtp_prefill
+
+            if not (
+                (envs.SGLANG_ENABLE_PP_SPEC.get() or is_pp_mtp_prefill())
+                and self.is_draft_worker
+            ):
                 assert self.support_pp, (
                     "Pipeline Parallel is not compatible with this model."
                 )

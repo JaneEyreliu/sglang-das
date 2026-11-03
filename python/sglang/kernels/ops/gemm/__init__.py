@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import cache
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
@@ -288,6 +290,32 @@ def bmm_fp8(
     )
 
 
+@cache
+def load_hipblaslt_fp8_bmm():
+    """Build once, before graph capture; disabled paths never load HIPBLASLt."""
+    from torch.utils.cpp_extension import load
+
+    source = Path(__file__).resolve().parents[2] / "jit/csrc/gemm/hipblaslt_fp8_bmm.cu"
+    return load(
+        name="sglang_hipblaslt_fp8_bmm",
+        sources=[str(source)],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "-DUSE_ROCM=1"],
+        extra_ldflags=["-lhipblaslt"],
+    )
+
+
+def hipblaslt_fp8_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """FP8 X[T,H,K] @ W[H,V,K], scalar scales, BF16 Out[T,H,V]."""
+    load_hipblaslt_fp8_bmm().bmm(x, weight, x_scale, weight_scale, out)
+
+
 def try_qwen3x_nvfp4_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -333,6 +361,7 @@ __all__ = [
     "dual_gemm_swiglu",
     "dual_gemm_swiglu_fp8",
     "fp8_scaled_mm",
+    "hipblaslt_fp8_bmm",
     "kimi_k3_tiny_gemm",
     "try_qwen3x_nvfp4_gemm",
     "try_sm120_fp8_linear",

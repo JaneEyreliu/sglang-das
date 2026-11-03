@@ -37,6 +37,8 @@ from sglang.srt.layers.dcp import (
     dcp_a2a_lse_reduce,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.layers.dcp.comm import hyv4_dcp2_a2a_reduce
+from sglang.srt.layers.hy4_dcp import Hyv4DcpRawLSE
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
@@ -191,6 +193,8 @@ class DeepseekMLAForwardMixin:
             forward_batch
         ):
             return False
+        if hasattr(self, "prepare_attention_output_gate"):
+            return False
         if not self.use_dsa:
             return False
         if self.use_deep_gemm_bmm:
@@ -321,11 +325,26 @@ class DeepseekMLAForwardMixin:
         # True between the alt-stream fork and its consumption in the born
         # block; also suppresses the duplicate split/rope on that path.
         self._q8kv8_qprep_overlap_pending = False
-        attention_output_gate = (
-            self.prepare_attention_output_gate(hidden_states)
-            if hasattr(self, "prepare_attention_output_gate")
-            else None
-        )
+        # HYV4 gated-MLA g_proj/projection overlap: when enabled, launch the
+        # attention output-gate GEMM (``linear_gate``) on a dedicated side
+        # stream *before* the Q/KV projection GEMMs so it overlaps them (and the
+        # attention core). The join is deferred to ``forward_absorb_core``,
+        # after attn_mqa, which is where sglang applies the gate anyway.
+        attention_output_gate = None
+        if hasattr(self, "prepare_attention_output_gate"):
+            _gate_proj_stream = getattr(self, "gate_proj_stream", None)
+            if _gate_proj_stream is not None:
+                self.gate_proj_start_event.record(torch.cuda.current_stream())
+                with torch.cuda.stream(_gate_proj_stream):
+                    _gate_proj_stream.wait_event(self.gate_proj_start_event)
+                    attention_output_gate = self.prepare_attention_output_gate(
+                        hidden_states
+                    )
+                    self.gate_proj_done_event.record(_gate_proj_stream)
+            else:
+                attention_output_gate = self.prepare_attention_output_gate(
+                    hidden_states
+                )
 
         fuse_bmm_attention = (
             self.q_lora_rank is not None
@@ -348,6 +367,8 @@ class DeepseekMLAForwardMixin:
         q_pe = None
         k_pe = None
         fusion_plan: Optional[MlaBmmFusionPlan] = None
+
+
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -714,7 +735,11 @@ class DeepseekMLAForwardMixin:
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
             if getattr(self, "learnable_sink_param", None) is not None:
-                extra_args["attn_sink"] = self.learnable_sink_param
+                extra_args["attn_sink"] = (
+                    self.get_local_attention_sink()
+                    if hasattr(self, "get_local_attention_sink")
+                    else self.learnable_sink_param
+                )
             if self._fuse_rope_for_trtllm_mla(forward_batch):
                 extra_args.update(
                     cos_sin_cache=self.rotary_emb.cos_sin_cache,
@@ -740,6 +765,8 @@ class DeepseekMLAForwardMixin:
                 attn_output = fusion_plan.attn_output_buf
             elif self.is_dcp_mla_decode_phase(forward_batch):
                 # set return_lse=True to correct attn_output
+                # The DCP sink is applied once to the merged output/LSE (HYV4
+                # wires it through ``hyv4_sink_getter``), never per rank.
                 attn_output, lse = self.attn_mqa_for_dcp_decode(
                     q_nope_out,
                     k_nope,
@@ -747,7 +774,7 @@ class DeepseekMLAForwardMixin:
                     forward_batch,
                     q_rope=q_pe,
                     k_rope=k_pe,
-                    **extra_args,
+                    **{k: v for k, v in extra_args.items() if k != "attn_sink"},
                     **(
                         dict(topk_indices=topk_indices)
                         if topk_indices is not None
@@ -786,8 +813,23 @@ class DeepseekMLAForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
 
+        # A HYV4 raw carrier has natural-log LSE and no local sink correction.
+        if self.is_dcp_mla_decode_phase(forward_batch) and isinstance(
+            lse, Hyv4DcpRawLSE
+        ):
+            if get_in_autotune_dummy_run():
+                attn_output = attn_output.new_zeros(
+                    (lse.num_total_rows, self.num_local_heads, self.kv_lora_rank)
+                )
+            else:
+                attn_output = hyv4_dcp2_a2a_reduce(
+                    attn_output,
+                    lse,
+                    self.get_local_attention_sink(),
+                    get_parallel().dcp_group,
+                )
         # correct attn_output with respect to lse from other ranks
-        if self.is_dcp_mla_decode_phase(forward_batch):
+        elif self.is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * self.dcp_size,
@@ -926,6 +968,12 @@ class DeepseekMLAForwardMixin:
                 self, attn_output, attn_bmm_output
             )
         if attention_output_gate is not None:
+            # Join the g_proj side stream (if the overlap launched the gate
+            # there) now that attention has finished, then apply the gate.
+            _gate_proj_stream = getattr(self, "gate_proj_stream", None)
+            if _gate_proj_stream is not None:
+                torch.cuda.current_stream().wait_event(self.gate_proj_done_event)
+                attention_output_gate.record_stream(torch.cuda.current_stream())
             attn_bmm_output = _apply_attention_output_gate(
                 self, attn_bmm_output, attention_output_gate
             )

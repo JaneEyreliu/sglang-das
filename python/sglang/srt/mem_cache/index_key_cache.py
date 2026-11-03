@@ -15,7 +15,10 @@ if TYPE_CHECKING:
 class IndexKeyCache:
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
         self.pool = pool
-        num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
+        # Draft KV pages span DCP ranks on HCU; packed index-K keeps
+        # physical page-64 rows there.
+        self.page_size = pool.index_row_page_size
+        num_pages = pool.index_num_pages
         with pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(pool.custom_mem_pool)
@@ -35,7 +38,7 @@ class IndexKeyCache:
         pool = self.pool
         return (
             num_pages,
-            pool.page_size
+            self.page_size
             // pool.index_kpool
             * (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
         )
@@ -43,7 +46,7 @@ class IndexKeyCache:
     def _kernel_view(self, buffer: torch.Tensor) -> torch.Tensor:
         pool = self.pool
         kernel_pages_per_row = (
-            pool.page_size // pool.index_kpool // pool.index_page_size
+            self.page_size // pool.index_kpool // pool.index_page_size
         )
         return buffer.view(-1, buffer.shape[1] // kernel_pages_per_row)
 
@@ -57,7 +60,7 @@ class IndexKeyCache:
         if tgt_loc.numel() == 0:
             return
 
-        page_size = self.pool.page_size
+        page_size = self.page_size
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
         tgt_page = tgt_loc_flat // page_size
@@ -137,11 +140,11 @@ class IndexKeyCache:
 
     def cpu_copy(self, indices):
         # Retracted pages may be reused before resume, so offload index-K with KV.
-        page_indices = indices[:: self.pool.page_size] // self.pool.page_size
+        page_indices = indices[:: self.page_size] // self.page_size
         torch.cuda.synchronize()
         index_k_cpu = []
         chunk_size = self.pool.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.pool.page_size)
+        page_chunk_size = max(1, chunk_size // self.page_size)
         for layer_id in range(self.pool.indexer_layer_num):
             index_k_cpu.append([])
             if self.buffer[layer_id].shape[0] == 0:
@@ -156,10 +159,10 @@ class IndexKeyCache:
         return index_k_cpu
 
     def load_cpu_copy(self, index_k_cpu, indices) -> None:
-        page_indices = indices[:: self.pool.page_size] // self.pool.page_size
+        page_indices = indices[:: self.page_size] // self.page_size
         torch.cuda.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.pool.page_size)
+        page_chunk_size = max(1, chunk_size // self.page_size)
         for layer_id in range(self.pool.indexer_layer_num):
             if self.buffer[layer_id].shape[0] == 0:
                 continue

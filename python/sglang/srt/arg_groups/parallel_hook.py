@@ -112,10 +112,13 @@ def handle_context_parallelism(server_args: Any):
                 cfg, model_config.hf_text_config.model_type, model_arch
             ),
         )
+        # HYV4 implements DSA prefill CP split/gather in the model on HCU.
+        hcu_hyv4 = is_hcu() and model_arch == "HYV4ForCausalLM"
         if (
             cfg.enable_prefill_cp
             and get_platform().is_hip
             and model_arch != "DeepseekV4ForCausalLM"
+            and not hcu_hyv4
         ):
             raise ValueError(
                 "Prefill CP on HIP is only supported for "

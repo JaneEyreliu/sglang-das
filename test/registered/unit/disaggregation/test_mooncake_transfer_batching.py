@@ -48,6 +48,13 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         manager._transfer_data = lambda session, blocks: (
             MooncakeKVManager._transfer_data(manager, session, blocks)
         )
+        # The DCP sender ships columns; route them through the (patchable)
+        # block-tuple path so tests can observe transfers in one place.
+        manager._transfer_addrs = lambda mooncake_session_id, src_addrs, dst_addrs, lengths: (
+            manager._transfer_data(
+                mooncake_session_id, list(zip(src_addrs, dst_addrs, lengths))
+            )
+        )
         manager._await_transfer_futures = lambda futures: (
             MooncakeKVManager._await_transfer_futures(manager, futures)
         )
@@ -294,6 +301,12 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                     max_transfer_batch_indices=batch_size,
                     enable_custom_mem_pool=custom_pool,
                     _transfer_data=transfer,
+                    _transfer_addrs=lambda mooncake_session_id, src_addrs, dst_addrs, lengths: (
+                        transfer(
+                            mooncake_session_id,
+                            list(zip(src_addrs, dst_addrs, lengths)),
+                        )
+                    ),
                     _await_transfer_futures=lambda futures: max(
                         f.result() for f in futures
                     ),

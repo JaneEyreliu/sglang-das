@@ -28,6 +28,7 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
     is_deepseek_dsa,
     is_deepseek_v4,
+    is_hy_v4,
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
@@ -48,6 +49,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
+    compute_hcu_dcp_graph_kv_padding_capacity,
     get_minimax_sparse_index_dtype,
 )
 from sglang.srt.mem_cache.page_interleave import compute_page_shard_scratch_bytes
@@ -66,6 +68,7 @@ from sglang.srt.utils.common import (
     ceil_div,
     is_float4_e2m1fn_x2,
     is_hcu,
+    is_hcu_native_fp8_supported,
     is_hip,
     is_npu,
     spec_decode_alloc_len_per_request,
@@ -244,6 +247,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
+        self._fixed_overhead_bytes = self._compute_graph_padding_overhead(
+            kvc, num_layers
+        )
+        if is_hy_v4(kvc.model_config.hf_config):
+            self._fixed_overhead_bytes += self._compute_hyv4_index_padding_overhead(
+                kvc, num_layers
+            )
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None
@@ -317,6 +327,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         allocate_all_layers=True,
                     )
                     if (
+                        _is_hcu
+                        and is_hy_v4(kvc.model_config.hf_config)
+                        and get_parallel().dcp_enabled
+                    ):
+                        # HY4's draft pool stores all allocator virtual slots
+                        # on each rank (_derive_pool_sizes multiplies by DCP),
+                        # including the replicated draft index-K.
+                        draft_kv_size *= dcp_size
+                        draft_indexer_size *= dcp_size
+                    if (
                         get_parallel().enable_dsa_cache_layer_split
                         and get_disagg().disaggregation_mode == "prefill"
                         and is_hcu()
@@ -381,6 +401,89 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=draft_cell_size,
                 )
+
+    def _compute_hyv4_index_padding_overhead(self, kvc, num_layers):
+        # One allocator page is reserved at address zero. Index-K uses global
+        # virtual addresses, so charge DCP physical index pages, not just one.
+        page = kvc.page_size * get_parallel().attn_dcp_size
+        overhead = page * self._compute_dsa_indexer_cell_size(
+            kvc=kvc, num_layers=num_layers
+        )
+        if not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle():
+            draft_layers = int(kvc.spec_aux_config.eagle_draft_num_layers or 0)
+            if draft_layers:
+                overhead += page * self._compute_dsa_indexer_cell_size(
+                    kvc=kvc, num_layers=draft_layers, allocate_all_layers=True
+                )
+        return overhead
+
+    def _compute_graph_padding_overhead(
+        self, kvc: KVCacheConfigurator, num_layers: int
+    ) -> int:
+        """Fixed MLA KV scratch charged outside allocator-visible token slots."""
+        if not (
+            _is_hcu
+            and get_parallel().dcp_enabled
+            and kvc.use_mla_backend
+            and is_deepseek_dsa(kvc.model_config.hf_config)
+            and kvc.spec_algorithm.is_eagle()
+        ):
+            return 0
+
+        graph_config = get_exec().graph.cuda_graph_config.decode
+        page_size = get_schedule().page_size
+        target_capacity = compute_hcu_dcp_graph_kv_padding_capacity(
+            pool_page_size=page_size,
+            page_size=page_size,
+            dcp_enabled=True,
+            is_hcu_platform=True,
+            speculative_algorithm=kvc.server_args.speculative_algorithm,
+            decode_cuda_graph_backend=graph_config.backend,
+            decode_cuda_graph_max_bs=graph_config.max_bs,
+            speculative_num_draft_tokens=max_speculative_num_draft_tokens(),
+        )
+        if target_capacity == page_size:
+            return 0
+
+        from sglang.srt.layers.cp.utils import (
+            get_glm_dsa_layer_split_effective_num_layers,
+        )
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
+        )
+
+        row_bytes = calculate_mla_kv_cache_dim(
+            model_config=kvc.model_config,
+            kv_cache_dtype=kvc.kv_cache_dtype,
+            server_args=kvc.server_args,
+        ) * torch._utils._element_size(kvc.kv_cache_dtype)
+        target_layers = get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
+        overhead = target_capacity * target_layers * row_bytes
+
+        draft_layers = int(kvc.spec_aux_config.eagle_draft_num_layers or 0)
+        draft_capacity = 0
+        if not kvc.is_draft_worker and draft_layers > 0:
+            draft_page_size = page_size * get_parallel().attn_dcp_size
+            draft_capacity = compute_hcu_dcp_graph_kv_padding_capacity(
+                pool_page_size=draft_page_size,
+                page_size=page_size,
+                dcp_enabled=True,
+                is_hcu_platform=True,
+                speculative_algorithm=kvc.server_args.speculative_algorithm,
+                decode_cuda_graph_backend=graph_config.backend,
+                decode_cuda_graph_max_bs=graph_config.max_bs,
+                speculative_num_draft_tokens=max_speculative_num_draft_tokens(),
+            )
+            overhead += draft_capacity * draft_layers * row_bytes
+
+        logger.info(
+            "HCU DCP graph KV padding overhead: target_rows=%d, "
+            "draft_rows=%d, bytes=%d",
+            target_capacity,
+            draft_capacity,
+            overhead,
+        )
+        return overhead
 
     def _compute_cell_size(
         self,
@@ -642,6 +745,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc.kv_cache_dtype,
             kvc.page_size,
             index_head_dim,
+            hcu_device=_is_hcu,
+            native_fp8_supported=is_hcu_native_fp8_supported(),
         )
         index_k_bytes = index_k_cache_bytes_per_token(cache_mode)
         if not _is_hcu:

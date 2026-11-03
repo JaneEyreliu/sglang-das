@@ -33,6 +33,10 @@ from sglang.srt.layers.attention.dsa.forward_batch_utils import (
     effective_forward_mode,
 )
 from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import IndexKCacheMode
+from sglang.srt.layers.attention.dsa.hyv4_short_context import (
+    hyv4_short_context_enabled,
+    select_hyv4_dsa_variant,
+)
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -113,6 +117,7 @@ def _decline_fused(reason: str) -> None:
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_fast_hadamard_transform = get_bool_env_var("SGLANG_USE_FAST_HADAMARD_TRANSFORM")
+_use_tuned_hadamard_transform = get_bool_env_var("HYV4_HADAMARD_TUNING")
 
 if _is_hcu:
     from lightop import attention as lightop_attention
@@ -269,7 +274,9 @@ def _hcu_paged_mqa_logits(
         block_tables,
         schedule_metadata,
         max_seq_len,
-        clean_logits=True,
+        # TopK reads only logits[:, :length]. The -inf fill is a separate
+        # kernel over the full page-table width.
+        clean_logits=False,
     )
 
 
@@ -288,7 +295,9 @@ def _hcu_mqa_logits(
         ks,
         ke,
         kv_scale=kv_scale,
-        clean_logit=True,
+        # TopK only reads [ks, ke). clean_logit writes -inf over the whole
+        # concatenated rectangle and is a separate kernel from the GEMM.
+        clean_logit=False,
     )
 
 
@@ -318,6 +327,15 @@ def rotate_activation(x: torch.Tensor, apply_scale: bool = True) -> torch.Tensor
         "Hidden size must be a power of 2 for Hadamard transform."
     )
     scale = hidden_size**-0.5 if apply_scale else 1.0
+    if (
+        _is_hcu
+        and _use_tuned_hadamard_transform
+        and hidden_size == 128
+        and x.dtype == torch.bfloat16
+    ):
+        from sglang.srt.layers.hyv4_tuned_hadamard import hadamard128
+
+        return hadamard128(x, scale=scale)
     if _is_hcu and _use_fast_hadamard_transform:
         return hcu_fast_hadamard_transform(x, scale=scale)
     if _is_hcu:
@@ -373,6 +391,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             "glm5v_next",
             "glm5next_text",
             "glm5_next_text",
+        )
+        self.hyv4_short_context_k_only = hyv4_short_context_enabled(
+            config, is_hcu=_is_hcu
         )
         self.use_dsa_indexer_fusion = (
             not self.glm5_next_fp32_head_gates
@@ -1027,7 +1048,36 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
         if _is_hcu:
-            return False
+            # A separate HCU K-only path preserves the exact LightOp K norm /
+            # RoPE / Hadamard representation. FP8 and prefill-CP stay on their
+            # existing paths; this opt-in targets the HYV4 BF16/INT8 index cache.
+            mode = effective_forward_mode(forward_batch)
+            if (
+                not self.hyv4_short_context_k_only
+                or self.dsa_enable_prefill_cp
+                or forward_batch.attn_cp_metadata is not None
+                or not self._use_hcu_bf16_indexer_compute(get_token_to_kv_pool())
+                or not (
+                    mode.is_decode_or_idle()
+                    or mode.is_target_verify()
+                    or mode.is_draft_extend_v2()
+                )
+            ):
+                return False
+            if get_is_capture_mode():
+                from sglang.srt.model_executor.runner_utils.capture_mode import (
+                    get_capture_attention_variant,
+                )
+
+                return get_capture_attention_variant() == DSA_DENSE
+            return select_hyv4_dsa_variant(
+                forward_batch,
+                self.index_topk,
+                extra_tokens=max(
+                    int(getattr(forward_batch.spec_info, "num_tokens_per_req", 1) or 1),
+                    1,
+                ),
+            ) == "dense"
 
         # topk_transform selects every valid page slot when kv_len <= index_topk;
         # logits are unnecessary in that case.
@@ -1452,9 +1502,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         packed_cache = self._get_index_k_read_buffer(pool, layer_id)
         assert packed_cache.dtype == torch.uint8
         assert packed_cache.dim() == 2
-        assert packed_cache.shape[1] == pool.page_size * (self.head_dim + 4)
+        assert packed_cache.shape[1] == pool.index_page_size * (self.head_dim + 4)
         return packed_cache.view(torch.int8).view(
-            packed_cache.shape[0], pool.page_size, 1, self.head_dim + 4
+            packed_cache.shape[0], pool.index_page_size, 1, self.head_dim + 4
         )
 
     def _prepare_hcu_int8_paged_query(
@@ -1707,7 +1757,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     else metadata.get_dsa_extend_len_cpu()
                 ),
             )
+            if sparse_route is not None and not hasattr(
+                self, "_hcu_sparse_mqa_hit_logged"
+            ):
+                logger.info(
+                    "DSA HCU sparse Page-MQA group_size=%s", sparse_route.group_size
+                )
+                self._hcu_sparse_mqa_hit_logged = True
             if sparse_route is None:
+                if use_mask_topk and not hasattr(self, "_hcu_sparse_mqa_skip_logged"):
+                    logger.info(
+                        "DSA HCU sparse Page-MQA not selected, using dense paged MQA"
+                    )
+                    self._hcu_sparse_mqa_skip_logged = True
                 logits = _hcu_paged_mqa_logits(
                     paged_q,
                     kv_cache,
@@ -1935,18 +1997,118 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and logits_bytes <= configured_budget_bytes
         ):
             return False, configured_budget_bytes
-        free_mem, total_mem = mqa_logits_free_mem_bytes(
-            device_index, include_reusable_cache=True
-        )
-        logits_budget_bytes = max(
-            1,
-            min(
-                configured_budget_bytes,
-                free_mem // 2,
-                int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION),
-            ),
-        )
+        # mem_get_info / memory_stats sync the device. A packed prefill
+        # calls this once per layer, so cache the first large-batch result.
+        logits_budget_bytes = self._mqa_logits_budget_bytes.get(device_index)
+        if logits_budget_bytes is None:
+            free_mem, total_mem = mqa_logits_free_mem_bytes(
+                device_index, include_reusable_cache=True
+            )
+            logits_budget_bytes = max(
+                1,
+                min(
+                    configured_budget_bytes,
+                    free_mem // 2,
+                    int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION),
+                ),
+            )
+            self._mqa_logits_budget_bytes[device_index] = logits_budget_bytes
+            logger.info(
+                "DSA mqa logits budget cached at %.2f GiB (configured %.2f GiB)",
+                logits_budget_bytes / (1024**3),
+                configured_budget_bytes / (1024**3),
+            )
         return logits_bytes > logits_budget_bytes, logits_budget_bytes
+
+    def _hcu_request_spans(self, metadata, q_offset: int):
+        """Local Q span and concatenated-K span for each request.
+
+        CP round-robin keeps each request's local rows contiguous. The HCU
+        kernel grids over the whole K tensor, so one kernel per request avoids
+        scanning other requests' K. Returns None when the spans do not cover
+        ``q_offset`` exactly.
+        """
+        cached = getattr(metadata, "_hcu_request_spans", None)
+        if cached is not None and cached[0] == q_offset:
+            return cached[1]
+        extend_lens = list(metadata.get_dsa_extend_len_cpu())
+        seq_lens = metadata.get_indexer_seq_len_cpu()
+        if torch.is_tensor(seq_lens):
+            seq_lens = seq_lens.tolist()
+        if len(extend_lens) != len(seq_lens):
+            return None
+        spans = []
+        q_cursor = 0
+        k_base = 0
+        for q_len, k_len in zip(extend_lens, seq_lens):
+            q_len = int(q_len)
+            k_len = int(k_len)
+            if q_len < 0 or k_len < 0:
+                return None
+            spans.append((q_cursor, q_cursor + q_len, k_base, k_len))
+            q_cursor += q_len
+            k_base += k_len
+        if q_cursor != q_offset or len(spans) <= 1:
+            return None
+        object.__setattr__(metadata, "_hcu_request_spans", (q_offset, spans))
+        return spans
+
+    def _get_topk_ragged_hcu_sliced(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        topk_result: torch.Tensor,
+        ke: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        q_offset = ke.shape[0]
+        spans = self._hcu_request_spans(metadata, q_offset)
+        if not spans:
+            if not getattr(self, "_hcu_req_mqa_skip_logged", False):
+                logger.info("DSA HCU per-request mqa skipped")
+                self._hcu_req_mqa_skip_logged = True
+            return None
+        budget = self._mqa_logits_budget_bytes.get(ke.device.index, 0)
+        if budget <= 0:
+            budget = 8 * (1024**3)
+        elem = self._MQA_LOGITS_BYTES_PER_ELEM
+        for start, end, _k_base, k_len in spans:
+            if (end - start) * k_len * elem > budget:
+                return None
+        device = q_fp8.device
+        if not getattr(self, "_hcu_req_mqa_logged", False):
+            logger.info("DSA HCU per-request mqa requests=%s", len(spans))
+            self._hcu_req_mqa_logged = True
+        for start, end, k_base, k_len in spans:
+            if end == start or k_len <= 0:
+                continue
+            scale = k_scale[k_base : k_base + k_len]
+            if scale.data_ptr() % 16 != 0:
+                scale = scale.clone()
+            n_rows = end - start
+            rel_ke = (ke[start:end] - k_base).to(torch.int32)
+            local_ks = torch.zeros(n_rows, dtype=torch.int32, device=device)
+            offset = local_ks.new_full((n_rows,), k_base)
+            with self._with_real_sm_count():
+                logits = _hcu_mqa_logits(
+                    q_fp8[start:end],
+                    k_fp8[k_base : k_base + k_len],
+                    weights[start:end],
+                    local_ks,
+                    rel_ke,
+                    kv_scale=scale,
+                )
+            self._mask_init_and_local_tokens(logits, rel_ke)
+            topk_result[start:end] = metadata.topk_transform(
+                logits,
+                self.index_topk,
+                ks=local_ks,
+                ke_offset=rel_ke,
+                topk_indices_offset_override=offset,
+            )
+        return topk_result
 
     def _get_topk_ragged(
         self,
@@ -2052,6 +2214,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 k_fp8 = k_fp8.view(torch.float8_e4m3fn)
 
             k_scale = k_scale.view(torch.float32).squeeze(-1)
+            if _is_hcu:
+                sliced = self._get_topk_ragged_hcu_sliced(
+                    q_fp8=q_fp8,
+                    weights=weights,
+                    metadata=metadata,
+                    topk_result=topk_result,
+                    ke=ke,
+                    k_fp8=k_fp8,
+                    k_scale=k_scale,
+                )
+                if sliced is not None:
+                    return sliced
             kv_fp8 = (k_fp8, k_scale)
             k_offset = k_fp8.shape[0]
 
@@ -2248,6 +2422,58 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         return topk_result
 
+    def _get_hcu_k_only_bf16(
+        self, x: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        key, _ = self.wk(x)
+        key = key.view(key.shape[0], -1, self.head_dim)
+        # LightOp's split launcher derives the Q grid from the head count. Zero
+        # Q heads launch only K blocks, running the exact same K arithmetic as
+        # _get_q_k_bf16 (including its BF16 rounding). Do not substitute generic
+        # LayerNorm/RoPE: cache differences would survive the 2048 transition.
+        empty_query = key.new_empty((key.shape[0], 0, self.head_dim))
+        lightop_attention.fuse_layernorm_rotary_embedding(
+            positions,
+            empty_query,
+            key,
+            self.head_dim,
+            self._indexer_cos_sin_cache,
+            False,
+            None,
+            None,
+            self.k_norm.weight,
+            getattr(self.k_norm, "bias", None),
+            None,
+            None,
+            self.k_norm.variance_epsilon,
+        )
+        return rotate_activation(key)
+
+    def _forward_hcu_k_only(
+        self, x, positions, forward_batch, layer_id, metadata, return_indices
+    ):
+        from sglang.kernels.ops.attention.dsa.short_context import logical_select_all
+
+        # Empty eager/idle batches must not reach LightOp's host launcher,
+        # which divides query.numel() by positions.numel(). Captured padded
+        # idle batches have nonzero static rows and follow the normal path.
+        x_meta = x[0] if isinstance(x, tuple) else x
+        if positions.numel() == 0 or x_meta.shape[0] == 0:
+            return (
+                logical_select_all(metadata.get_seqlens_expanded(), self.index_topk)
+                if return_indices
+                else None
+            )
+        key = self._get_hcu_k_only_bf16(x, positions)
+        # Index-K must be populated even while logits are skipped: a subsequent
+        # longer-context sparse graph consumes the entire historical K cache.
+        self._store_index_k_cache(
+            forward_batch=forward_batch, layer_id=layer_id, key=key
+        )
+        if not return_indices:
+            return None
+        return logical_select_all(metadata.get_seqlens_expanded(), self.index_topk)
+
     def _forward_cuda_k_only(
         self,
         x: torch.Tensor,
@@ -2363,7 +2589,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = getattr(pool, "index_page_size", pool.page_size)
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
@@ -2758,18 +2984,31 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             skip_logits_computation = self._should_skip_logits_computation(
                 forward_batch
             )
+            if _is_hcu and skip_logits_computation:
+                # The shared HYV4 TopK state carries logical IDs. If another
+                # configuration requests physically transformed TopK, keep its
+                # established full path instead of changing this contract.
+                skip_logits_computation = (
+                    getattr(metadata, "force_unfused_topk", False)
+                    or not envs.SGLANG_DSA_FUSE_TOPK.get()
+                )
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.dsa_enable_prefill_cp):
-            topk_result = self._forward_cuda_k_only(
-                x,
-                positions,
-                forward_batch,
-                layer_id,
-                act_quant,
-                metadata,
-                return_indices,
-            )
+            if _is_hcu:
+                topk_result = self._forward_hcu_k_only(
+                    x, positions, forward_batch, layer_id, metadata, return_indices
+                )
+            else:
+                topk_result = self._forward_cuda_k_only(
+                    x,
+                    positions,
+                    forward_batch,
+                    layer_id,
+                    act_quant,
+                    metadata,
+                    return_indices,
+                )
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return maybe_capture_indexer_topk(layer_id, topk_result)
 

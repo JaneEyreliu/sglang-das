@@ -42,6 +42,8 @@ from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
+    group_concurrent_contiguous_runs,
+    localize_num_kv_tokens_for_page_slice,
     pack_int_lists,
     pack_string_list,
     unpack_int_lists,
@@ -1291,6 +1293,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 return False, mismatch
         return fully_checked, None
 
+    def _transfer_addrs(
+        self,
+        mooncake_session_id: str,
+        src_addrs: List[int],
+        dst_addrs: List[int],
+        lengths: List[int],
+    ) -> int:
+        # Column-wise twin of _transfer_data; skips the per-block tuple round trip.
+        if not src_addrs:
+            return 0
+
+        return self.engine.batch_transfer_sync(
+            mooncake_session_id, src_addrs, dst_addrs, lengths
+        )
+
     def _send_kvcache_generic(
         self,
         mooncake_session_id: str,
@@ -1777,7 +1794,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         layers_params = []
         if src_token_indices.size:
-            target_groups = group_concurrent_contiguous(
+            target_groups = group_concurrent_contiguous_runs(
                 src_token_indices,
                 plan.target_dst_token_indices,
             )
@@ -1800,7 +1817,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 raise ValueError(
                     "PD DCP with different draft TP sizes requires destination KV lengths"
                 )
-            draft_groups = group_concurrent_contiguous(
+            draft_groups = group_concurrent_contiguous_runs(
                 plan.draft_src_token_indices,
                 plan.draft_dst_token_indices,
             )
@@ -1876,7 +1893,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 sliced_draft_params.extend(draft_to_pack)
             else:
                 packed_ptrs, packed_indices = packed
-                packed_groups = group_concurrent_contiguous(
+                packed_groups = group_concurrent_contiguous_runs(
                     packed_indices, plan.draft_dst_token_indices
                 )
                 layers_params.extend(
@@ -1904,25 +1921,29 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     return ret
             return 0
 
+        # DCP strides the source tokens, so runs are ~1 token long; array ops here,
+        # as a per-run Python loop holds the GIL ~60 ms per chunk (16k tokens, DCP 2).
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, token_item_len: int, groups
-        ) -> List[Tuple[int, int, int]]:
-            src_groups, dst_groups = groups
-            return [
-                (
-                    src_ptr + int(src_group[0]) * token_item_len,
-                    dst_ptr + int(dst_group[0]) * token_item_len,
-                    len(src_group) * token_item_len,
-                )
-                for src_group, dst_group in zip(src_groups, dst_groups)
-            ]
+        ) -> Tuple[List[int], List[int], List[int]]:
+            src_starts, dst_starts, run_lens = groups
+            return (
+                (src_ptr + src_starts * token_item_len).tolist(),
+                (dst_ptr + dst_starts * token_item_len).tolist(),
+                (run_lens * token_item_len).tolist(),
+            )
 
         def process_layer(
             src_ptr: int, dst_ptr: int, token_item_len: int, groups
         ) -> int:
-            return self._transfer_data(
-                mooncake_session_id,
-                set_transfer_blocks(src_ptr, dst_ptr, token_item_len, groups),
+            src_addrs, dst_addrs, lengths = set_transfer_blocks(
+                src_ptr, dst_ptr, token_item_len, groups
+            )
+            return self._transfer_addrs(
+                mooncake_session_id=mooncake_session_id,
+                src_addrs=src_addrs,
+                dst_addrs=dst_addrs,
+                lengths=lengths,
             )
 
         if self.enable_custom_mem_pool:
@@ -1940,10 +1961,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if pack_buffer is not None:
                     concurrent.futures.wait(futures)
 
-        transfer_blocks = []
+        src_addrs: List[int] = []
+        dst_addrs: List[int] = []
+        lengths: List[int] = []
         for layer_params in layers_params:
-            transfer_blocks.extend(set_transfer_blocks(*layer_params))
-        ret = self._transfer_data(mooncake_session_id, transfer_blocks)
+            layer_src, layer_dst, layer_lengths = set_transfer_blocks(*layer_params)
+            src_addrs += layer_src
+            dst_addrs += layer_dst
+            lengths += layer_lengths
+        ret = self._transfer_addrs(
+            mooncake_session_id=mooncake_session_id,
+            src_addrs=src_addrs,
+            dst_addrs=dst_addrs,
+            lengths=lengths,
+        )
         if ret != 0 or not sliced_draft_params:
             return ret
         return process_sliced_draft(sliced_draft_params)
@@ -4270,12 +4301,21 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
     ):
+        original_page_start = self.curr_idx
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
         if should_skip:
             self._source_event = None
             return
+
+        num_kv_tokens = localize_num_kv_tokens_for_page_slice(
+            num_kv_tokens,
+            original_page_start=original_page_start,
+            sliced_page_start=index_slice.start or 0,
+            sliced_page_count=len(kv_indices),
+            physical_page_size=self.kv_mgr.kv_args.page_size,
+        )
 
         pd_hidden_chunk_meta = self._pd_hidden_chunk_meta
         self._pd_hidden_chunk_meta = None

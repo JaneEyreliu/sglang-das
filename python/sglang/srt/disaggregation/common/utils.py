@@ -259,6 +259,29 @@ def group_concurrent_contiguous(
     return src_groups, dst_groups
 
 
+def group_concurrent_contiguous_runs(
+    src_indices: npt.NDArray[np.integer], dst_indices: npt.NDArray[np.integer]
+) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """Same runs as group_concurrent_contiguous, as (src_starts, dst_starts, lengths)."""
+    # int64: callers scale these by byte item lengths, which overflows int32.
+    src = np.asarray(src_indices, dtype=np.int64)
+    dst = np.asarray(dst_indices, dtype=np.int64)
+    if src.size == 0 or dst.size == 0:
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty.copy(), empty.copy()
+
+    if src.size != dst.size:
+        raise ValueError(
+            "group_concurrent_contiguous_runs requires equal-length src/dst index "
+            f"arrays, got {src.size} and {dst.size}"
+        )
+
+    is_run_start = np.ones(src.size, dtype=bool)
+    is_run_start[1:] = (np.diff(src) != 1) | (np.diff(dst) != 1)
+    run_starts = np.flatnonzero(is_run_start)
+    return src[run_starts], dst[run_starts], np.diff(run_starts, append=src.size)
+
+
 @dataclasses.dataclass(frozen=True)
 class DCPTokenTransferPlan:
     target_src_token_indices: npt.NDArray[np.int64]
@@ -271,6 +294,42 @@ class DCPTokenTransferPlan:
             self.target_src_token_indices.size == 0
             and self.draft_src_token_indices.size == 0
         )
+
+
+def localize_num_kv_tokens_for_page_slice(
+    num_kv_tokens: Optional[int],
+    *,
+    original_page_start: int,
+    sliced_page_start: int,
+    sliced_page_count: int,
+    physical_page_size: int,
+) -> Optional[int]:
+    """Return the valid-token count after a contiguous page slice.
+
+    ``num_kv_tokens`` describes the unfiltered chunk beginning at
+    ``original_page_start``. Prefill context parallelism can give each CP rank
+    only a sub-slice of those pages. The DCP relayout plan consumes a token
+    count relative to that sub-slice, so forwarding the original count can
+    exceed the local source capacity (and, for the ragged tail, copy invalid
+    token rows).
+    """
+    if num_kv_tokens is None:
+        return None
+    if num_kv_tokens < 0:
+        raise ValueError(f"num_kv_tokens must be non-negative, got {num_kv_tokens}")
+    if sliced_page_start < original_page_start:
+        raise ValueError(
+            "sliced_page_start must not precede original_page_start, "
+            f"got {sliced_page_start} < {original_page_start}"
+        )
+    if sliced_page_count < 0:
+        raise ValueError(
+            f"sliced_page_count must be non-negative, got {sliced_page_count}"
+        )
+
+    skipped_tokens = (sliced_page_start - original_page_start) * physical_page_size
+    sliced_capacity = sliced_page_count * physical_page_size
+    return max(0, min(num_kv_tokens - skipped_tokens, sliced_capacity))
 
 
 def build_dcp_token_transfer_plan(

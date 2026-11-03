@@ -851,6 +851,13 @@ class DeepseekV2WeightLoaderMixin:
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
+            if _is_hcu and hasattr(self_attn, "prepare_attention_output_gate"):
+                from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm import (
+                    prepare_hy4_fp8_v_up_proj,
+                )
+
+                prepare_hy4_fp8_v_up_proj(self_attn)
+
     @classmethod
     def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):
         """

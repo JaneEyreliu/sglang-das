@@ -363,12 +363,9 @@ class TpModelWorker(BaseTpWorker):
             self.random_seed = random_seed
         elif get_exec().moe.is_ep_joiner:
             self.random_seed = get_device().random_seed
-        elif (
-            envs.SGLANG_ENABLE_PP_SPEC.get()
-            and is_draft_worker
-            and get_parallel().pp_size > 1
-        ):
-            # PP+spec: the draft worker exists only on the last PP stage, so a
+        elif is_draft_worker and get_parallel().pp_size > 1:
+            # PP+spec (SGLANG_ENABLE_PP_SPEC or PD-prefill MTP): the draft
+            # worker exists only on the last PP stage, so a
             # world-group broadcast here would deadlock (first-stage ranks never
             # join). Sync within the stage's TP group instead — that is exactly
             # the set of ranks holding a draft worker. The draft worker is

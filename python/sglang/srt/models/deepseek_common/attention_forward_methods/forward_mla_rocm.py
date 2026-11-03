@@ -17,6 +17,7 @@ import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
+    per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.environ import envs
@@ -34,6 +35,9 @@ from sglang.srt.layers.fused_rms_quant import (
     supports_fused_mla_qkv_a_rms_quant_input,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.layers.dcp.comm import hyv4_dcp2_a2a_reduce
+from sglang.srt.layers.hy4_dcp import Hyv4DcpRawLSE
+from sglang.srt.layers.hyv4_gate_a2a_overlap import DeferredHyv4Gate
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
     emit_transposed_bpreshuffle_scale,
@@ -260,11 +264,53 @@ def rocm_absorb_q_bmm(
     return q_nope_out
 
 
+def prepare_hy4_fp8_v_up_proj(attn: DeepseekV2AttentionMLA) -> None:
+    """Keep BF16 MLA weights; prepare a separate FP8 V-only copy after loading."""
+    attn.use_hipblaslt_fp8_v_up_proj = envs.SGLANG_HY4_FP8_V_UP_PROJ.get()
+    if not attn.use_hipblaslt_fp8_v_up_proj:
+        return
+    if (
+        not _is_hcu
+        or attn.w_vc.dtype != torch.bfloat16
+        or attn.use_deep_gemm_bmm
+        or _use_aiter_gfx95
+    ):
+        raise ValueError(
+            "HY4 FP8 V projection requires HCU BF16 MLA weights "
+            "without AITER/DeepGEMM BMM"
+        )
+
+    from sglang.kernels.ops.gemm import load_hipblaslt_fp8_bmm
+    from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+
+    load_hipblaslt_fp8_bmm()
+    # Existing w_vc is [H,K,V]. BLASLt's TN path consumes contiguous [H,V,K].
+    weight = _absorb_weight_bf16(attn.w_vc, attn.w_scale).transpose(1, 2).contiguous()
+    attn.w_vc_fp8, attn.w_vc_fp8_scale = input_to_float8(weight, dtype=fp8_dtype)
+
+
 def rocm_absorb_v_bmm(
     attn: DeepseekV2AttentionMLA,
     attn_output: torch.Tensor,
 ) -> torch.Tensor:
     """Absorb ``attn_output @ w_vc`` (+ optional fused flatten quant) on HIP."""
+    if getattr(attn, "use_hipblaslt_fp8_v_up_proj", False):
+        from sglang.kernels.ops.gemm import hipblaslt_fp8_bmm
+
+        if attn_output.dtype != torch.bfloat16:
+            raise ValueError("HY4 FP8 V projection requires BF16 activations")
+        output = attn_output.new_empty(
+            (attn_output.shape[0], attn.num_local_heads, attn.v_head_dim)
+        )
+        if attn_output.shape[0] == 0:
+            return output.flatten(1, 2)
+        # The MLA quantizer accepts contiguous 3D data; its scalar scale covers
+        # all tokens and heads. Keep token-major layout for the native BMM.
+        scale = torch.zeros(1, dtype=torch.float32, device=attn_output.device)
+        quant, scale = per_tensor_quant_mla_fp8(attn_output.contiguous(), scale)
+        hipblaslt_fp8_bmm(quant, attn.w_vc_fp8, scale, attn.w_vc_fp8_scale, output)
+        return output.flatten(1, 2)
+
     # TODO(haishaw): add bmm_fp8 to ROCm
     if _use_aiter_gfx95 and attn.w_vc.dtype == torch.uint8:
         x = attn_output.transpose(0, 1)
@@ -355,6 +401,12 @@ def rocm_absorb_v_bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
                 _absorb_weight_bf16(attn.w_vc, attn.w_scale),
             )
+
+    if hasattr(attn, "prepare_attention_output_gate"):
+        return (
+            _bmm_buf.flatten(1, 2) if _bmm_buf is not None
+            else attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        )
 
     if _bmm_buf is not None:
         # _bmm_buf is already (batch, heads, dim) contiguous
@@ -563,11 +615,6 @@ class DeepseekMLARocmForwardMixin:
     ):
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
-        attention_output_gate = (
-            self.prepare_attention_output_gate(hidden_states)
-            if hasattr(self, "prepare_attention_output_gate")
-            else None
-        )
         q_replicate_active = (
             self.is_dcp_q_replicate_phase(forward_batch)
             and not self.use_deep_gemm_bmm
@@ -577,6 +624,49 @@ class DeepseekMLARocmForwardMixin:
         q_lora = None
         q_input_quant_args = None
         topk_indices = None
+
+        # HYV4 gated-MLA g_proj/projection overlap: launch ``linear_gate`` on a
+        # dedicated side stream before the Q/KV projections so it overlaps them
+        # (and the attention core). Joined in ``forward_absorb_rocm_core``.
+        _gate_proj_stream = getattr(self, "gate_proj_stream", None)
+        _gate_proj_overlap = _gate_proj_stream is not None and hasattr(
+            self, "prepare_attention_output_gate"
+        )
+        gate_a2a_enabled = getattr(self, "_hyv4_gate_a2a_enabled", False)
+        deferred_gate = None
+        if (
+            gate_a2a_enabled
+            and not _gate_proj_overlap
+            and self.use_dsa
+            and self.is_dcp_mla_decode_phase(forward_batch)
+            and not get_in_autotune_dummy_run()
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] > 0
+            and (
+                self._hyv4_gate_a2a_max_tokens == 0
+                or hidden_states.shape[0] <= self._hyv4_gate_a2a_max_tokens
+            )
+            and hidden_states.dtype == torch.bfloat16
+            and self.linear_gate.weight.dtype == torch.bfloat16
+            and type(self.linear_gate.quant_method).__name__ == "UnquantizedLinearMethod"
+        ):
+            deferred_gate = DeferredHyv4Gate(
+                hidden_states,
+                self.prepare_attention_output_gate,
+                self._hyv4_gate_a2a_state,
+            )
+        attention_output_gate = None
+        if _gate_proj_overlap:
+            self.gate_proj_start_event.record(torch.cuda.current_stream())
+            with torch.cuda.stream(_gate_proj_stream):
+                _gate_proj_stream.wait_event(self.gate_proj_start_event)
+                attention_output_gate = self.prepare_attention_output_gate(
+                    hidden_states
+                )
+                self.gate_proj_done_event.record(_gate_proj_stream)
+        elif deferred_gate is None and hasattr(self, "prepare_attention_output_gate"):
+            attention_output_gate = self.prepare_attention_output_gate(hidden_states)
+
         if self.q_lora_rank is not None:
             qkv_latent = get_attn_tp_context().fetch_qkv_latent()
             q_input_quant_args = None
@@ -617,10 +707,16 @@ class DeepseekMLARocmForwardMixin:
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
-            # overlap qk norm
+            # overlap qk norm. Skipped on HCU: the two norms are only ~10us at
+            # decode sizes while each graph cross-stream dependency costs ~12us,
+            # so the fork/join serializes them and adds ~25us per layer.
             if use_hcu_norm_quant:
                 pass  # Both normalized views were written into packed qkv_latent.
-            elif self.alt_stream is not None and get_is_capture_mode():
+            elif (
+                self.alt_stream is not None
+                and get_is_capture_mode()
+                and not _is_hcu
+            ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -938,7 +1034,11 @@ class DeepseekMLARocmForwardMixin:
             # Only models that own the MLA output gate (currently HYV4) emit
             # this extra slot, so every other caller keeps the 10-tuple.
             *(
-                (attention_output_gate,)
+                (
+                    deferred_gate
+                    if deferred_gate is not None
+                    else attention_output_gate,
+                )
                 if hasattr(self, "prepare_attention_output_gate")
                 else ()
             ),
@@ -958,11 +1058,26 @@ class DeepseekMLARocmForwardMixin:
         q_nope_unabsorbed=None,
         attention_output_gate: Optional[torch.Tensor] = None,
     ):
+        # Keep the existing tuple arity. Only the opt-in HYV4 path carries a
+        # deferred value; no input/result state is stored on the layer.
+        deferred_gate = (
+            attention_output_gate
+            if isinstance(attention_output_gate, DeferredHyv4Gate)
+            else None
+        )
+        if deferred_gate is not None:
+            attention_output_gate = None
         save_kv_cache = True
         # HYV4 carries a per-head learnable attention sink logit that the
         # sparse backend folds into the softmax denominator.
         sink_args = (
-            dict(attn_sink=self.learnable_sink_param)
+            dict(
+                attn_sink=(
+                    self.get_local_attention_sink()
+                    if hasattr(self, "get_local_attention_sink")
+                    else self.learnable_sink_param
+                )
+            )
             if getattr(self, "learnable_sink_param", None) is not None
             else {}
         )
@@ -1042,6 +1157,8 @@ class DeepseekMLARocmForwardMixin:
                             else {}
                         ),
                     )
+                    if self.is_dcp_mla_decode_phase(forward_batch):
+                        attn_output, lse = attn_output
             else:
                 extra_args = {}
                 if self._fuse_rope_for_trtllm_mla(forward_batch):
@@ -1168,8 +1285,72 @@ class DeepseekMLARocmForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
 
+        # The raw carrier explicitly selects natural-log LSE with a deferred
+        # sink. Never feed it through the generic backend-name LSE inference.
+        if self.is_dcp_mla_decode_phase(forward_batch) and isinstance(
+            lse, Hyv4DcpRawLSE
+        ):
+            if get_in_autotune_dummy_run():
+                attn_output = attn_output.new_zeros(
+                    (lse.num_total_rows, self.num_local_heads, self.kv_lora_rank)
+                )
+            else:
+                project_weight = None
+                gate_dtype = (
+                    deferred_gate.dtype
+                    if deferred_gate is not None
+                    else (
+                        attention_output_gate.dtype
+                        if attention_output_gate is not None
+                        else None
+                    )
+                )
+                if (
+                    envs.SGLANG_HY4_DCP2_FUSED_VPROJ.get()
+                    and not getattr(self, "use_hipblaslt_fp8_v_up_proj", False)
+                    and not self.use_deep_gemm_bmm
+                    and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                    and not is_kv_b_lora_active(self)
+                    and gate_dtype == torch.bfloat16
+                    and self.w_vc.dtype == torch.bfloat16
+                    and isinstance(self.w_scale, (int, float))
+                    and self.w_scale == 1
+                    and self.kv_lora_rank == 512
+                    and self.v_head_dim == 256
+                    and self.num_local_heads in (16, 32)
+                    and self.num_local_heads * get_parallel().attn_dcp_size == 64
+                    # B64 regressed versus rocBLAS in graph microbenchmarks;
+                    # retain the bounded gfx936 buckets for DCP2 and DCP4.
+                    and lse.num_total_rows in (1, 2, 4, 8, 16, 32)
+                    and getattr(
+                        torch.cuda.get_device_properties(attn_output.device),
+                        "gcnArchName",
+                        "",
+                    ).startswith("gfx936")
+                ):
+                    project_weight = self.w_vc
+                attn_output = hyv4_dcp2_a2a_reduce(
+                    attn_output,
+                    lse,
+                    self.get_local_attention_sink(),
+                    get_parallel().dcp_group,
+                    w_vc=project_weight,
+                    gate=attention_output_gate if project_weight is not None else None,
+                    **(
+                        {"deferred_gate": deferred_gate}
+                        if deferred_gate is not None
+                        else {}
+                    ),
+                )
+                if project_weight is not None:
+                    # Projection and gate are already applied by the receive
+                    # kernel. Preserve the normal TopK carry contract below.
+                    output, _ = self.o_proj(attn_output)
+                    if self.next_skip_topk is None:
+                        return output
+                    return output, topk_indices if self.next_skip_topk else None
         # correct attn_output with respect to lse from other ranks
-        if self.is_dcp_mla_decode_phase(forward_batch):
+        elif self.is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * self.dcp_size,
@@ -1204,6 +1385,9 @@ class DeepseekMLARocmForwardMixin:
                         is_lse_base_on_e=is_lse_base_on_e,
                     )
                     attn_output = attn_output.transpose(0, 1)
+        if deferred_gate is not None:
+            attention_output_gate = deferred_gate.resolve()
+
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None
@@ -1254,6 +1438,12 @@ class DeepseekMLARocmForwardMixin:
                 self, attn_output, attn_bmm_output
             )
         if attention_output_gate is not None:
+            # Join the g_proj side stream (if the overlap launched the gate
+            # there) now that attention has finished, then apply the gate.
+            _gate_proj_stream = getattr(self, "gate_proj_stream", None)
+            if _gate_proj_stream is not None:
+                torch.cuda.current_stream().wait_event(self.gate_proj_done_event)
+                attention_output_gate.record_stream(torch.cuda.current_stream())
             attn_bmm_output = _apply_attention_output_gate(
                 self, attn_bmm_output, attention_output_gate
             )

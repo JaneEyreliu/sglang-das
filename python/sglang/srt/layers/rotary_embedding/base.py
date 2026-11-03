@@ -586,17 +586,21 @@ class RotaryEmbedding(BaseFusedOp):
                 )
                 if _is_hip:
                     self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+                    # HIP keeps the fp32 master for QSA; this kernel needs
+                    # cos_sin_cache in the query dtype.
+                    cos_sin_cache = self.cos_sin_cache_as(query.dtype)
                 else:
                     self.cos_sin_cache = self.cos_sin_cache.to(
                         query.device, dtype=query.dtype
                     )
+                    cos_sin_cache = self.cos_sin_cache
                 _launch_rotary_embedding(
                     self.fallback_rotary_embedding,
                     positions,
                     query,
                     key,
                     self.head_size,
-                    self.cos_sin_cache,
+                    cos_sin_cache,
                     self.is_neox_style,
                 )
         return query, key

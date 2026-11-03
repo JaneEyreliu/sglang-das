@@ -130,7 +130,12 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             if (
                 (
                     _is_hcu
-                    and model_config_of(resolved_view(server_args)).is_deepseek_v4_arch
+                    # Set only for hybrid-SWA models; HY4 has no such attribute.
+                    and getattr(
+                        model_config_of(resolved_view(server_args)),
+                        "is_deepseek_v4_arch",
+                        False,
+                    )
                 )
                 and cfg.speculative_algorithm
                 not in (

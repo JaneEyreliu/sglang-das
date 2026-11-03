@@ -22,6 +22,9 @@ import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.layers.attention.dsa.hyv4_short_context import (
+    create_hyv4_short_context_graph_variants,
+)
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -168,6 +171,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.captured_req_width = resolve_num_tokens_per_req(phase="draft_extend")
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
+        # HYV4 HCU K-only indexer: capture dense + sparse draft-extend graphs.
+        self.attention_graph_variants = create_hyv4_short_context_graph_variants(
+            model_runner.model_config.hf_config, self.captured_req_width
+        )
 
         self.draft_extend_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
@@ -336,8 +343,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        return ShapeKey(size=bs)
+    def _make_graph_key(
+        self, bs, stream_idx=None, variant_label=None, attention_variant=None
+    ):
+        return ShapeKey(size=bs, attention_variant=attention_variant)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Uniform-width replay invariant: the batch's actual per-request width
@@ -358,7 +367,15 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             cuda_graph_bs = forward_batch.seq_lens.numel()
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, self._make_graph_key(cuda_graph_bs))
+            self.backend.can_run(
+                forward_batch,
+                self._make_graph_key(
+                    cuda_graph_bs,
+                    attention_variant=self._resolve_attention_variant(
+                        forward_batch, cuda_graph_bs
+                    ),
+                ),
+            )
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -525,7 +542,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 else contextlib.nullcontext()
             )
             with canary_ctx:
-                shape_key = self._make_graph_key(bs)
+                shape_key = self._make_graph_key(bs, attention_variant=attention_variant)
                 post_warmup_hook = getattr(
                     self.draft_extend_attn_backend,
                     "on_after_cuda_graph_warmup",
@@ -720,7 +737,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         self.raw_bs = raw_bs
         self.bs = bs
-        shape_key = self._make_graph_key(bs)
+        shape_key = self._make_graph_key(
+            bs, attention_variant=self._resolve_attention_variant(forward_batch, bs)
+        )
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(
                 shape_key,
