@@ -729,6 +729,9 @@ class Envs:
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
+    # HCU layer-split: back up KV with the staged page-first kernel instead of the
+    # per-layer index_select/index_copy_ fallback that blocks the scheduler thread.
+    SGLANG_OPT_HICACHE_STAGED_LAYER_SPLIT_BACKUP = EnvBool(False)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
 
     # ===================================================================

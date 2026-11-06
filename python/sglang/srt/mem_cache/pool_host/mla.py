@@ -18,6 +18,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -122,6 +123,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 buffer for pool in device_pools for buffer in pool.kv_buffer
             ]
         self._init_write_back_staging_buffers()
+        self._layer_split_staged_src_ptrs = self._init_layer_split_staged_backup()
 
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
@@ -247,6 +249,52 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             ),
             dtype=self.dtype,
             device=self.device_pool.device,
+        )
+
+    def _init_layer_split_staged_backup(self) -> Optional[torch.Tensor]:
+        """Device pointer table for the staged layer-split backup; None when off."""
+        if not (_is_hcu and envs.SGLANG_OPT_HICACHE_STAGED_LAYER_SPLIT_BACKUP.get()):
+            return None
+        if not self._is_device_layer_sharded(self.device_pool):
+            return None
+        if not self.can_use_write_back_jit:
+            logger.warning(
+                "SGLANG_OPT_HICACHE_STAGED_LAYER_SPLIT_BACKUP is set but the staged "
+                "write-back kernel is unavailable (layout=%s); keeping the per-layer "
+                "backup fallback.",
+                self.layout,
+            )
+            return None
+
+        # Same order as the host layer axis: owned target layers, then packed drafts.
+        buffers = [
+            self.device_pool.kv_buffer[layer_id]
+            for layer_id in self._owned_device_layer_ids(self.device_pool)
+        ]
+        buffers += [pool.kv_buffer[0] for pool in self.mtp_draft_device_pools]
+        assert len(buffers) == self.layer_num, (
+            f"Layer-split staged backup expects {self.layer_num} device layers, "
+            f"got {len(buffers)}."
+        )
+        logger.info(
+            "HiCache layer-split backup uses the staged page-first kernel (%d layers).",
+            len(buffers),
+        )
+        return torch.tensor(
+            [buffer.data_ptr() for buffer in buffers],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    def _backup_layer_split_staged(self, *, host_indices, device_indices):
+        jit_transfer_hicache_all_layer_mla_staged_lf_pf(
+            ptr_src=self._layer_split_staged_src_ptrs,
+            src_indices=device_indices.to(self.device_pool.device),
+            # The kernel reads destination page offsets on the host.
+            dst_indices=host_indices.cpu(),
+            staging=self.staging_buffer,
+            dst=self.kv_buffer,
+            page_size=self.page_size,
         )
 
     def load_to_device_per_layer(
@@ -460,6 +508,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         host_indices = self.maybe_dcp_kernel_indices(host_indices)
         device_indices = self.maybe_dcp_kernel_indices(device_indices)
         if self._is_device_layer_sharded(device_pool):
+            if self._layer_split_staged_src_ptrs is not None and io_backend == "kernel":
+                self._backup_layer_split_staged(
+                    host_indices=host_indices, device_indices=device_indices
+                )
+                return
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
                     device_pool, host_indices, device_indices, layer_id, io_backend
