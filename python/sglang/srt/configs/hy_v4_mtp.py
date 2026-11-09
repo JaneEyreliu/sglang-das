@@ -75,6 +75,7 @@ def validate_hyv4_mtp_metadata(config, weights, *, packed_experts, mixed_int8=Fa
         "torch.float32",
     }
     packed = {"I8", "U8", "torch.int8", "torch.uint8"}
+    fp8 = {"F8_E4M3", "torch.float8_e4m3fn"}
 
     def check(name, shape, dtypes):
         meta = weights.get(name)
@@ -86,9 +87,15 @@ def validate_hyv4_mtp_metadata(config, weights, *, packed_experts, mixed_int8=Fa
                 f"dtype in {sorted(dtypes)}"
             )
 
+    def check_fp8(name, shape):
+        check(name, shape, fp8)
+        check(name.removesuffix(".weight") + ".weight_scale", [shape[0], 1], floating)
+
     def check_linear(name, shape):
         meta = weights.get(name, {})
-        if mixed_int8 and len(shape) == 2 and meta.get("dtype") in ("I8", "torch.int8"):
+        if len(shape) == 2 and meta.get("dtype") in fp8:
+            check_fp8(name, shape)
+        elif mixed_int8 and len(shape) == 2 and meta.get("dtype") in ("I8", "torch.int8"):
             check(name, shape, {"I8", "torch.int8"})
             check(
                 name.removesuffix(".weight") + ".weight_scale",
@@ -114,6 +121,9 @@ def validate_hyv4_mtp_metadata(config, weights, *, packed_experts, mixed_int8=Fa
             name = f"{prefix}.{proj}"
             if mixed_int8 and prefix == "mlp.shared_experts":
                 check_linear(name + ".weight", [out_size, in_size])
+                continue
+            if not packed_experts and weights.get(name + ".weight", {}).get("dtype") in fp8:
+                check_fp8(name + ".weight", [out_size, in_size])
                 continue
             check(
                 name + ".weight",

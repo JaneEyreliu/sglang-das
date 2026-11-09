@@ -360,6 +360,9 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
 
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
+        # HYV4 VL: the draft is text-only. Use the nested text config so
+        # vars(config) and the layer builders see the text fields directly.
+        config = getattr(config, "text_config", config)
         self.config = config
         self.quant_config = _mtp_quant_config(quant_config)
         quant_config = self.quant_config
@@ -417,10 +420,40 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
                 forward_batch.seq_lens_cpu.tolist(),
                 extend_seqs_len=forward_batch.extend_seq_lens_cpu,
             )
-        hidden_states = self.model(input_ids, positions, forward_batch)
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=self._mm_input_embeds(input_ids, forward_batch),
+        )
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+
+    def _mm_input_embeds(self, input_ids, forward_batch):
+        """Target embeddings for a multimodal draft prefill, else None.
+
+        Placeholder ids are pad hashes outside the vocab, so the draft cannot
+        embed them itself; reuse the target's merged embeddings and re-embed
+        only each request's shifted-in tail token.
+        """
+        mode = forward_batch.forward_mode
+        if (
+            not mode.is_extend()
+            or mode.is_draft_extend_v2()
+            or not forward_batch.contains_mm_inputs()
+        ):
+            return None
+        input_embeds = forward_batch.mm_input_embeds
+        if input_embeds is None:
+            raise RuntimeError(
+                "HYV4 MTP multimodal prefill requires the target mm_input_embeds"
+            )
+        last_indices = (
+            forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+        ).long()
+        input_embeds[last_indices] = self.model.embed_tokens(input_ids[last_indices])
+        return input_embeds
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
