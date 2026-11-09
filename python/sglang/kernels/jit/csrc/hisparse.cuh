@@ -333,7 +333,7 @@ template <
     bool SkipIO,
     typename SeqLensT,
     typename ReqPoolIndicesT>
-__global__ void load_cache_to_device_buffer_kernel(
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void load_cache_to_device_buffer_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
     const int64_t* __restrict__ host_cache_locs,

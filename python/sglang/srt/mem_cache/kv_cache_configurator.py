@@ -97,9 +97,10 @@ logger = logging.getLogger(__name__)
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool, hf_config=None) -> bool:
     memory_config = get_memory()
+    # HiSparse only offloads main KV; Index-K stays device-resident and is
+    # never touched by the hot-buffer swap path, so it can be elided as well.
     return (
-        not memory_config.enable_hisparse
-        and not is_draft_worker
+        not is_draft_worker
         and not memory_config.enable_hierarchical_cache
         and not memory_config.enable_unified_cache_external_linker
         and (
@@ -1416,8 +1417,7 @@ class KVCacheConfigurator:
             # HiCache uses dense storage/transfer metadata, but skip-topk
             # layers still must not enqueue an Index-K collective.
             pool_kwargs["indexer_prefetch_layer_ids"] = full_indexer_layer_ids
-        if not get_memory().enable_hisparse:
-            pool_kwargs["indexer_layer_ids"] = indexer_layer_ids
+        pool_kwargs["indexer_layer_ids"] = indexer_layer_ids
         if is_hy_v4(self.model_config.hf_config):
             # The allocator reserves virtual page 0 (64 * DCP slots). Index-K
             # indexes raw virtual locs on both the target and replicated draft.
