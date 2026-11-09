@@ -818,6 +818,109 @@ class HYV4DecoderLayer(nn.Module):
         return hidden_states, topk_indices
 
 
+class HYV4MRoPE:
+    """MRoPE for HYV4 VL on top of the unchanged 1D rope kernels.
+
+    The MLA / DSA-indexer rope paths (fused lightop kernels, forward_native)
+    take 1D positions and read ``rotary_emb.cos_sin_cache[positions]``. So:
+
+    * decode / verify / draft-extend: the three axes are equal by construction
+      (``(delta - 1) + seq_lens`` or ``positions + delta``), use axis 0.
+      ``forward_batch.positions`` lacks the mrope delta, hence the override.
+      The cuda-graph buffers carry a ``mrope_positions`` slot, so this is
+      capture safe.
+    * extend: compose a per-token ``(N, rotary_dim)`` table that picks each
+      rope pair from its t/h/w axis, swap it in as ``cos_sin_cache`` for the
+      layer loop and index it with ``arange(N)``. The arange survives the CP
+      split unchanged. Extend runs eagerly for this multimodal arch.
+    """
+
+    def __init__(self, rope_parameters):
+        rope_parameters = rope_parameters or {}
+        self.section = rope_parameters.get("mrope_section")
+        self.interleaved = bool(rope_parameters.get("mrope_interleaved", False))
+        self._axis_maps = {}
+
+    @property
+    def enabled(self) -> bool:
+        return self.section is not None
+
+    def resolve(self, positions, forward_batch):
+        """Return ``(positions, mrope_positions to compose or None)``."""
+        mrope_positions = forward_batch.mrope_positions
+        if not self.enabled or mrope_positions is None:
+            return positions, None
+        if mrope_positions.shape[-1] != positions.shape[0]:
+            raise RuntimeError(
+                f"HYV4 mrope_positions {tuple(mrope_positions.shape)} do not "
+                f"match positions {tuple(positions.shape)}"
+            )
+        if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            arange = torch.arange(
+                positions.shape[0], dtype=positions.dtype, device=positions.device
+            )
+            return arange, mrope_positions
+        return mrope_positions[0], None
+
+    def _axis_map(self, rotary_dim: int, device) -> torch.Tensor:
+        key = (rotary_dim, device)
+        axis = self._axis_maps.get(key)
+        if axis is None:
+            half = rotary_dim // 2
+            s0, s1, s2 = (int(v) for v in self.section)
+            pair_axis = torch.zeros(half, dtype=torch.long)
+            if self.interleaved:
+                pair = torch.arange(half)
+                pair_axis[((pair % 3) == 1) & (pair < s1 * 3)] = 1
+                pair_axis[((pair % 3) == 2) & (pair < s2 * 3)] = 2
+            else:
+                pair_axis[s0 : s0 + s1] = 1
+                pair_axis[s0 + s1 :] = 2
+            # cos_sin_cache rows are cat(cos[half], sin[half]).
+            axis = torch.cat((pair_axis, pair_axis)).to(device)
+            self._axis_maps[key] = axis
+        return axis
+
+    def compose(self, cache: torch.Tensor, mrope_positions: torch.Tensor):
+        rows = cache[mrope_positions]  # (3, N, rotary_dim)
+        axis = self._axis_map(cache.shape[-1], cache.device)
+        index = axis.view(1, 1, -1).expand(1, rows.shape[1], -1)
+        return rows.gather(0, index).squeeze(0)
+
+    @staticmethod
+    def rotary_embs(layers):
+        ropes = {}
+        for layer in layers:
+            attn = getattr(layer, "self_attn", None)
+            for owner in (attn, getattr(attn, "indexer", None)):
+                rope = getattr(owner, "rotary_emb", None)
+                if rope is not None and hasattr(rope, "cos_sin_cache"):
+                    ropes[id(rope)] = rope
+        return list(ropes.values())
+
+    def install(self, ropes, mrope_positions):
+        """Swap in composed tables; returns the restore callable."""
+        if mrope_positions is None:
+            return lambda: None
+        saved = []
+        try:
+            for rope in ropes:
+                cache = rope.cos_sin_cache
+                composed = self.compose(cache, mrope_positions)
+                saved.append((rope, cache))
+                rope.cos_sin_cache = composed
+        except BaseException:
+            for rope, cache in saved:
+                rope.cos_sin_cache = cache
+            raise
+
+        def restore():
+            for rope, cache in saved:
+                rope.cos_sin_cache = cache
+
+        return restore
+
+
 class HYV4Model(nn.Module):
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
@@ -979,6 +1082,11 @@ class HYV4Model(nn.Module):
         self.next_full_attention_layer_id = dict(
             zip(local_layer_ids, local_layer_ids[1:])
         )
+        self.mrope = HYV4MRoPE(getattr(config, "rope_parameters", None))
+        self._mrope_rotary_embs = None
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
 
     def _dsa_forward_uses_topk(self) -> bool:
         """Does this batch's attention backend consume DSA top-k indices?
@@ -1038,6 +1146,7 @@ class HYV4Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         dsa_forward_uses_topk = self._dsa_forward_uses_topk()
+        positions, mrope_positions = self.mrope.resolve(positions, forward_batch)
         if self.pp_group.is_first_rank:
             hidden_states = (
                 self.embed_tokens(input_ids) if input_embeds is None else input_embeds
@@ -1079,6 +1188,10 @@ class HYV4Model(nn.Module):
         # from extend_seq_lens_cpu -- it is the full length on every rank.
         if input_ids is not None:
             num_tokens = input_ids.shape[0]
+        elif input_embeds is not None:
+            # Multimodal prefill embeds the CP-padded input_ids and passes only
+            # input_embeds; extend_seq_lens_cpu would give the unpadded length.
+            num_tokens = input_embeds.shape[0]
         elif forward_batch.extend_seq_lens_cpu is not None:
             num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
         else:
@@ -1116,6 +1229,11 @@ class HYV4Model(nn.Module):
             # Install this batch's compact Main-KV page plan and prefetch the
             # first local layer before entering the layer loop.
             maybe_prefetch_full_attention_kv(forward_batch, self.start_layer)
+        if mrope_positions is not None and self._mrope_rotary_embs is None:
+            self._mrope_rotary_embs = HYV4MRoPE.rotary_embs(
+                self.layers[i] for i in range(self.start_layer, self.end_layer)
+            )
+        restore_rope = self.mrope.install(self._mrope_rotary_embs, mrope_positions)
         try:
             for i in range(self.start_layer, self.end_layer):
                 # NOTE: torch dynamo does not support graph break in context manager
@@ -1135,6 +1253,7 @@ class HYV4Model(nn.Module):
                     )
                 index_topk_share.update(topk_indices)
         finally:
+            restore_rope()
             if self.gate_cp_chain is not None:
                 self.gate_cp_chain.end()
         index_topk_share.publish()
