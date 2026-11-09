@@ -65,6 +65,10 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define __shfl_sync(mask, var, src_lane, ...) __shfl(var, src_lane, ##__VA_ARGS__)
 #define __shfl_up_sync(mask, var, delta, ...) __shfl_up(var, delta, ##__VA_ARGS__)
 #define __shfl_xor_sync(mask, var, lane_mask, ...) __shfl_xor(var, lane_mask, ##__VA_ARGS__)
+#ifndef HIP_ENABLE_WARP_SYNC_BUILTINS
+// DTK (and ROCm < 6.2) only expose __ballot_sync behind HIP_ENABLE_WARP_SYNC_BUILTINS.
+#define __ballot_sync(mask, predicate) (__ballot(predicate) & (mask))
+#endif
 #endif
 
 namespace sglang {

@@ -13,6 +13,13 @@ HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE = {
     "fp8_e4m3": {"flashmla_kv", "flashinfer_sparse_mla"},
 }
 HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "aiter"}
+# fp8 flashmla_sparse prefill takes the RAGGED top-k transform, whose indices
+# point into the gathered extend KV rather than pool locs, so the HiSparse
+# loc translation in forward_extend would corrupt them.
+HISPARSE_HCU_DSA_BACKENDS_BY_DTYPE = {
+    "bfloat16": {"flashmla_sparse"},
+    "fp8_e4m3": {"flashmla_kv"},
+}
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
 
 
@@ -22,13 +29,25 @@ def _is_hip() -> bool:
     return is_hip()
 
 
+def _is_hcu() -> bool:
+    from sglang.srt.utils import is_hcu
+
+    return is_hcu()
+
+
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
+    if _is_hcu():
+        return "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
     if _is_hip():
         return "tilelang"
     return "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
 
 
 def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
+    if _is_hcu():
+        return HISPARSE_HCU_DSA_BACKENDS_BY_DTYPE.get(
+            kv_cache_dtype, {"flashmla_sparse"}
+        )
     if _is_hip():
         return HISPARSE_ROCM_DSA_BACKENDS
     return HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE.get(

@@ -41,7 +41,11 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         host_to_device_ratio: int = 2,
+        **kwargs,
     ):
+        # Index-K is indexed by logical (host-sized) locs, never by the
+        # device hot-buffer locs, so its size is fixed by the host ratio.
+        kwargs.pop("index_buf_size", None)
         super().__init__(
             size=size,
             page_size=page_size,
@@ -56,6 +60,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             index_buf_size=size * host_to_device_ratio,
+            **kwargs,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
 
