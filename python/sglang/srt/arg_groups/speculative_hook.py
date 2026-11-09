@@ -830,6 +830,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
         "HYV4ForCausalLM",
+        "HYV4VLForConditionalGeneration",
     ]:
         if server_args.speculative_draft_model_path is None:
             declare_resolution(

@@ -131,13 +131,18 @@ def is_deepseek_dsa(config) -> bool:
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
             "HYV4ForCausalLMNextN",
+            "HYV4VLForConditionalGeneration",
         )
         and _hf_attr(config, "index_topk") is not None
     )
 
 
 def is_hy_v4(config) -> bool:
-    return _hf_arch(config) in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN")
+    return _hf_arch(config) in (
+        "HYV4ForCausalLM",
+        "HYV4ForCausalLMNextN",
+        "HYV4VLForConditionalGeneration",
+    )
 
 
 def is_kimi_k3(config) -> bool:
@@ -830,7 +835,10 @@ class ModelConfig:
             self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and self.hf_config.architectures[0] == "HYV4ForCausalLM":
+        if is_draft_model and self.hf_config.architectures[0] in (
+            "HYV4ForCausalLM",
+            "HYV4VLForConditionalGeneration",
+        ):
             if getattr(self.hf_config, "num_nextn_predict_layers", 0) != 1:
                 raise ValueError("HYV4 MTP requires exactly one checkpoint MTP layer")
             self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
@@ -996,6 +1004,7 @@ class ModelConfig:
             or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "HYV4ForCausalLM" in self.hf_config.architectures
             or "HYV4ForCausalLMNextN" in self.hf_config.architectures
+            or "HYV4VLForConditionalGeneration" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -1930,6 +1939,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 
 
 multimodal_model_archs = [
+    "HYV4VLForConditionalGeneration",
     "CLIPModel",
     "Cohere2VisionForConditionalGeneration",
     "DeepseekVL2ForCausalLM",

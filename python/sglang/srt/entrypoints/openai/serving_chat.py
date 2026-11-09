@@ -305,7 +305,8 @@ class OpenAIServingChat(OpenAIServingBase):
         self.is_hy_v4 = (
             hasattr(self.tokenizer_manager.model_config, "hf_config")
             and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
-            and self.tokenizer_manager.model_config.hf_config.model_type == "hy_v4"
+            and self.tokenizer_manager.model_config.hf_config.model_type
+            in ("hy_v4", "hy_v4_vl")
         )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.

@@ -1305,7 +1305,9 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
-@_register_for("HYV4ForCausalLM", "HYV4ForCausalLMNextN")
+@_register_for(
+    "HYV4ForCausalLM", "HYV4ForCausalLMNextN", "HYV4VLForConditionalGeneration"
+)
 def _hyv4_dsa_backend_overrides(server_args: Any, hf_config: Any) -> dict:
     """Hunyuan-V4 (Hy4-preview) defaults, ported from an internal fork's
     ``_handle_hyv4_adjustments``: DSA attention backend, the learnable-sink

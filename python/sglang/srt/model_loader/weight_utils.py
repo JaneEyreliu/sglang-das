@@ -265,7 +265,7 @@ def _resolve_explicit_draft_quant_config(
 def _get_hyv4_checkpoint_format(hf_folder, hf_config, quantization):
     if (
         quantization != "slimquant_w4a8_marlin"
-        or getattr(hf_config, "model_type", None) != "hy_v4"
+        or getattr(hf_config, "model_type", None) not in ("hy_v4", "hy_v4_vl")
     ):
         return None
     manifest = os.path.join(hf_folder, "hy4-assets.json")
