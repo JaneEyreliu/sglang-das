@@ -4,6 +4,8 @@ from importlib import import_module
 
 import torch
 
+from sglang.srt.utils.common import print_warning_once
+
 
 def get_hcu_fp8_pair32_packer(device):
     if device.type != "cuda":
@@ -11,7 +13,22 @@ def get_hcu_fp8_pair32_packer(device):
     arch = torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
     if arch != "gfx938":
         return None
-    return import_module("deepgemm.group_gemm_weight_pack").pack_fp8_weight_pair32
+    # Older DeepGEMM builds ship neither pair32 symbol; fall back to the W6 path.
+    pack = getattr(
+        import_module("deepgemm.group_gemm_weight_pack"), "pack_fp8_weight_pair32", None
+    )
+    gemm = getattr(
+        import_module("deepgemm.m_group_gemm_nt_masked"),
+        "m_grouped_fp8_gemm_nt_masked_pair32",
+        None,
+    )
+    if pack is None or gemm is None:
+        print_warning_once(
+            "DeepGEMM lacks FP8 pair32 kernels; using W6 low-latency packing "
+            "(down-GEMM overlap unavailable)"
+        )
+        return None
+    return pack
 
 
 def run_hcu_fp8_pair32(
