@@ -119,15 +119,15 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     ), "Hierarchical sparse attention currently requires --disable-radix-cache."
 
     enable_spec = (
-        cfg.speculative_algorithm is not None
-        and cfg.speculative_algorithm.upper() != "NONE"
+        server_args.speculative_algorithm is not None
+        and server_args.speculative_algorithm.upper() != "NONE"
     )
-    if enable_spec and (cfg.speculative_eagle_topk or 1) != 1:
+    if enable_spec and (server_args.speculative_eagle_topk or 1) != 1:
         raise ValueError(
             "The minimal HiSparse spec integration supports linear speculation "
             "only; use --speculative-eagle-topk 1."
         )
-    if enable_spec and cfg.speculative_adaptive:
+    if enable_spec and server_args.speculative_adaptive:
         raise ValueError(
             "HiSparse speculative decoding uses statically sized swap state; "
             "--speculative-adaptive is not supported."

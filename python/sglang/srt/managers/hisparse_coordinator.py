@@ -143,8 +143,7 @@ class HiSparseSpecSwapManager:
         if not self.enabled:
             return
 
-        if _is_xpu:
-            raise ValueError("HiSparse speculative swap is unsupported on XPU.")
+        # Upstream also rejects XPU here; this fork is HCU/CUDA only.
         if coordinator.is_dsv4_hisparse:
             raise ValueError("HiSparse spec swap currently supports DSA caches only.")
         if not 2 <= num_draft_tokens <= 4 or coordinator.top_k < 1024:
