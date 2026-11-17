@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -17,6 +18,15 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
+    def test_spec_scratch_is_charged_only_before_request_slot_allocation(self):
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = 64
+
+        allocator.configure_spec_scratch(1024)
+
+        self.assertEqual(allocator.request_slot_reserve(has_req_pool_slot=False), 1024)
+        self.assertEqual(allocator.request_slot_reserve(has_req_pool_slot=True), 0)
+
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
         logical_allocator = MagicMock(spec=["alloc_extend_swa_tail"])

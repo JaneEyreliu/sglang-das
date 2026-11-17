@@ -600,6 +600,8 @@ def eagle_prepare_for_verify(
             draft_token_num=verify_input.draft_token_num,
             device=device,
         )
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.prepare_spec_verify(batch)
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
@@ -962,8 +964,6 @@ def eagle_sample(
                 coins,
                 coins_for_final_sampling,
             )
-        if batch.hisparse_coordinator is not None:
-            batch.hisparse_coordinator.prepare_spec_verify(batch)
 
         # Sync sampling results across TP ranks: different GPUs may
         # produce slightly different target_probs due to floating-point
