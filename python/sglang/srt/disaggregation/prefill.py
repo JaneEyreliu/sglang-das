@@ -446,6 +446,13 @@ class PrefillBootstrapQueue:
             )
             kv_args.prefill_draft_start_layer = 0
             kv_args.prefill_draft_end_layer = num_draft_entries // 2
+        if num_draft_entries:
+            # Draft entries carry layer ids >= num_hidden_layers (see
+            # build_kv_layer_ids); a HiSparse decode peer routes them to its
+            # device page space instead of host pages.
+            kv_args.draft_kv_layer_id_start = (
+                self.scheduler.model_config.num_hidden_layers
+            )
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens

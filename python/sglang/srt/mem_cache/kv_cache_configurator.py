@@ -493,6 +493,14 @@ class KVCacheConfigurator:
                 sizes = msgspec.structs.replace(
                     sizes, max_total_num_tokens=draft_virtual_id_space
                 )
+            elif isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
+                # HiSparse hands out logical locs from the host-sized space
+                # (size * host_to_device_ratio); the dense draft pool is indexed
+                # by those locs directly, so it must span that whole space.
+                draft_virtual_id_space = token_to_kv_pool_allocator.size_full
+                sizes = msgspec.structs.replace(
+                    sizes, max_total_num_tokens=draft_virtual_id_space
+                )
 
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
@@ -1375,7 +1383,9 @@ class KVCacheConfigurator:
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
         use_layer_split_pool = False
-        if get_memory().enable_hisparse:
+        # The MTP draft keeps its whole KV on device, addressed by the target's
+        # logical locs; only the target pool is host-backed.
+        if get_memory().enable_hisparse and not self.is_draft_worker:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 

@@ -876,6 +876,10 @@ class ModelRunner:
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
             return
+        if self.is_draft_worker:
+            # The draft pool is a dense device pool over the target's logical
+            # locs; host offload and Top-K swap-in belong to the target only.
+            return
         from sglang.srt.managers.hisparse_coordinator import (
             HiSparseCoordinator,
             resolve_shared_index_layers,

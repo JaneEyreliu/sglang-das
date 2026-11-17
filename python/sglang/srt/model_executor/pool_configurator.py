@@ -242,6 +242,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         # HY4's draft pool stores all allocator virtual slots
                         # on each rank (_derive_pool_sizes multiplies by DCP).
                         draft_kv_size *= get_parallel().attn_dcp_size
+                    if get_memory().enable_hisparse:
+                        # The dense draft pool spans the HiSparse logical space
+                        # (_init_pools resizes it to allocator.size_full) while
+                        # the target only keeps the device hot buffer.
+                        draft_kv_size *= _get_dsa_indexer_cache_token_multiplier(
+                            kvc
+                        )
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,

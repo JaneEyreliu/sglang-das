@@ -1090,6 +1090,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     return ret
         return ret
 
+    def _dsa_hisparse_draft_dst_ptrs(
+        self, dst_kv_ptrs: list[int], dst_layer_ids: Optional[List[int]]
+    ) -> set[int]:
+        """Decode pointers of the draft (MTP) KV entries, matched by layer id."""
+        draft_start = getattr(self.kv_args, "draft_kv_layer_id_start", None)
+        if draft_start is None:
+            raise RuntimeError(
+                "HiSparse device KV indices were sent for a prefill without "
+                "draft KV entries"
+            )
+        if not dst_layer_ids or len(dst_layer_ids) != len(dst_kv_ptrs):
+            raise RuntimeError(
+                "DSA HiSparse draft KV transfer requires decode KV layer ids: "
+                f"ptrs={len(dst_kv_ptrs)}, layer_ids={len(dst_layer_ids or [])}"
+            )
+        return {
+            int(ptr)
+            for ptr, lid in zip(dst_kv_ptrs, dst_layer_ids)
+            if lid >= draft_start
+        }
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -1109,14 +1130,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
             compression_ratios = self.kv_args.mla_compression_ratios
-            assert compression_ratios is not None
-            if len(dst_kv_ptrs) == len(self.kv_args.kv_data_ptrs):
-                start = self.kv_args.prefill_start_layer
-                end = self.kv_args.prefill_end_layer
-                assert end is not None
-                compression_ratios = compression_ratios[start:end]
-            c4_layer_num = sum(ratio == 4 for ratio in compression_ratios)
-            dst_device_kv_ptrs = set(dst_kv_ptrs[c4_layer_num:])
+            if compression_ratios is None:
+                # DSA HiSparse: target KV lands in decode host pages, while the
+                # dense draft (MTP) pool is addressed by logical device pages.
+                dst_device_kv_ptrs = self._dsa_hisparse_draft_dst_ptrs(
+                    dst_kv_ptrs, dst_layer_ids
+                )
+            else:
+                if len(dst_kv_ptrs) == len(self.kv_args.kv_data_ptrs):
+                    start = self.kv_args.prefill_start_layer
+                    end = self.kv_args.prefill_end_layer
+                    assert end is not None
+                    compression_ratios = compression_ratios[start:end]
+                c4_layer_num = sum(ratio == 4 for ratio in compression_ratios)
+                dst_device_kv_ptrs = set(dst_kv_ptrs[c4_layer_num:])
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,

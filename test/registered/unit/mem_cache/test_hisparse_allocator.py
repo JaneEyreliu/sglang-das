@@ -235,6 +235,63 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         kwargs = manager._send_kvcache_generic.call_args.kwargs
         self.assertEqual(kwargs["dst_device_data_ptrs"], {20000, 30000})
 
+    def test_mooncake_dsa_routes_draft_buffers_to_device_pages(self):
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+
+        manager = object.__new__(MooncakeKVManager)
+        # Two target layers (host pages) followed by one MTP draft layer.
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[1000, 2000, 3000],
+            kv_item_lens=[100, 100, 100],
+            kv_layer_ids=[0, 1, 2],
+            mla_compression_ratios=None,
+            draft_kv_layer_id_start=2,
+            prefill_start_layer=0,
+            prefill_end_layer=2,
+        )
+        manager._send_kvcache_generic = MagicMock(return_value=0)
+
+        with get_context().override_server_args(enable_unified_memory=False):
+            manager.send_kvcache(
+                "session",
+                np.array([1], dtype=np.int32),
+                [10000, 20000, 30000],
+                np.array([7], dtype=np.int32),
+                MagicMock(),
+                dst_layer_ids=[0, 1, 2],
+                dst_device_kv_indices=np.array([21], dtype=np.int32),
+            )
+
+        kwargs = manager._send_kvcache_generic.call_args.kwargs
+        self.assertEqual(kwargs["dst_device_data_ptrs"], {30000})
+
+    def test_mooncake_dsa_device_pages_require_draft_entries(self):
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[1000, 2000],
+            kv_item_lens=[100, 100],
+            kv_layer_ids=[0, 1],
+            mla_compression_ratios=None,
+            prefill_start_layer=0,
+            prefill_end_layer=2,
+        )
+        manager._send_kvcache_generic = MagicMock(return_value=0)
+
+        with get_context().override_server_args(enable_unified_memory=False):
+            with self.assertRaises(RuntimeError):
+                manager.send_kvcache(
+                    "session",
+                    np.array([1], dtype=np.int32),
+                    [10000, 20000],
+                    np.array([7], dtype=np.int32),
+                    MagicMock(),
+                    dst_layer_ids=[0, 1],
+                    dst_device_kv_indices=np.array([21], dtype=np.int32),
+                )
+        manager._send_kvcache_generic.assert_not_called()
+
     def test_mooncake_transfer_metadata_carries_device_page_indices(self):
         from sglang.srt.disaggregation.mooncake.conn import TransferInfo
 

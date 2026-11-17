@@ -98,6 +98,9 @@ class KVArgs:
     prefill_main_end_layer: Optional[int]
     prefill_draft_start_layer: Optional[int]
     prefill_draft_end_layer: Optional[int]
+    # First global layer id used by draft (MTP) KV entries in kv_layer_ids.
+    # HiSparse decode routes those entries to device pages, not host pages.
+    draft_kv_layer_id_start: Optional[int]
     # For DeepSeek V4 (and other compressed-MLA) memory pools only.
     # Full-model compression ratio per layer (entries are 0/4/128). Used by
     # the connection layer to slice the buffer-type-organized flat list in a
