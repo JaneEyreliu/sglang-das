@@ -962,6 +962,8 @@ def eagle_sample(
                 coins,
                 coins_for_final_sampling,
             )
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.prepare_spec_verify(batch)
 
         # Sync sampling results across TP ranks: different GPUs may
         # produce slightly different target_probs due to floating-point

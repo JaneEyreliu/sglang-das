@@ -375,7 +375,9 @@ class ModelRunner:
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = get_memory().enable_hisparse
+        # HiSparse owns target KV only. Draft KV keeps its logical GPU page
+        # space and must not construct a second sparse coordinator.
+        self.enable_hisparse = get_memory().enable_hisparse and not is_draft_worker
         self._sampling_observer: Optional[SamplingObserver] = None
 
         self.init_startup_observability()
@@ -875,10 +877,9 @@ class ModelRunner:
 
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
-            return
-        if self.is_draft_worker:
-            # The draft pool is a dense device pool over the target's logical
-            # locs; host offload and Top-K swap-in belong to the target only.
+            # enable_hisparse already excludes draft workers: the draft pool is
+            # a dense device pool over the target's logical locs, and host
+            # offload plus Top-K swap-in belong to the target only.
             return
         from sglang.srt.managers.hisparse_coordinator import (
             HiSparseCoordinator,
@@ -906,7 +907,11 @@ class ModelRunner:
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
                 pp_size=self.ps.pp_size,
-                is_speculative=self.spec_algorithm.is_speculative(),
+            ),
+            num_draft_tokens=(
+                0
+                if self.spec_algorithm.is_none()
+                else get_spec().speculative_num_draft_tokens or 0
             ),
         )
 

@@ -1402,11 +1402,33 @@ class CommonKVManager(BaseKVManager):
             )
 
         # Regular MLA PP slicing
+        # Draft (MTP) entries are appended after the target layers and follow
+        # the global layer range on both peers, so they must be excluded from
+        # this stage's target span and re-attached from the dst tail.
+        num_draft = (
+            self._num_draft_kv_entries(src_kv_ptrs) if state_type is None else 0
+        )
         start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + len(src_kv_ptrs)
+        end_layer = start_layer + len(src_kv_ptrs) - num_draft
         # Decode pp size should be equal to prefill pp size or 1
-        sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        sliced_dst_kv_ptrs = list(dst_kv_ptrs[start_layer:end_layer])
+        if num_draft:
+            sliced_dst_kv_ptrs += list(dst_kv_ptrs[-num_draft:])
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
+
+    def _num_draft_kv_entries(self, src_kv_ptrs: List[int]) -> int:
+        """Trailing draft (MTP) entries in ``src_kv_ptrs``, 0 if none.
+
+        Counted from ``kv_layer_ids`` (draft ids are >= draft_kv_layer_id_start,
+        see ``build_kv_layer_ids``) so the layout need not be assumed.
+        """
+        draft_start = getattr(self.kv_args, "draft_kv_layer_id_start", None)
+        if draft_start is None:
+            return 0
+        src_layer_ids = getattr(self.kv_args, "kv_layer_ids", None)
+        if not src_layer_ids or len(src_layer_ids) != len(src_kv_ptrs):
+            return 0
+        return sum(lid >= draft_start for lid in src_layer_ids)
 
     def _mla_slice_ptrs_for_pp(
         self,

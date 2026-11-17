@@ -836,6 +836,16 @@ class PrefillAdder:
             return self._mamba_slot_cost
         return 0
 
+    def _request_slot_reserve_for_req(
+        self, req: Req, *, extend_input_len: Optional[int] = None
+    ) -> int:
+        if extend_input_len is None:
+            extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        return self.token_to_kv_pool_allocator.request_slot_reserve(
+            has_req_pool_slot=req.req_pool_idx is not None,
+            prefill_tokens=req.prefix_len + extend_input_len,
+        )
+
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
@@ -869,6 +879,7 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
+        request_slot_reserve: int = 0,
         host_hit_len: int = 0,
         storage_hit_len: int = 0,
     ):
@@ -881,11 +892,18 @@ class PrefillAdder:
         # mamba state's shared-gap cost to BOTH full budgets: the slot is allocated
         # immediately (counts against `cur_rem`) and held for the request lifetime
         # (counts against `rem_total`). See `_mamba_gap_budget_for_req`.
+        # `request_slot_reserve` (HiSparse only; 0 otherwise) is the per-request
+        # device buffer / spec scratch held for the request lifetime, so it is
+        # charged to both budgets as well. See `_request_slot_reserve_for_req`.
         self.rem_total_token_offset += (
-            extend_input_len + max_new_tokens + page_overhead + mamba_gap_reserve
+            extend_input_len
+            + max_new_tokens
+            + page_overhead
+            + mamba_gap_reserve
+            + request_slot_reserve
         )
         self.cur_rem_token_offset += (
-            extend_input_len + page_overhead + mamba_gap_reserve
+            extend_input_len + page_overhead + mamba_gap_reserve + request_slot_reserve
         )
         # The new mamba slot also consumes one mamba-recoverable slot (gated
         # separately so full_evictable can't cover it — see __init__).
@@ -1036,6 +1054,14 @@ class PrefillAdder:
         )
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        request_slot_reserve = self._request_slot_reserve_for_req(
+            req, extend_input_len=new_len
+        )
+        if request_slot_reserve and new_len + request_slot_reserve > _rem_tokens:
+            # HiSparse holds the per-request device buffer for the whole
+            # request, so the need is max(new_len, buffer - prefix): shrinking
+            # this chunk cannot pay for it. Defer and retry next round.
+            return req
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -1048,6 +1074,7 @@ class PrefillAdder:
             ),
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            request_slot_reserve=request_slot_reserve,
         )
 
         # Return if chunked prefill not finished
@@ -1078,6 +1105,9 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
+        paged_input += self._request_slot_reserve_for_req(
+            req, extend_input_len=cand_extend_input_len
+        )
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
@@ -1179,6 +1209,7 @@ class PrefillAdder:
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                request_slot_reserve=self._request_slot_reserve_for_req(req),
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -1202,6 +1233,9 @@ class PrefillAdder:
                 0,
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                request_slot_reserve=self._request_slot_reserve_for_req(
+                    req, extend_input_len=trunc_len
+                ),
             )
 
         return self.budget_state()
@@ -1235,6 +1269,11 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
+        # HiSparse reserves per-request device buffer / spec scratch beyond the
+        # prefilled tokens; charge it to the same budget (0 without HiSparse).
+        total_tokens += self._request_slot_reserve_for_req(
+            req, extend_input_len=cand_extend_input_len
+        )
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = cand_extend_input_len - req.host_hit_length
@@ -1384,6 +1423,9 @@ class PrefillAdder:
                     ),
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    request_slot_reserve=self._request_slot_reserve_for_req(
+                        req, extend_input_len=input_tokens
+                    ),
                     host_hit_len=req.host_hit_length,
                     storage_hit_len=req.storage_hit_length,
                 )
@@ -1432,6 +1474,9 @@ class PrefillAdder:
                     0,
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    request_slot_reserve=self._request_slot_reserve_for_req(
+                        req, extend_input_len=trunc_len
+                    ),
                     host_hit_len=req.host_hit_length,
                     storage_hit_len=req.storage_hit_length,
                 )
@@ -1471,6 +1516,7 @@ class PrefillAdder:
             len(req.full_untruncated_fill_ids)
             - len(req.prefix_indices)
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            + self._request_slot_reserve_for_req(req)
             - self.rem_total_tokens
         )
         for running_req in sorted_valid_running_reqs:

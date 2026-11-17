@@ -498,6 +498,10 @@ class KVCacheConfigurator:
                 # (size * host_to_device_ratio); the dense draft pool is indexed
                 # by those locs directly, so it must span that whole space.
                 draft_virtual_id_space = token_to_kv_pool_allocator.size_full
+                page = max(int(self.pool_page_size or 1), 1)
+                draft_virtual_id_space = (
+                    (draft_virtual_id_space + page - 1) // page * page
+                )
                 sizes = msgspec.structs.replace(
                     sizes, max_total_num_tokens=draft_virtual_id_space
                 )

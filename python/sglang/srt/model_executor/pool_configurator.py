@@ -219,6 +219,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(num_layers) > 0
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
+                draft_loc_space_scale = 1
+                if get_memory().enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    # The draft pool is direct-indexed by the target allocator's
+                    # host-expanded logical IDs.  Account for the entire dense
+                    # address space that KVCacheConfigurator allocates below.
+                    draft_loc_space_scale = parse_hisparse_config().host_to_device_ratio
                 if is_deepseek_dsa(kvc.model_config.hf_config):
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
@@ -242,13 +250,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         # HY4's draft pool stores all allocator virtual slots
                         # on each rank (_derive_pool_sizes multiplies by DCP).
                         draft_kv_size *= get_parallel().attn_dcp_size
-                    if get_memory().enable_hisparse:
-                        # The dense draft pool spans the HiSparse logical space
-                        # (_init_pools resizes it to allocator.size_full) while
-                        # the target only keeps the device hot buffer.
-                        draft_kv_size *= _get_dsa_indexer_cache_token_multiplier(
-                            kvc
-                        )
+                    # The dense draft pool spans the HiSparse logical space
+                    # (_init_pools resizes it to allocator.size_full) while the
+                    # target only keeps the device hot buffer.  Outside HiSparse
+                    # the scale is 1, so this is a no-op.
+                    draft_kv_size *= draft_loc_space_scale
+                    # _compute_dsa_indexer_cell_size already applies the
+                    # HiSparse logical-space ratio to the draft indexer.
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,
@@ -277,9 +285,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     else:
                         self._cell_size += draft_kv_size + draft_indexer_size
                 else:
-                    self._cell_size = int(
-                        self._cell_size * (1 + draft_num_layers / int(num_layers))
+                    draft_kv_size = int(
+                        self._cell_size * draft_num_layers / int(num_layers)
                     )
+                    self._cell_size += draft_kv_size * draft_loc_space_scale
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:

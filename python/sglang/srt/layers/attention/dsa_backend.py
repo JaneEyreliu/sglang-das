@@ -2609,10 +2609,23 @@ class DeepseekSparseAttnBackend(
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
-            # flash_mla_sparse_fwd / tilelang require int32 page indices.
-            page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                page_table_1
-            ).to(torch.int32)
+            if forward_batch.forward_mode.is_target_verify():
+                num_reqs = forward_batch.req_pool_indices.shape[0]
+                num_steps = self.speculative_num_draft_tokens
+                assert topk_indices is not None
+                grouped_topk_indices = topk_indices.view(num_reqs, num_steps, -1)
+                assert metadata.dsa_seqlens_expanded is not None
+                page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
+                    forward_batch.req_pool_indices,
+                    metadata.dsa_seqlens_expanded,
+                    grouped_topk_indices,
+                    layer.layer_id,
+                ).view(num_reqs * num_steps, -1)
+            else:
+                # flash_mla_sparse_fwd / tilelang require int32 page indices.
+                page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                    page_table_1
+                ).to(torch.int32)
 
         # Index-K keeps physical metadata. Translate only the final Main-KV
         # consumer locations into this batch's compact scratch layout.
@@ -4307,7 +4320,10 @@ class DeepseekSparseAttnBackend(
     ) -> DSAIndexerMetadata:
         forward_mode = effective_forward_mode(forward_batch)
         force_unfused = not self.use_fused_topk or (
-            self.hisparse_coordinator is not None and forward_mode.is_decode_or_idle()
+            self.hisparse_coordinator is not None
+            and (
+                forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+            )
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,

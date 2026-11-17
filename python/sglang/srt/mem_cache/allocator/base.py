@@ -84,6 +84,15 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
                 (0,), dtype=self.release_pages.dtype, device=self.device
             )
 
+    def request_slot_reserve(
+        self, *, has_req_pool_slot: bool, prefill_tokens: int = 0
+    ) -> int:
+        """Extra KV slots beyond prefill, including request-owned workspace.
+
+        ``prefill_tokens`` includes the cached prefix and selected extension.
+        """
+        return 0
+
     def translate_kv_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:

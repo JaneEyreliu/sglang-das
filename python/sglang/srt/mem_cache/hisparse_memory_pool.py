@@ -63,6 +63,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             **kwargs,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
+        self.data_strides = torch.full_like(self.data_ptrs, self.bytes_per_token)
 
     def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
         self.full_to_hisparse_device_index_mapping = (
