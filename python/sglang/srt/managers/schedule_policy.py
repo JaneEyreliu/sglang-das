@@ -839,11 +839,14 @@ class PrefillAdder:
     def _request_slot_reserve_for_req(
         self, req: Req, *, extend_input_len: Optional[int] = None
     ) -> int:
+        # Upstream reads req.prefix_len; this fork has no such attribute and
+        # derives the prefix from prefix_indices everywhere in this module.
+        prefix_len = len(req.prefix_indices)
         if extend_input_len is None:
-            extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+            extend_input_len = len(req.full_untruncated_fill_ids) - prefix_len
         return self.token_to_kv_pool_allocator.request_slot_reserve(
             has_req_pool_slot=req.req_pool_idx is not None,
-            prefill_tokens=req.prefix_len + extend_input_len,
+            prefill_tokens=prefix_len + extend_input_len,
         )
 
     def ceil_paged_tokens(self, tokens: int) -> int:

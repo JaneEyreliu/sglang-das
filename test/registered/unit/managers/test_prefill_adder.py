@@ -89,6 +89,7 @@ class TestPrefillAdder(CustomTestCase):
         allocator.swa_available_size.return_value = swa_available_size
         allocator.available_size.return_value = available_size
         allocator.size_swa = size_swa
+        allocator.request_slot_reserve.return_value = 0
         return allocator
 
     def create_running_batch(self, reqs=None) -> MagicMock:
@@ -109,6 +110,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
         req = MagicMock(spec=Req)
+        req.req_pool_idx = None
         req.rid = str(rid)
         req.priority = priority
         req.prefix_indices = []
