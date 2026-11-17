@@ -82,6 +82,8 @@ def _make_model_runner(
     qk_rope_head_dim=64,
     swa_kv_lora_rank=128,
     swa_qk_rope_head_dim=32,
+    enable_hisparse=False,
+    hisparse_host_to_device_ratio=1,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -120,6 +122,9 @@ def _make_model_runner(
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mc.hf_config.get_text_config = lambda: mc.hf_config
+    # Real ModelConfig exposes hf_text_config; the cell-size path reads it to
+    # parse the QSA profile.
+    mc.hf_text_config = mc.hf_config
     mc.linear_attn_registry_result = None
     mc.context_len = 8192
     mr.model_config = mc
@@ -143,7 +148,10 @@ def _make_model_runner(
         disaggregation_mode=disaggregation_mode,
         max_running_requests=max_running_requests,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
-        enable_hisparse=False,
+        enable_hisparse=enable_hisparse,
+        hisparse_config=(
+            f'{{"host_to_device_ratio": {hisparse_host_to_device_ratio}}}'
+        ),
         enable_hierarchical_cache=False,
         enable_dsa_cache_layer_split=False,
         kv_cache_dtype="auto",
@@ -751,6 +759,73 @@ class TestEagleConfigurator(CustomTestCase):
             config.max_total_num_tokens * actual_bytes_per_token,
             available,
         )
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_hisparse_draft_expanded_id_space_is_budgeted(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """Under HiSparse, the draft adds exactly one copy of host_to_device_ratio.
+
+        The dense draft pool is direct-indexed by the target allocator's
+        host-expanded logical IDs, so the draft term spans ratio times the
+        device space. Both the draft KV (draft_loc_space_scale) and the draft
+        index-K (the ratio already applied inside
+        _compute_dsa_indexer_cell_size) carry that factor, so applying the
+        scale to the indexer a second time would make the draft grow as
+        ratio**2 and over-price the pool; dropping it entirely would leave the
+        draft flat and under-budget the pool.
+
+        Asserted as the eagle-vs-no-eagle delta at several ratios, so the test
+        pins the draft's own scaling and stays independent of how the target
+        prices its active indexer layers (the target's index-K is replicated
+        across the same logical space and therefore scales too).
+        """
+        available = 10_000_000
+        num_layers = 78
+        draft_num_layers = 1
+
+        def _cell_size_for(ratio, *, eagle):
+            mr = _make_model_runner(
+                self,
+                num_layers=num_layers,
+                use_mla_backend=True,
+                enable_hisparse=True,
+                hisparse_host_to_device_ratio=ratio,
+            )
+            _configure_dsa_model(mr)
+            mr.model_config.hf_config.index_topk_freq = 4
+            mr.model_config.hf_config.index_skip_topk_offset = 3
+            if eagle:
+                mr.spec_algorithm.is_eagle.return_value = True
+                mr.spec_algorithm.is_none.return_value = False
+                mr.spec_aux_config.eagle_draft_num_layers = draft_num_layers
+
+            with mock_cpu_env(kv_size=1):
+                from sglang.srt.model_executor.pool_configurator import (
+                    create_memory_pool_configurator,
+                )
+
+                cfg = create_memory_pool_configurator(mr)
+                config = cfg.calculate_pool_sizes(available, page_size=1)
+            return cfg._cell_size, config.max_total_num_tokens
+
+        draft_deltas = {}
+        for ratio in (1, 2, 4):
+            target_cell, _ = _cell_size_for(ratio, eagle=False)
+            full_cell, tokens = _cell_size_for(ratio, eagle=True)
+            draft_deltas[ratio] = full_cell - target_cell
+            self.assertLessEqual(tokens * full_cell, available)
+
+        # Linear in ratio: a double-scaled draft would grow quadratically
+        # (4x at ratio=2), an unscaled one would stay constant.
+        unit = draft_deltas[1]
+        self.assertGreater(unit, 0)
+        for ratio, delta in draft_deltas.items():
+            self.assertEqual(delta, unit * ratio)
 
     def test_hybrid_swa_draft_uses_swa_geometry_and_capacity(self):
         """SWA draft layers use SWA KV geometry and capacity."""

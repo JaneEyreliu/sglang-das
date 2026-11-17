@@ -226,7 +226,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     # The draft pool is direct-indexed by the target allocator's
                     # host-expanded logical IDs.  Account for the entire dense
                     # address space that KVCacheConfigurator allocates below.
-                    draft_loc_space_scale = parse_hisparse_config().host_to_device_ratio
+                    # This fork's parse_hisparse_config takes server_args as a
+                    # required positional argument; upstream defaults it.
+                    draft_loc_space_scale = parse_hisparse_config(
+                        kvc.server_args
+                    ).host_to_device_ratio
                 if is_deepseek_dsa(kvc.model_config.hf_config):
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
