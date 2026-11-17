@@ -153,6 +153,51 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.scheduler = scheduler
         return queue
 
+    def test_hisparse_prealloc_reserves_scratch_for_pending_transfers(self):
+        """Pending PD requests consume a full buffer AND scratch, not just a buffer.
+
+        hisparse_req_budget = avail // (padded_buffer + scratch) - pending, so
+        charging only padded_buffer would over-admit by one request per
+        4160/(4160+1024) of the pool.
+        """
+        for available, pending, admitted in (
+            # One buffer's worth of pool cannot cover buffer + scratch.
+            (4160, 0, 0),
+            # Two slots, one already owed to an in-flight transfer... but
+            # 8320 // 5184 == 1, so the pending req consumes the only slot.
+            (8320, 1, 0),
+            # Two slots, one pending -> exactly one admission.
+            (10368, 1, 1),
+            # Two slots, nothing pending -> both admitted.
+            (10368, 0, 2),
+        ):
+            with self.subTest(available=available, pending=pending):
+                reqs = [self._new_decode_req(f"hisparse-{i}", i) for i in range(3)]
+                queue = self._new_queue(reqs)
+                queue.scheduler.enable_priority_scheduling = False
+                queue.scheduler.enable_hisparse = True
+                queue.scheduler.hisparse_coordinator = SimpleNamespace(
+                    padded_buffer_size=4160,
+                    spec_swap=SimpleNamespace(scratch_capacity=1024),
+                )
+                queue.token_to_kv_pool_allocator.hisparse_attn_allocator = (
+                    SimpleNamespace(available_size=lambda: available)
+                )
+                queue.transfer_queue.queue = [
+                    SimpleNamespace(host_staged=False) for _ in range(pending)
+                ]
+
+                with patch(
+                    "sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096
+                ):
+                    preallocated, failed = queue.pop_preallocated()
+
+                self.assertEqual(failed, [])
+                self.assertEqual(
+                    [d.req.rid for d in preallocated],
+                    [f"hisparse-{i}" for i in range(admitted)],
+                )
+
     def test_prealloc_queue_schedules_higher_priority_values_first_by_default(self):
         reqs = [
             self._new_decode_req("low", 1),

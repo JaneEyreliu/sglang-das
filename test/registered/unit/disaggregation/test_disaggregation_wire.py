@@ -45,6 +45,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -573,6 +574,110 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         )
         self.assertEqual(future_map.dsa_topk_indices_buf.shape, (4, 3))
         self.assertEqual(future_map.dsa_topk_indices_buf.dtype, torch.int32)
+
+
+class TestMooncakeHiSparseSpecIndices(CustomTestCase):
+    """A local target layer count must not turn remote target KV into draft KV.
+
+    Upstream #37771 infers the draft pointers positionally from
+    num_draft_entries, which mis-slices under PP. This fork matches decode
+    layer ids against draft_kv_layer_id_start instead, so the selection is
+    independent of how many layers the local stage owns.
+    """
+
+    def _manager(self, *, draft_start):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            mla_compression_ratios=None,
+            draft_kv_layer_id_start=draft_start,
+        )
+        return manager
+
+    def test_draft_ptrs_selected_by_layer_id_not_local_stage_size(self):
+        # Decode owns 5 layers: target 0..3 plus one draft layer with id 4.
+        # Every PP stage sees the same decode-side ids, so each picks the same
+        # single draft pointer regardless of how many layers it holds locally.
+        manager = self._manager(draft_start=4)
+        self.assertEqual(
+            manager._dsa_hisparse_draft_dst_ptrs(
+                [10000, 20000, 30000, 40000, 50000], [0, 1, 2, 3, 4]
+            ),
+            {50000},
+        )
+
+    def test_multiple_draft_layers_are_all_selected(self):
+        manager = self._manager(draft_start=2)
+        self.assertEqual(
+            manager._dsa_hisparse_draft_dst_ptrs(
+                [10000, 20000, 30000, 40000], [0, 1, 2, 3]
+            ),
+            {30000, 40000},
+        )
+
+    def test_missing_draft_entries_is_rejected(self):
+        manager = self._manager(draft_start=None)
+        with self.assertRaisesRegex(RuntimeError, "without.*draft KV entries"):
+            manager._dsa_hisparse_draft_dst_ptrs([10000], [0])
+
+    def test_missing_layer_ids_is_rejected(self):
+        # Without decode layer ids the selection would silently fall back to a
+        # positional guess, which is exactly the upstream PP bug.
+        manager = self._manager(draft_start=1)
+        for dst_layer_ids in (None, [], [0]):
+            with self.subTest(dst_layer_ids=dst_layer_ids):
+                with self.assertRaisesRegex(RuntimeError, "decode KV layer ids"):
+                    manager._dsa_hisparse_draft_dst_ptrs(
+                        [10000, 20000], dst_layer_ids
+                    )
+
+
+class TestHiSparseStagedSpecRelay(CustomTestCase):
+    def test_builds_lightweight_eagle_relay_handle(self):
+        future_map = object.__new__(FutureMap)
+        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
+        future_map.dsa_topk_indices_buf = None
+        future_indices = torch.tensor([2, 5], device="cpu")
+
+        spec_input = future_map.make_staged_spec_input(future_indices)
+
+        self.assertIs(spec_input.future_indices, future_indices)
+        self.assertFalse(spec_input.future_dsa_topk_indices_available)
+
+    def test_staged_relay_restores_rejection_sampling_probs(self):
+        future_map = object.__new__(FutureMap)
+        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
+        future_map.device = torch.device("cpu")
+        future_map.need_topk = True
+        future_map.need_hidden_states = False
+        future_map.topk_p_buf = torch.zeros((4, 1), dtype=torch.float32)
+        future_map.topk_index_buf = torch.zeros((4, 1), dtype=torch.int64)
+        future_map.output_tokens_buf = torch.arange(4, dtype=torch.int64)
+        future_map.hidden_states_buf = None
+        future_map.draft_probs_buf = torch.arange(12, dtype=torch.float32).view(4, 3)
+        future_map.dsa_topk_indices_buf = None
+        future_indices = torch.tensor([2, 3], dtype=torch.int64)
+        spec_input = future_map.make_staged_spec_input(future_indices)
+        gathered = (
+            torch.zeros((2, 1)),
+            torch.zeros((2, 1), dtype=torch.int64),
+            torch.tensor([2, 3]),
+            None,
+        )
+
+        # _resolve_spec_extras picks the HCU kernel when running on HCU, so
+        # both gather entry points must be stubbed for this to be host-only.
+        with patch(
+            "sglang.srt.managers.overlap_utils.gather_spec_extras",
+            return_value=gathered,
+        ), patch(
+            "sglang.srt.managers.overlap_utils._gather_spec_extras",
+            return_value=gathered,
+        ):
+            future_map._resolve_spec_extras(SimpleNamespace(spec_info=spec_input))
+
+        torch.testing.assert_close(
+            spec_input.draft_probs, future_map.draft_probs_buf[future_indices]
+        )
 
 
 class TestDSV4C128StateIndices(unittest.TestCase):
