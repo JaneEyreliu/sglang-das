@@ -308,7 +308,7 @@ class HiSparseSpecSwapManager:
 
         # CPU-side logical reservations cover verify even when overlap lags seq_lens.
         for req in batch.reqs:
-            req_pool_idx = req.kv.req_pool_idx
+            req_pool_idx = req.req_pool_idx
             allocated_len = int(
                 coordinator.req_to_host_pool_allocated_len[req_pool_idx]
             )
@@ -456,7 +456,7 @@ class HiSparseSpecSwapManager:
             ],
         )
         for req in batch.reqs:
-            coordinator._skip_first_backup[req.kv.req_pool_idx] = True
+            coordinator._skip_first_backup[req.req_pool_idx] = True
 
     def swap_in(
         self,
@@ -826,7 +826,7 @@ class HiSparseCoordinator:
             self.req_device_buffer_tokens[
                 :, req.req_pool_idx, : self.device_buffer_size
             ] = -1
-            self.spec_swap.invalidate_cache(req.kv.req_pool_idx)
+            self.spec_swap.invalidate_cache(req.req_pool_idx)
 
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
@@ -899,8 +899,8 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
-        self.spec_swap.allocate_scratch(req.kv.req_pool_idx)
-        self.spec_swap.reset(req.kv.req_pool_idx)
+        self.spec_swap.allocate_scratch(req.req_pool_idx)
+        self.spec_swap.reset(req.req_pool_idx)
 
     def _grow_device_buffers(
         self,
