@@ -871,6 +871,36 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
             server_args._validate_hisparse_kv_cache_dtype()
 
+    def test_hisparse_rejects_adaptive_speculation(self):
+        """HiSparse sizes its swap state statically, so the draft length is fixed."""
+        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=1,
+            speculative_adaptive=True,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+        )
+
+        # This fork reads the model config through ServerArgs.get_model_config
+        # rather than upstream's module-level model_config_of.
+        with (
+            patch.object(
+                ServerArgs, "get_model_config", return_value=model_config
+            ),
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "speculative-adaptive"):
+                validate_hisparse(server_args)
+
 
 class TestFa4PageSizeAutoForce(CustomTestCase):
     """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
