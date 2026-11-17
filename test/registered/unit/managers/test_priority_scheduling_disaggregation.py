@@ -93,6 +93,8 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             sampling_params=SimpleNamespace(max_new_tokens=8),
             cache_protected_len=0,
             time_stats=MagicMock(),
+            # pop_preallocated reaches _is_fake_transfer, which reads this.
+            bootstrap_host="127.0.0.1",
         )
         return SimpleNamespace(
             req=req,
@@ -114,7 +116,15 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue._num_published_destinations = 0
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
+        # The admission budget helper is named `_allocatable_token_budgets` in
+        # this fork. Mocking only the older `_allocatable_tokens` name lets the
+        # real method run and return a MagicMock, which then fails the
+        # `int > MagicMock` comparison inside pop_preallocated. Mock both, plus
+        # the two other real helpers pop_preallocated calls before admission.
         queue._allocatable_tokens = MagicMock(return_value=1000)
+        queue._allocatable_token_budgets = MagicMock(return_value=1000)
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
         def pre_alloc_mock(req, prefix_indices=None, prefix_len=0, total_prefix_len=0):
             return torch.arange(
@@ -137,7 +147,13 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.token_to_kv_pool_allocator.page_size = 1
         queue.token_to_kv_pool_allocator.available_size.return_value = 1000
         queue.token_to_kv_pool = MagicMock()
-        queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
+        queue.draft_token_to_kv_pool = None
+        queue.transfer_queue = SimpleNamespace(
+            queue=[],
+            enable_staging=False,
+            # The failed-request scan calls this on every aborted req.
+            _release_pd_hidden_rows=lambda decode_req: None,
+        )
         queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
         queue.tree_cache = MagicMock()
 
