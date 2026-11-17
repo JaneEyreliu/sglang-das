@@ -555,6 +555,146 @@ class TestPrefillAdder(CustomTestCase):
         req.set_extend_range.assert_not_called()
         self.assertEqual(len(adder.can_run_list), 0)
 
+    def _hisparse_allocator(self, *, size, page_size, scratch, device_buffer):
+        """Real HiSparse allocator on CPU, configured for spec swapping.
+
+        The MagicMock allocator stubs request_slot_reserve to 0, so these cases
+        exercise the production formula:
+          max(device_buffer - ceil_page(prefill), 0)
+          + (0 if the req already owns a slot else scratch)
+        """
+        import torch
+
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            HiSparseTokenToKVPoolAllocator,
+        )
+
+        allocator = HiSparseTokenToKVPoolAllocator(
+            size=size,
+            page_size=page_size,
+            dtype=torch.float32,
+            device="cpu",
+            kvcache=SimpleNamespace(register_mapping=lambda mapping: None),
+            need_sort=False,
+        )
+        allocator.configure_spec_scratch(scratch, device_buffer_size=device_buffer)
+        return allocator
+
+    @staticmethod
+    def _set_rem_total_tokens(adder, target: int) -> None:
+        """Pin rem_total_tokens, which is a read-only property.
+
+        It is available_size + evictable - rem_total_token_offset, and the
+        offset is the only writable term.
+        """
+        adder.rem_total_token_offset = int(adder.rem_total_tokens) - target
+
+    def test_hisparse_request_slot_reserve_formula(self):
+        allocator = self._hisparse_allocator(
+            size=10496, page_size=64, scratch=1024, device_buffer=4160
+        )
+        cases = [
+            # (has_req_pool_slot, prefill_tokens, expected)
+            # Fresh request, nothing prefilled: whole buffer plus one scratch.
+            (False, 0, 4160 + 1024),
+            # Prefill KV is reused by the persistent buffer; only the missing
+            # slots are charged, but the scratch is still owed.
+            (False, 100, 4160 - 128 + 1024),
+            # A continuing chunk already holds its scratch -> buffer only.
+            (True, 100, 4160 - 128),
+            # Prefill longer than the buffer owes nothing for the buffer.
+            (True, 8192, 0),
+            (False, 8192, 1024),
+        ]
+        for has_slot, prefill, expected in cases:
+            with self.subTest(has_req_pool_slot=has_slot, prefill_tokens=prefill):
+                self.assertEqual(
+                    allocator.request_slot_reserve(
+                        has_req_pool_slot=has_slot, prefill_tokens=prefill
+                    ),
+                    expected,
+                )
+
+    def test_hisparse_reserve_is_charged_to_prefill_admission(self):
+        """A short prompt must still budget the whole device buffer + scratch.
+
+        Without the reserve the 100-token prompt would be admitted against
+        total_tokens = 100 + max_new + page; with it the admission must also
+        cover 4160 + 1024, so a pool that only fits the prompt is rejected.
+        """
+        allocator = self._hisparse_allocator(
+            size=10496, page_size=64, scratch=1024, device_buffer=4160
+        )
+        req = self.create_mock_req("hisparse", priority=0, max_new_tokens=0)
+        req.full_untruncated_fill_ids = list(range(100))
+        req.sampling_params.ignore_eos = False
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.last_node = MagicMock()
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+
+        reserve = allocator.request_slot_reserve(
+            has_req_pool_slot=False, prefill_tokens=100
+        )
+        self.assertEqual(reserve, 4160 - 128 + 1024)
+
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            token_to_kv_pool_allocator=allocator,
+        )
+        self.assertEqual(
+            adder._request_slot_reserve_for_req(req, extend_input_len=100), reserve
+        )
+
+        # Room for the prompt and the page overhead but not for the reserve.
+        self._set_rem_total_tokens(adder, 100 + 64 + 1)
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.NO_TOKEN,
+        )
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_hisparse_chunked_req_defers_when_reserve_cannot_shrink(self):
+        """A shrunk chunk cannot pay for the buffer, so it must be deferred.
+
+        The reserve is max(buffer - prefill, 0): capping the chunk raises it
+        rather than lowering it, so admitting a smaller chunk would never fit.
+        Deferring and retrying next round is the only way out.
+        """
+        allocator = self._hisparse_allocator(
+            size=10496, page_size=64, scratch=1024, device_buffer=4160
+        )
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            rem_chunk_tokens=128,
+            token_to_kv_pool_allocator=allocator,
+        )
+        self._set_rem_total_tokens(adder, 100_000)
+
+        req = self.create_mock_req("hisparse-chunk", priority=0, max_new_tokens=0)
+        # Mid-chunk requests already own a req pool slot, so only the device
+        # buffer is owed -- still far more than rem_chunk_tokens.
+        req.req_pool_idx = 3
+        req.prefix_indices = list(range(64))
+        req.full_untruncated_fill_ids = list(range(1024))
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIs(result, req)  # deferred, not admitted
+        req.set_extend_range.assert_not_called()
+        self.assertEqual(adder.can_run_list, [])
+
     def test_swa_budget_for_req(self):
         # budget = max(alloc - window, 0) + min(extend + max_new, window) + page,
         # where alloc = min(extend, rem_chunk). The decode headroom is the SWA the
