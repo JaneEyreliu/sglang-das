@@ -576,6 +576,102 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         self.assertEqual(future_map.dsa_topk_indices_buf.dtype, torch.int32)
 
 
+class TestHiSparsePrefillDraftMetadata(unittest.TestCase):
+    def test_layer_shard_non_owner_keeps_global_draft_boundary(self):
+        from sglang.srt.disaggregation import prefill
+
+        for rank, has_draft in ((0, True), (7, True), (0, False)):
+            with self.subTest(rank=rank, has_draft=has_draft):
+                pool = SimpleNamespace(
+                    layer_shard_enabled=True,
+                    layer_shard_rank=rank,
+                    layer_shard_size=8,
+                    layer_shard_start=rank,
+                    start_layer=rank,
+                    end_layer=rank + 1,
+                    page_size=64,
+                    get_contiguous_buf_infos=lambda: ([1000], [4096], [64]),
+                )
+                draft_pool = SimpleNamespace(
+                    start_layer=0,
+                    end_layer=1,
+                    get_contiguous_buf_infos=lambda: ([2000], [4096], [64]),
+                )
+                queue = SimpleNamespace(
+                    tp_rank=rank,
+                    pp_rank=0,
+                    pp_size=1,
+                    token_to_kv_pool=pool,
+                    draft_token_to_kv_pool=draft_pool if has_draft else None,
+                    is_mla_backend=True,
+                    transfer_backend=None,
+                    scheduler=SimpleNamespace(
+                        ps=SimpleNamespace(dp_rank=0, gpu_id=rank),
+                        tp_worker=SimpleNamespace(
+                            model_runner=SimpleNamespace(kv_cache_dtype_str="fp8_e4m3")
+                        ),
+                        model_config=SimpleNamespace(num_hidden_layers=8),
+                        server_args=SimpleNamespace(),
+                    ),
+                    metadata_buffers=SimpleNamespace(
+                        get_buf_infos=lambda: ([], [], [])
+                    ),
+                )
+                def manager_factory(args, *unused):
+                    return SimpleNamespace(kv_args=args)
+
+                def get_class(backend, kind):
+                    return KVArgs if kind == prefill.KVClassType.KVARGS else manager_factory
+
+                with (
+                    patch.object(prefill, "get_kv_class", side_effect=get_class),
+                    patch.object(prefill, "setup_state_kv_args"),
+                    patch.object(
+                        prefill,
+                        "get_disagg",
+                        return_value=SimpleNamespace(disaggregation_ib_device="mlx5_0"),
+                    ),
+                ):
+                    manager = prefill.PrefillBootstrapQueue._init_kv_manager(queue)
+                args = manager.kv_args
+                boundary = getattr(args, "draft_kv_layer_id_start", None)
+                self.assertEqual(boundary, 8 if has_draft else None)
+                self.assertEqual(len(args.kv_data_ptrs), 2 if rank == 7 and has_draft else 1)
+                if has_draft:
+                    sender = object.__new__(MooncakeKVManager)
+                    sender.kv_args = args
+                    self.assertEqual(
+                        sender._dsa_hisparse_draft_dst_ptrs(
+                            [10000, 20000], [rank, 8]
+                        ),
+                        {20000},
+                    )
+                    sender.is_mla_backend = True
+                    sender.pp_size = 1
+                    sender.enable_custom_mem_pool = False
+                    sender._transfer_data = Mock(return_value=0)
+                    local_ids = [rank, 8] if rank == 7 else [rank]
+                    src_ptrs = [1000, 2000] if rank == 7 else [1000]
+                    rc = sender._send_kvcache_generic(
+                        mooncake_session_id="test",
+                        src_data_ptrs=src_ptrs,
+                        dst_data_ptrs=[10000, 20000],
+                        item_lens=[64] * len(src_ptrs),
+                        prefill_data_indices=np.array([2], dtype=np.int32),
+                        dst_data_indices=np.array([10], dtype=np.int32),
+                        executor=None,
+                        src_layer_ids=local_ids,
+                        dst_layer_ids=[rank, 8],
+                        dst_device_data_indices=np.array([20], dtype=np.int32),
+                        dst_device_data_ptrs={20000},
+                    )
+                    expected = [(1128, 10640, 64)]
+                    if rank == 7:
+                        expected.append((2128, 21280, 64))
+                    self.assertEqual(rc, 0)
+                    sender._transfer_data.assert_called_once_with("test", expected)
+
+
 class TestMooncakeHiSparseSpecIndices(CustomTestCase):
     """A local target layer count must not turn remote target KV into draft KV.
 

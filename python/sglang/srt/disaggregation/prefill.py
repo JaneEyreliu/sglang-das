@@ -446,10 +446,11 @@ class PrefillBootstrapQueue:
             )
             kv_args.prefill_draft_start_layer = 0
             kv_args.prefill_draft_end_layer = num_draft_entries // 2
-        if num_draft_entries:
-            # Draft entries carry layer ids >= num_hidden_layers (see
-            # build_kv_layer_ids); a HiSparse decode peer routes them to its
-            # device page space instead of host pages.
+        if self.draft_token_to_kv_pool is not None:
+            # Keep the global draft boundary even on PP/LayerSplit ranks that
+            # do not send draft KV locally. Every sender sees the decode peer's
+            # full layer list and must distinguish its host and device pages.
+            # build_kv_layer_ids assigns draft ids >= num_hidden_layers.
             kv_args.draft_kv_layer_id_start = (
                 self.scheduler.model_config.num_hidden_layers
             )
