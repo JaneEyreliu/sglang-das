@@ -25,6 +25,27 @@ class TestDSAOffloadSignatures(unittest.TestCase):
                 self.assertIn("mamba_indices", signature.parameters)
 
 
+class TestMLAHostRegistration(unittest.TestCase):
+    def test_registration_uses_cpu_pointers_including_draft_layer(self):
+        pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        pool.layer_num = 3  # Two target layers and one packed MTP draft layer.
+        pool.page_size = 4
+        pool.token_stride_size = 8
+        pool.kv_buffer = torch.empty((3, 8, 8), dtype=torch.uint8)
+        pool.data_refs = list(pool.kv_buffer.unbind(0))
+        host_ptrs = [buffer.data_ptr() for buffer in pool.data_refs]
+        # Model HCU's distinct device aliases without allocating device memory.
+        aliases = torch.tensor([ptr + 4096 for ptr in host_ptrs], dtype=torch.uint64)
+        pool.data_ptrs = aliases.clone()
+
+        ptrs, lengths, item_lengths = pool.get_contiguous_buf_infos()
+
+        self.assertEqual(ptrs, host_ptrs)
+        self.assertEqual(lengths, [64, 64, 64])
+        self.assertEqual(item_lengths, [32, 32, 32])
+        self.assertEqual(pool.data_ptrs.tolist(), aliases.tolist())
+
+
 class TestDSAHiCacheTransfer(unittest.TestCase):
     def setUp(self):
         if not torch.cuda.is_available():
