@@ -177,8 +177,13 @@ def _validate_dsa_dcp_launch(
         )
     if enable_prefill_cp:
         raise ValueError("DSA DCP does not support prefill CP in the first phase.")
-    if enable_hisparse:
-        raise ValueError("DSA DCP does not support HiSparse in the first phase.")
+    if enable_hisparse and not is_hy_v4_model:
+        # HY4 is adapted: the HiSparse host pool shards in POSITION space
+        # (pos % dcp_size == dcp_rank -> row pos // dcp_size) rather than
+        # reusing the paged logical-loc translation, and the PD relayout
+        # carries a second destination array for the MTP draft pool. Neither
+        # applies to the other DSA models, which keep the original rejection.
+        raise ValueError("DSA DCP supports HiSparse only for HY4.")
     if enable_hierarchical_cache:
         raise ValueError("DSA DCP does not support HiCache in the first phase.")
     if enable_symm_mem:

@@ -1974,7 +1974,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "hisparse_page_size",
                     page_size,
                 )
-                kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
+                # _pre_alloc returned host rows, which are compressed and (under
+                # DCP) rank-local; truncate in that unit, not in token units.
+                kv_indices = dst_kv_indices[
+                    : self.scheduler.hisparse_coordinator.local_host_token_len(
+                        origin_input_len - prefix_len
+                    )
+                ]
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = self.req_to_token_pool.req_to_token[
@@ -2535,13 +2541,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 uses_swa_tail=uses_swa_tail,
                 swa_tail_len=swa_tail_len,
             )
-            # Allocate host indices for the RDMA transfer target.
+            # Allocate host indices for the RDMA transfer target. Under
+            # attention DCP this rank only owns the positions where
+            # pos % dcp_size == dcp_rank, and req_to_host_pool is sized for
+            # that share alone -- reserving the global length would overrun it.
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                 coordinator.req_to_host_pool,
                 coordinator.req_to_host_pool_allocated_len,
                 req.req_pool_idx,
                 0,
-                coordinator.host_token_len(fill_len),
+                coordinator.local_host_token_len(fill_len),
             )
         else:
             kv_loc = alloc_for_decode_prealloc(

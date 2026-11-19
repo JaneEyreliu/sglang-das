@@ -1982,9 +1982,21 @@ class KVCacheConfigurator:
             self.is_draft_worker
             and is_hy_v4(self.model_config.hf_config)
             and get_parallel().dcp_enabled
+            and not get_memory().enable_hisparse
         ):
             # The shared allocator owns retraction of both pools, including the
-            # replicated draft state whose slots will otherwise be reused.
+            # draft state whose slots will otherwise be reused.
+            #
+            # HiSparse is excluded because it swaps the allocator for
+            # HiSparseTokenToKVPoolAllocator, which has no register_draft_pool
+            # -- that method is HYV4DCPAllocator-only, so calling it here would
+            # raise AttributeError at startup. Nothing is lost: the HiSparse
+            # allocator inherits the base get_cpu_copy/load_cpu_copy, which
+            # raise NotImplementedError, so it has no retraction path for a
+            # registered draft pool to serve. Its geometry check would reject
+            # the pool regardless -- the HiSparse allocator pages at
+            # get_schedule().page_size while the draft pool pages at
+            # page_size * dcp_size (loc_space_scale).
             token_to_kv_pool_allocator.register_draft_pool(token_to_kv_pool)
         return token_to_kv_pool_allocator
 

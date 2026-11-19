@@ -1176,10 +1176,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         num_kv_tokens: int,
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: List[int],
+        dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
         physical_page_size = self.kv_args.page_size
+        dst_draft_kv_ptrs: Optional[set[int]] = None
+        if dst_device_kv_indices is not None:
+            # DSA HiSparse: the decode side keeps target KV in DCP-sharded host
+            # pages but the MTP draft pool on-device at ``virtual_loc // dcp_size``
+            # (fold per the draft read/write kernels). One plan, two destinations.
+            dst_draft_kv_ptrs = self._dsa_hisparse_draft_dst_ptrs(
+                dst_kv_ptrs, dst_layer_ids
+            )
         plan = build_dcp_token_transfer_plan(
             prefill_kv_indices,
             dst_kv_indices,
@@ -1189,6 +1198,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_page_offset=src_page_offset,
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
+            dst_draft_page_indices=dst_device_kv_indices,
         )
         if plan.src_token_indices.size == 0:
             return 0
@@ -1213,6 +1223,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             plan.src_token_indices,
             plan.dst_token_indices,
         )
+        draft_runs = None
+        if plan.dst_draft_token_indices is not None:
+            draft_runs = group_concurrent_contiguous_runs(
+                plan.src_token_indices,
+                plan.dst_draft_token_indices,
+            )
 
         layers_params = [
             (
@@ -1228,10 +1244,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, token_item_len: int
         ) -> Tuple[List[int], List[int], List[int]]:
+            if dst_draft_kv_ptrs and int(dst_ptr) in dst_draft_kv_ptrs:
+                assert draft_runs is not None
+                layer_src_starts, layer_dst_starts, layer_run_lens = draft_runs
+            else:
+                layer_src_starts, layer_dst_starts, layer_run_lens = (
+                    src_starts,
+                    dst_starts,
+                    run_lens,
+                )
             return (
-                (src_ptr + src_starts * token_item_len).tolist(),
-                (dst_ptr + dst_starts * token_item_len).tolist(),
-                (run_lens * token_item_len).tolist(),
+                (src_ptr + layer_src_starts * token_item_len).tolist(),
+                (dst_ptr + layer_dst_starts * token_item_len).tolist(),
+                (layer_run_lens * token_item_len).tolist(),
             )
 
         def process_layer(src_ptr: int, dst_ptr: int, token_item_len: int) -> int:
@@ -2466,12 +2491,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                         chunked_dst_device_kv_indice = None
                         if is_dcp_transfer:
-                            if req.dst_device_kv_indices is not None:
-                                raise RuntimeError(
-                                    "HiSparse destination device indices are not "
-                                    "supported by PD DCP relayout"
-                                )
+                            # Under DCP relayout the decode side sends ONE
+                            # whole-request index array (not per-chunk slices);
+                            # send_kvcache_dcp offsets into it via
+                            # src_page_offset. HiSparse adds a second array for
+                            # the MTP draft pool (the target's raw virtual page
+                            # ids), indexed the same way, so it is forwarded
+                            # whole as well.
                             chunked_dst_kv_indice = req.dst_kv_indices
+                            chunked_dst_device_kv_indice = req.dst_device_kv_indices
                         else:
                             chunked_dst_kv_indice = req.dst_kv_indices[
                                 kv_chunk.index_slice
@@ -2538,6 +2566,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_layer_ids=(
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
+                                dst_device_kv_indices=chunked_dst_device_kv_indice,
                             )
                         elif (
                             self.is_mla_backend

@@ -811,6 +811,16 @@ class HiSparseCoordinator:
             self.dcp_rank < compressed_len % self.dcp_size
         )
 
+    def local_host_token_len(self, kv_allocated_len: int) -> int:
+        """Host rows this rank must own for a request of kv_allocated_len tokens.
+
+        Compression first (DSV4 keeps one host row per compress_ratio tokens),
+        then this rank's share of those rows. The PD prealloc path reserves with
+        this, not host_token_len: req_to_host_pool is only
+        ceil(max_compressed / dcp_size) wide.
+        """
+        return self.local_host_len_int(self.host_token_len(kv_allocated_len))
+
     def allocate_spec_scratch(self, req_pool_indices: List[int]) -> None:
         for req_pool_idx in req_pool_indices:
             self.spec_swap.allocate_scratch(req_pool_idx)

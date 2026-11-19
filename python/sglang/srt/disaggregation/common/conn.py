@@ -410,6 +410,15 @@ class CommonKVManager(BaseKVManager):
         )
 
     def prepare_dcp_token_item_lens(self, dst_page_item_lens: List[int]) -> List[int]:
+        """Per-token byte stride of each local KV region, for a DCP relayout.
+
+        Callers pass ONE destination page item_len broadcast over all regions.
+        That is exact as long as every region shares a per-token stride, which
+        holds for MLA: all regions store one ``kv_cache_dim``-wide row per
+        token. A region may still report a larger page item_len than its peer
+        -- the HiSparse MTP draft pool pages at ``page_size * dcp_size`` -- but
+        the DCP sender addresses tokens, not pages, so only the stride matters.
+        """
         page_size = self.kv_args.page_size
         src_token_lens = [
             item_len // page_size for item_len in self.kv_args.kv_item_lens

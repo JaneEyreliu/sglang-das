@@ -284,6 +284,18 @@ def group_concurrent_contiguous_runs(
 class DCPTokenTransferPlan:
     src_token_indices: npt.NDArray[np.int64]
     dst_token_indices: npt.NDArray[np.int64]
+    # Second destination for the HiSparse MTP draft pool. Decisive fact (kernel
+    # source, since dcp=1 cannot distinguish fold from no-fold and is the only
+    # tested config): the draft MLA KV is both read and written at ``loc //
+    # dcp_size`` -- transform_index_page_table_decode divides loaded indices by
+    # dcp, and _write_mla_kv_buffer under dcp_widened_write_locs does
+    # ``loc[valid] // dcp``. The raw widened virtual loc is used ONLY by Index-K
+    # (not transferred on this path), which is why the pool is sized size*dcp.
+    # So the prefill must land each owned draft token at ``raw_virtual_loc //
+    # dcp_size`` -- the same fold the sharded host arm applies, but into the
+    # draft pool's own full (not rank-compacted) row array. ``None`` when the
+    # peer registered no draft pool.
+    dst_draft_token_indices: Optional[npt.NDArray[np.int64]] = None
 
 
 def localize_num_kv_tokens_for_page_slice(
@@ -332,6 +344,7 @@ def build_dcp_token_transfer_plan(
     src_page_offset: int = 0,
     decode_prefix_len: int = 0,
     num_kv_tokens: Optional[int] = None,
+    dst_draft_page_indices: Optional[npt.NDArray[np.int32]] = None,
 ) -> DCPTokenTransferPlan:
     virtual_page_size = physical_page_size * dcp_size
     if decode_prefix_len % virtual_page_size != 0:
@@ -352,7 +365,13 @@ def build_dcp_token_transfer_plan(
         )
     if src_pages.size == 0:
         empty = np.empty((0,), dtype=np.int64)
-        return DCPTokenTransferPlan(empty, empty.copy())
+        # Keep the draft arm present/absent in lockstep with the request: the
+        # sender asserts on the draft runs for every draft destination pointer
+        # it selected, so an empty chunk must still yield an empty array, not None.
+        empty_draft = (
+            empty.copy() if dst_draft_page_indices is not None else None
+        )
+        return DCPTokenTransferPlan(empty, empty.copy(), empty_draft)
 
     chunk_start = decode_prefix_len + src_page_offset * physical_page_size
     first_owned_offset = (dcp_rank - chunk_start) % dcp_size
@@ -381,4 +400,45 @@ def build_dcp_token_transfer_plan(
         dst_pages[dst_page_ordinals] * physical_page_size
         + dst_local_offsets % physical_page_size
     )
-    return DCPTokenTransferPlan(src_token_indices, dst_token_indices)
+    dst_draft_token_indices = None
+    if dst_draft_page_indices is not None:
+        dst_draft_token_indices = _build_draft_dst_token_indices(
+            dst_draft_page_indices,
+            relative_positions=relative_positions,
+            page_size=physical_page_size,
+            dcp_size=dcp_size,
+        )
+    return DCPTokenTransferPlan(
+        src_token_indices, dst_token_indices, dst_draft_token_indices
+    )
+
+
+def _build_draft_dst_token_indices(
+    dst_page_indices: npt.NDArray[np.int32],
+    *,
+    relative_positions: npt.NDArray[np.int64],
+    page_size: int,
+    dcp_size: int,
+) -> npt.NDArray[np.int64]:
+    """Destination rows in the HiSparse MTP draft pool for the owned tokens.
+
+    ``dst_page_indices`` are the target's raw virtual locs at page granularity
+    (``virtual_loc // page_size``). Reconstruct each owned token's virtual loc
+    from its chunk position, then fold by ``// dcp_size`` -- the exact reduction
+    the draft read/write kernels apply (transform_index and
+    _write_mla_kv_buffer). ``page_size`` must be the DCP virtual-page's physical
+    stride so the fold stays page-clean (``dcp_size`` divides it).
+    """
+    pages = np.asarray(dst_page_indices, dtype=np.int64)
+    page_ordinals = relative_positions // page_size
+    if page_ordinals.size and (
+        pages.size == 0 or int(page_ordinals.max()) >= pages.size
+    ):
+        raise ValueError(
+            "Insufficient draft destination pages: "
+            f"required={int(page_ordinals.max()) + 1}, provided={pages.size}, "
+            f"page_size={page_size}"
+        )
+    virtual_locs = pages[page_ordinals] * page_size + relative_positions % page_size
+    return virtual_locs // dcp_size
+
