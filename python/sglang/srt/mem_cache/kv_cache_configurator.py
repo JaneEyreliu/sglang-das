@@ -1901,6 +1901,8 @@ class KVCacheConfigurator:
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
                             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                            dcp_size=get_parallel().attn_dcp_size,
+                            dcp_rank=get_parallel().attn_dcp_rank,
                         )
                     elif (
                         get_schedule().page_size == 1 and not get_parallel().dcp_enabled

@@ -559,6 +559,10 @@ class HiSparseCoordinator:
             self.mem_pool_device: HiSparseDSATokenToKVPool = (
                 self.token_to_kv_pool_allocator.get_kvcache()
             )
+            # Host rows stay rank-local: callers hand in logical slots widened
+            # across the dcp group and maybe_dcp_kernel_indices keeps this
+            # rank's stride before collapsing it, so host_to_device_ratio is
+            # the per-rank ratio and must not be scaled by dcp_size.
             self.mem_pool_host = MLATokenToKVPoolHost(
                 device_pool=self.mem_pool_device,
                 host_to_device_ratio=host_to_device_ratio,
@@ -566,6 +570,8 @@ class HiSparseCoordinator:
                 page_size=self.mem_pool_device.page_size,
                 layout="layer_first",
                 override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+                dcp_size=self.token_to_kv_pool_allocator.dcp_size,
+                dcp_rank=self.token_to_kv_pool_allocator.dcp_rank,
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size

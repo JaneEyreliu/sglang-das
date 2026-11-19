@@ -22,9 +22,19 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: HiSparseDSATokenToKVPool,
         need_sort: bool,
         host_to_device_ratio: int = 2,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
     ):
         self._kvcache = kvcache
-        self._size_full = size * host_to_device_ratio
+        # Attention DCP widens only the logical index space: a request's
+        # host-backed slots are dealt across the dcp ranks, so one rank must
+        # hand out ids spanning the whole group. The hisparse device hot
+        # buffer stays rank-local and physical, so it is never scaled.
+        # The interleave granularity itself is applied in position space by
+        # the coordinator, not here.
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
+        self._size_full = size * host_to_device_ratio * dcp_size
         self._size_hisparse = size
         self.compress_ratio = 1
         self.dtype = dtype
