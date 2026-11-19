@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
@@ -44,8 +45,15 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         **kwargs,
     ):
         # Index-K is indexed by logical (host-sized) locs, never by the
-        # device hot-buffer locs, so its size is fixed by the host ratio.
+        # device hot-buffer locs, so its size follows the host ratio. Under
+        # attention DCP those logical locs are dealt across the dcp group, so
+        # one rank hands out ids spanning [0, size * ratio * dcp_size); the
+        # Index-K buffer must cover that whole span or high-rank locs overflow
+        # it. This matches DSATokenToKVPool's own default (size * attn_dcp_size)
+        # and the allocator's _size_full widening.
         kwargs.pop("index_buf_size", None)
+        parallel = get_parallel()
+        dcp_size = parallel.attn_dcp_size if parallel.dcp_enabled else 1
         super().__init__(
             size=size,
             page_size=page_size,
@@ -59,7 +67,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             kv_cache_dim=kv_cache_dim,
             start_layer=start_layer,
             end_layer=end_layer,
-            index_buf_size=size * host_to_device_ratio,
+            index_buf_size=size * host_to_device_ratio * dcp_size,
             **kwargs,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
