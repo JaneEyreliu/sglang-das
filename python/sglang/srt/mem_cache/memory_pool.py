@@ -4302,6 +4302,15 @@ class HybridLinearKVPool(KVCache):
 
 
 class MLATokenToKVPool(KVCache):
+    # Under attention DCP, write locations arrive widened across the dcp group
+    # and this pool applies the owner rule (loc % dcp == rank) plus the // dcp
+    # renumbering itself. Subclasses that hand in locations which are *already*
+    # this rank's local physical rows (HiSparse translates through
+    # full_to_hisparse_device_index_mapping before calling up) set this to
+    # False, so the filter is not applied a second time -- doing so would
+    # silently drop most writes and mis-bound the OOB check.
+    dcp_widened_write_locs: bool = True
+
     def __init__(
         self,
         size: int,
@@ -4457,7 +4466,7 @@ class MLATokenToKVPool(KVCache):
         )
         assert not self.dsa_kv_cache_store_fp8
         parallel = get_parallel()
-        if parallel.dcp_enabled:
+        if parallel.dcp_enabled and self.dcp_widened_write_locs:
             valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
             if not valid_mask.all():
                 loc = loc[valid_mask]
@@ -4513,7 +4522,7 @@ class MLATokenToKVPool(KVCache):
                 from lightop import kvcache as op
 
                 parallel = get_parallel()
-                if parallel.dcp_enabled:
+                if parallel.dcp_enabled and self.dcp_widened_write_locs:
                     # LightOp has no DCP owner/slot parameters. Convert the
                     # widened virtual locations to this rank's local slots.
                     from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -4585,7 +4594,10 @@ class MLATokenToKVPool(KVCache):
         maybe_detect_oob(
             loc,
             0,
-            (self.size + self.padding_capacity) * get_parallel().attn_dcp_size,
+            (self.size + self.padding_capacity)
+            * (
+                get_parallel().attn_dcp_size if self.dcp_widened_write_locs else 1
+            ),
             "set_mla_kv_buffer (MLA)",
         )
         layer_id = (

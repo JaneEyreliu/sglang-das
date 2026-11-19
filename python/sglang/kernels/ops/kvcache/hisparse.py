@@ -97,6 +97,8 @@ def load_cache_to_device_buffer_spec_mla(
     miss_count: torch.Tensor | None = None,
     device_locs: torch.Tensor | None = None,
     host_binding: torch.Tensor | None = None,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> None:
     """Resolve all speculative steps and swap unique misses in one launch pair.
 
@@ -107,8 +109,15 @@ def load_cache_to_device_buffer_spec_mla(
     ``device_locs`` enables resident KV passthrough and single-step draft calls
     using the same hot/scratch state. ``host_binding`` supplies the runtime
     [host base address, row stride in bytes] for the shared HiCache host pool.
+
+    ``dcp_size``/``dcp_rank`` let the kernel apply the attention-DCP owner rule
+    on the *global* compressed positions in ``top_k_tokens``: non-owned
+    occurrences resolve to loc -1 and owned ones read host row ``pos //
+    dcp_size``. See the comment above ``dcp_owned_token`` in the kernel.
     """
     _, num_steps, num_top_k = top_k_tokens.shape
+    if dcp_size < 1 or not 0 <= dcp_rank < dcp_size:
+        raise ValueError(f"invalid dcp pair (size={dcp_size}, rank={dcp_rank}).")
     if not 2 <= num_steps <= SPEC_SWAP_MAX_STEPS and not (
         num_steps == 1 and device_locs is not None
     ):
@@ -214,6 +223,8 @@ def load_cache_to_device_buffer_spec_mla(
         state.scratch_state,
         num_real_reqs,
         page_size,
+        dcp_size,
+        dcp_rank,
         miss_src,
         miss_dst,
         miss_count,
@@ -347,10 +358,15 @@ def _load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None,
     miss_count: torch.Tensor | None,
     skip_io: bool,
+    dcp_size: int,
+    dcp_rank: int,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    assert dcp_size >= 1 and 0 <= dcp_rank < dcp_size, (
+        f"invalid dcp pair (size={dcp_size}, rank={dcp_rank})"
+    )
 
     record_miss_plan = miss_src is not None
     module = _jit_sparse_module(
@@ -397,6 +413,8 @@ def _load_cache_to_device_buffer_mla(
         num_real_reqs,
         page_size,
         item_size_bytes,
+        dcp_size,
+        dcp_rank,
         miss_src,
         miss_dst,
         miss_count,
@@ -424,6 +442,8 @@ def load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
     skip_io: bool = False,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes).
 
@@ -452,6 +472,8 @@ def load_cache_to_device_buffer_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
     )
 
 
@@ -513,6 +535,8 @@ def load_cache_to_device_buffer_dsv4_mla(
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
     skip_io: bool = False,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -537,4 +561,6 @@ def load_cache_to_device_buffer_dsv4_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
     )

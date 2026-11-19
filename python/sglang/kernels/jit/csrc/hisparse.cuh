@@ -23,7 +23,12 @@ constexpr int WARP_SIZE = 32;
 using BallotMask = unsigned int;
 constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFu;
 #endif
-constexpr int32_t TOKEN_HIT = 0xFFFFFFFF;
+// Marks a top-k slot whose KV is already resident in the device buffer. Must
+// be a value no real token position can take: INT32_MAX, not -1, because -1 is
+// how a caller marks a slot it does not back (attention DCP shards the top-k
+// across ranks) and the two must stay distinguishable.
+constexpr int32_t TOKEN_HIT = 0x7FFFFFFF;
+constexpr int32_t TOKEN_HOLE = -1;
 constexpr int32_t HASH_EMPTY = -1;
 
 // Knuth multiplicative hash for open-addressing table of size hash_size.
@@ -302,8 +307,8 @@ template <int NUM_TOP_K, int HOT_BUFFER_SIZE>
 struct SmemLayout {
   static constexpr int HASH_SIZE = NUM_TOP_K * 2;
   static constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
-  // int32_t region: top_k_tokens + chunk_offset + evict_chunk_offset + hash_keys + total_hits + newest_hit
-  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 2;
+  // int32_t region: top_k_tokens + chunk_offset + evict_chunk_offset + hash_keys + total_hits + newest_hit + total_holes
+  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 3;
   // int16_t region: lru_slots_out + hash_vals
   static constexpr int TOTAL_INT16 = HOT_BUFFER_SIZE + HASH_SIZE;
   static constexpr size_t BYTES = TOTAL_INT32 * sizeof(int32_t) + TOTAL_INT16 * sizeof(int16_t);
@@ -354,6 +359,8 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void load_cache_to_device_buffer_ker
     int64_t top_k_device_locs_stride,
     int64_t page_size,
     int64_t item_size_bytes,
+    int32_t dcp_size,
+    int32_t dcp_rank,
     int64_t* __restrict__ miss_src_out,
     int32_t* __restrict__ miss_dst_out,
     int32_t* __restrict__ miss_count_out,
@@ -400,7 +407,10 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void load_cache_to_device_buffer_ker
       int32_t device_loc = -1;
       if (i < count) {
         int32_t token_pos = req_top_k_tokens[i];
-        if (token_pos >= 0) {
+        // Apply the DCP owner rule even though every token is resident: a
+        // position attended by more than one rank is double-counted by the
+        // cross-rank LSE combine.
+        if (token_pos >= 0 && (dcp_size == 1 || token_pos % dcp_size == dcp_rank)) {
           device_loc = req_device_buffer_locs[token_pos];
         }
       }
@@ -432,6 +442,9 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void load_cache_to_device_buffer_ker
   // Scalar counters
   int32_t& s_total_hits = s_hash_keys[HASH_SIZE];
   int32_t& s_newest_hit = s_hash_keys[HASH_SIZE + 1];
+  // Top-k slots this caller does not back (-1 inputs); excluded from both the
+  // hit and the miss accounting.
+  int32_t& s_total_holes = s_hash_keys[HASH_SIZE + 2];
 
   int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
   // Compacted slot ordering: [hits fwd->  ...  <-evictables bwd]
@@ -443,6 +456,7 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void load_cache_to_device_buffer_ker
   if (tid == 0) {
     s_total_hits = 0;
     s_newest_hit = 0;
+    s_total_holes = 0;
   }
   for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
     s_hash_keys[i] = HASH_EMPTY;
@@ -457,9 +471,22 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void load_cache_to_device_buffer_ker
   const int32_t newest_token = seq_len - 1;
 
   // Insert top-k tokens into shared-memory hash table.
+  int hole_count = 0;
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
-    if (token_idx == newest_token) {
+    // A hole is a top-k slot this rank must not attend: padding past a short
+    // top-k (-1), or -- under attention DCP -- a position owned by another
+    // rank. The owner rule is unconditional, even when the position happens to
+    // be resident in this rank's hot buffer: every position must be attended by
+    // exactly one rank or the cross-rank LSE combine double-counts it.
+    const bool is_hole = token_idx < 0 || (dcp_size > 1 && token_idx % dcp_size != dcp_rank);
+    if (is_hole) {
+      // Emit an invalid location and keep it out of the hash table, which would
+      // otherwise mistake -1 for HASH_EMPTY.
+      s_top_k_tokens[i] = TOKEN_HOLE;
+      req_top_k_device_locs[i] = -1;
+      hole_count++;
+    } else if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
@@ -478,6 +505,8 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void load_cache_to_device_buffer_ker
       s_top_k_tokens[i] = token_idx;
     }
   }
+  // Total holes in this request's top-k, needed for the miss count below.
+  atomicAdd(&s_total_holes, hole_count);
   __syncthreads();
 
   constexpr int ITERATIONS_PER_WARP_BUFFER = (NUM_BUFFER_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
@@ -586,9 +615,12 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void load_cache_to_device_buffer_ker
     int local_miss_offset = 0;
 
     if (has_valid_token) {
-      is_miss = s_top_k_tokens[my_token_idx] != TOKEN_HIT;
+      const int32_t slot_token = s_top_k_tokens[my_token_idx];
+      // A hole is already resolved (loc = -1) and has no host row to copy
+      // from, so it must not consume an evictable slot.
+      is_miss = slot_token != TOKEN_HIT && slot_token != TOKEN_HOLE;
       if (is_miss) {
-        my_token = s_top_k_tokens[my_token_idx];
+        my_token = slot_token;
       }
     }
 
@@ -624,14 +656,14 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void load_cache_to_device_buffer_ker
       // Record the plan where the eviction is decided so it cannot disagree
       // with the copy phase; locs are layer-independent (lockstep buffers).
       if constexpr (RecordMissPlan) {
-        miss_src_out[bid * plan_stride + miss_offset] = req_host_cache_locs[my_token];
+        miss_src_out[bid * plan_stride + miss_offset] = req_host_cache_locs[my_token / dcp_size];
         miss_dst_out[bid * plan_stride + miss_offset] = req_device_buffer_locs[evict_slot];
       }
     }
   }
   __syncthreads();
 
-  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit - s_total_holes;
   if constexpr (RecordMissPlan) {
     if (tid == 0) {
       miss_count_out[bid] = total_misses;
@@ -679,7 +711,10 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void load_cache_to_device_buffer_ker
       const int32_t miss_token = s_top_k_tokens[miss_idx];
       const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
 
-      const int64_t src_loc = req_host_cache_locs[miss_token];
+      // Host rows are dense in this rank's own position space: global position
+      // p lives at row p / dcp_size (p % dcp_size == dcp_rank is guaranteed,
+      // non-owned positions were marked as holes and never become misses).
+      const int64_t src_loc = req_host_cache_locs[miss_token / dcp_size];
       const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
 
       copy_miss_item<IsMLA, IsDsv4Layout>(
@@ -712,10 +747,16 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView num_real_reqs,
     int64_t page_size,
     int64_t item_size_bytes,
+    int64_t dcp_size,
+    int64_t dcp_rank,
     tvm::ffi::TensorView miss_src_out,
     tvm::ffi::TensorView miss_dst_out,
     tvm::ffi::TensorView miss_count_out) {
   using namespace host;
+
+  if (dcp_size < 1 || dcp_rank < 0 || dcp_rank >= dcp_size) {
+    throw std::runtime_error("load_cache_to_device_buffer: invalid attention DCP pair");
+  }
 
   const int64_t bs = top_k_tokens.shape()[0];
   const int64_t host_stride = host_cache_locs.shape()[1];
@@ -764,6 +805,8 @@ void load_cache_to_device_buffer(
         top_k_device_locs_stride,
         page_size,
         item_size_bytes,
+        static_cast<int32_t>(dcp_size),
+        static_cast<int32_t>(dcp_rank),
         miss_src_ptr,
         miss_dst_ptr,
         miss_count_ptr,

@@ -27,6 +27,12 @@ else:
 
 
 class HiSparseDSATokenToKVPool(DSATokenToKVPool):
+    # Every write path here first maps the logical loc through
+    # full_to_hisparse_device_index_mapping, so by the time it reaches
+    # MLATokenToKVPool the loc is already this rank's local physical hot-buffer
+    # row. Re-applying the DCP owner rule there would drop most writes.
+    dcp_widened_write_locs: bool = False
+
     def __init__(
         self,
         size: int,

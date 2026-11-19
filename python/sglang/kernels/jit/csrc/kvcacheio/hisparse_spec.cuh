@@ -381,6 +381,20 @@ __device__ __forceinline__ int64_t shfl_i64(int64_t value, int src_lane) {
 #endif
 }
 
+// Attention DCP deals compressed sequence positions across the dcp group, but
+// the sparse indexer replicates Index-K on every rank, so top_k_tokens arrives
+// identical and in *global* position space. Exactly one rank may attend each
+// position or the cross-rank LSE combine double-counts it, so non-owned
+// occurrences are turned into holes (token -1 -> device loc -1) here, at the
+// only leaf that touches host rows; owned positions index their host row at
+// pos / dcp_size. dcp_size == 1 is the identity.
+__device__ __forceinline__ int32_t dcp_owned_token(int32_t token, int32_t dcp_size, int32_t dcp_rank) {
+  if (dcp_size > 1 && (token < 0 || token % dcp_size != dcp_rank)) {
+    return -1;
+  }
+  return token;
+}
+
 __device__ __forceinline__ int first_set_lane(BallotMask mask) {
 #ifdef USE_ROCM
   // uint64_t (unsigned long) converts equally to HIP's __ffsll overloads
@@ -469,7 +483,9 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t plan_stride,
-    int64_t page_size) {
+    int64_t page_size,
+    int32_t dcp_size,
+    int32_t dcp_rank) {
   const int bid = blockIdx.x;
   const int tid = threadIdx.x;
   constexpr int64_t total_occurrences = NUM_STEPS * NUM_TOP_K;
@@ -532,12 +548,14 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
   bool needs_cache_lookup = false;
   if (occ < total_occurrences) {
     const int64_t step = occ / NUM_TOP_K;
-    token = req_top_k_tokens[occ];
+    token = dcp_owned_token(req_top_k_tokens[occ], dcp_size, dcp_rank);
     const int64_t seq_len = static_cast<int64_t>(seq_lens[bid * NUM_STEPS + step]);
     if (token >= 0 && token < seq_len) {
       int32_t direct_loc = -1;
       if constexpr (PassThroughDeviceLocs) {
-        direct_loc = device_locs[rid * device_locs_stride + token];
+        // device_locs is validated to have host_cache_locs' shape, i.e. it is
+        // indexed in the same (DCP-local) position space as the host table.
+        direct_loc = device_locs[rid * device_locs_stride + token / dcp_size];
         if (direct_loc >= 0) {
           loc = direct_loc;
         } else {
@@ -575,7 +593,7 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     if (cache_slot >= 0) {
       loc = req_device_buffer_locs[cache_slot];
     } else {
-      src_loc = req_host_cache_locs[token];
+      src_loc = req_host_cache_locs[token / dcp_size];
       if (src_loc >= 0) {
         int32_t hash_pos = hash_slot(token, WORKSPACE_CAPACITY);
         const auto epoch_bits = static_cast<unsigned long long>(static_cast<uint32_t>(scratch_epoch)) << 32;
@@ -685,7 +703,9 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     int64_t top_k_device_locs_stride,
     int64_t buffer_stride_0,
     int64_t host_stride,
-    int64_t plan_stride) {
+    int64_t plan_stride,
+    int32_t dcp_size,
+    int32_t dcp_rank) {
   device::PDLWaitPrimary<USE_PDL>();
   const int bid = blockIdx.x;
   if (bid >= num_real_reqs[0]) return;
@@ -765,7 +785,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     constexpr int64_t admission_step = NUM_STEPS > APPROX_ADMISSION_STEPS ? NUM_STEPS - APPROX_ADMISSION_STEPS : 0;
     const int64_t admission_start = admission_step * NUM_TOP_K;
     for (int64_t occ = admission_start + threadIdx.x; occ < total_occurrences; occ += blockDim.x) {
-      const int32_t token = req_top_k_tokens[occ];
+      const int32_t token = dcp_owned_token(req_top_k_tokens[occ], dcp_size, dcp_rank);
       if (token < 0) {
         continue;
       }
@@ -902,7 +922,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
           } else {
             const auto epoch_bits = static_cast<unsigned long long>(static_cast<uint32_t>(scratch_epoch)) << 32;
             atomicExch(req_scratch_indices + hash_pos, epoch_bits | static_cast<uint32_t>(old_loc));
-            copy_src_loc = req_host_cache_locs[token];
+            copy_src_loc = req_host_cache_locs[token / dcp_size];
             copy_dst_loc = old_loc;
             copy_owner = copy_src_loc >= 0;
           }
@@ -947,7 +967,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
       if (req_top_k_device_locs[occ] >= 0) {
         continue;
       }
-      const int32_t token = req_top_k_tokens[occ];
+      const int32_t token = dcp_owned_token(req_top_k_tokens[occ], dcp_size, dcp_rank);
       if (token < 0 || token >= seq_lens[bid * NUM_STEPS + occ / NUM_TOP_K]) {
         continue;
       }
@@ -1016,6 +1036,8 @@ void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView scratch_state,
     tvm::ffi::TensorView num_real_reqs,
     int64_t page_size,
+    int64_t dcp_size,
+    int64_t dcp_rank,
     tvm::ffi::TensorView miss_src_out,
     tvm::ffi::TensorView miss_dst_out,
     tvm::ffi::TensorView miss_count_out,
@@ -1029,6 +1051,10 @@ void load_cache_to_device_buffer_spec(
   static_assert(
       WORKSPACE_CAPACITY >= NUM_STEPS * NUM_TOP_K && WORKSPACE_CAPACITY <= 16384,
       "HiSparse speculative metadata must cover every occurrence and fit the compact hash index.");
+
+  RuntimeCheck(
+      dcp_size >= 1 && dcp_rank >= 0 && dcp_rank < dcp_size,
+      "invalid attention DCP pair for the speculative HiSparse swap.");
 
   const auto* device_locs_ptr = PassThroughDeviceLocs ? static_cast<const int32_t*>(device_locs.data_ptr()) : nullptr;
   const int64_t device_locs_stride = PassThroughDeviceLocs ? device_locs.strides()[0] : 0;
@@ -1063,12 +1089,14 @@ void load_cache_to_device_buffer_spec(
   RuntimeCheck(scratch_state.strides()[0] % 2 == 0, "speculative scratch metadata stride must be 64-bit aligned.");
 
   const int64_t host_stride = host_cache_locs.shape()[1];
+  // Tokens are *global* compressed positions, while host rows cover only this
+  // rank's share, so the packing bound scales by dcp_size.
   RuntimeCheck(
-      host_stride <= PackedRingEntry<HOT_BUFFER_SIZE>::TOKEN_CAPACITY,
+      host_stride * dcp_size <= PackedRingEntry<HOT_BUFFER_SIZE>::TOKEN_CAPACITY,
       "speculative packed ring metadata supports sequence lengths up to ",
       PackedRingEntry<HOT_BUFFER_SIZE>::TOKEN_CAPACITY,
       ", got ",
-      host_stride);
+      host_stride * dcp_size);
   const int64_t buffer_stride_0 = device_buffer_tokens.strides()[0];
   const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
@@ -1156,7 +1184,9 @@ void load_cache_to_device_buffer_spec(
       top_k_tokens_stride,
       top_k_device_locs_stride,
       plan_stride,
-      page_size);
+      page_size,
+      static_cast<int32_t>(dcp_size),
+      static_cast<int32_t>(dcp_rank));
 
   LaunchKernel(dim3(static_cast<uint32_t>(bs)), 512, device)
       .enable_pdl(USE_PDL)(
@@ -1189,7 +1219,9 @@ void load_cache_to_device_buffer_spec(
           top_k_device_locs_stride,
           buffer_stride_0,
           host_stride,
-          plan_stride);
+          plan_stride,
+          static_cast<int32_t>(dcp_size),
+          static_cast<int32_t>(dcp_rank));
 }
 
 }  // namespace sglang

@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module, is_hip
 
 if TYPE_CHECKING:
@@ -311,13 +312,16 @@ class HiSparseSpecSwapManager:
             allocated_len = int(
                 coordinator.req_to_host_pool_allocated_len[req_pool_idx]
             )
-            if req.kv.kv_allocated_len > allocated_len:
+            # Under DCP the host pool holds only this rank's positions, so the
+            # reservation target is the rank-local length, not the global one.
+            target_len = coordinator.local_host_len_int(req.kv.kv_allocated_len)
+            if target_len > allocated_len:
                 coordinator.mem_pool_host.alloc_paged_token_slots(
                     coordinator.req_to_host_pool,
                     coordinator.req_to_host_pool_allocated_len,
                     req_pool_idx,
                     allocated_len,
-                    req.kv.kv_allocated_len - allocated_len,
+                    target_len - allocated_len,
                 )
 
         extra_start = coordinator.device_buffer_size + 1
@@ -428,7 +432,22 @@ class HiSparseSpecSwapManager:
         )
 
         # Rejected padding goes to this request's reserved, not-yet-visible host slots.
-        host_locs = coordinator.req_to_host_pool[req_pool_indices, positions]
+        if coordinator.dcp_size > 1:
+            # Only the owner of a position has a host row for it. Keep the width
+            # fixed (boolean indexing would sync, see above) by redirecting
+            # every non-owned row to the reserved host sink page.
+            owns = positions % coordinator.dcp_size == coordinator.dcp_rank
+            local_positions = torch.where(
+                owns, positions // coordinator.dcp_size, torch.zeros_like(positions)
+            )
+            host_locs = coordinator.req_to_host_pool[
+                req_pool_indices, local_positions
+            ]
+            host_locs = torch.where(
+                owns, host_locs, torch.full_like(host_locs, coordinator._host_sink_loc)
+            )
+        else:
+            host_locs = coordinator.req_to_host_pool[req_pool_indices, positions]
         self._backup_device_locs_to_host(
             host_locs.flatten(), destination_locs.flatten()
         )
@@ -489,6 +508,8 @@ class HiSparseSpecSwapManager:
             seq_lens=compressed_seq_lens,
             state=self.states[layer_id],
             num_real_reqs=coordinator.num_real_reqs,
+            dcp_size=coordinator.dcp_size,
+            dcp_rank=coordinator.dcp_rank,
             **plan,
         )
         return top_k_indices
@@ -577,11 +598,27 @@ class HiSparseCoordinator:
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
 
+        # Attention DCP: HiSparse addresses host rows in *position* space
+        # (req_to_host_pool[req, compressed_pos]), so the owner rule is applied
+        # on compressed positions rather than on logical locs the way the
+        # ordinary topk path does it (transform_index_page_table_*_kernel
+        # filters loaded_kv_indices % dcp == rank). Each rank host-backs only
+        # the positions it owns, densely at p // dcp_size, which is the
+        # position-space twin of filter_dcp_local_kv_indices. See the DCP
+        # section further down for why the device buffer stays replicated.
+        parallel = get_parallel()
+        self.dcp_size = parallel.attn_dcp_size if parallel.dcp_enabled else 1
+        self.dcp_rank = parallel.attn_dcp_rank if parallel.dcp_enabled else 0
+
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
         max_compressed_context_len = (
             max_context_len + self.compress_ratio - 1
         ) // self.compress_ratio
+        # Only this rank's share of the compressed positions is host-backed.
+        max_local_compressed_context_len = (
+            max_compressed_context_len + self.dcp_size - 1
+        ) // self.dcp_size
 
         # to have an extra page for new tokens
         self.padded_buffer_size = (
@@ -597,7 +634,7 @@ class HiSparseCoordinator:
             max_num_req_slots, dtype=torch.int64, device="cpu"
         )
         self.req_to_host_pool = torch.full(
-            (max_num_req_slots, max_compressed_context_len + self.page_size),
+            (max_num_req_slots, max_local_compressed_context_len + self.page_size),
             -1,
             dtype=torch.int64,
             device=device,
@@ -605,6 +642,20 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len = torch.zeros(
             max_num_req_slots, dtype=torch.int64, device="cpu"
         )
+
+        # Under DCP, fixed-width spec paths still have to name a host row for
+        # positions this rank does not own. Reserve one page as a write-only
+        # sink: those rows are never read back, and concurrent writes into it
+        # race harmlessly. Compacting instead would mean boolean indexing on
+        # the hot path, which syncs (see commit_accept_tokens).
+        self._host_sink_loc = -1
+        if self.dcp_size > 1:
+            sink_page = self.mem_pool_host.alloc_page(1)
+            if sink_page is None:
+                raise RuntimeError(
+                    "HiSparse could not reserve a host sink page for DCP."
+                )
+            self._host_sink_loc = int(sink_page[0])
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
@@ -733,6 +784,33 @@ class HiSparseCoordinator:
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
+    # ---------------------------------------------------------------- DCP ----
+    # HiSparse works in compressed *position* space: req_to_host_pool is
+    # indexed by compressed position, the swap-in kernel receives top-k token
+    # positions, and req_device_buffer_* are keyed by position too. Attention
+    # DCP therefore shards positions, not locs: rank r owns the compressed
+    # positions p with p % dcp_size == r, and backs them up densely at host row
+    # p // dcp_size. This is the position-space twin of
+    # filter_dcp_local_kv_indices.
+    #
+    # Only the *host* side shards. The device hot buffer stays replicated and
+    # keyed by global position (it is a bounded window, so replicating it is
+    # cheap and keeps req_device_buffer_tokens / the kernel's hash in one key
+    # space); the owner rule is enforced at the leaf, inside the swap-in
+    # kernel, which is also the only place that reads host rows.
+
+    def local_host_len_int(self, compressed_len: int) -> int:
+        """This rank's share of a request's compressed length.
+
+        Same formula as get_dcp_lens(lens, dcp_size, dcp_rank) in
+        layers/dcp/layout.py, in scalar form for the Python alloc paths.
+        """
+        if self.dcp_size == 1:
+            return compressed_len
+        return compressed_len // self.dcp_size + (
+            self.dcp_rank < compressed_len % self.dcp_size
+        )
+
     def allocate_spec_scratch(self, req_pool_indices: List[int]) -> None:
         for req_pool_idx in req_pool_indices:
             self.spec_swap.allocate_scratch(req_pool_idx)
@@ -777,6 +855,18 @@ class HiSparseCoordinator:
         )
 
         prefill_len = len(device_indices)
+        if self.dcp_size > 1:
+            # Back up only this rank's share of the prefill positions. The
+            # position -> host-row map stays dense (position p lands at row
+            # p // dcp_size), so host_indices[i] pairs with the i-th owned
+            # device row.
+            owned = (
+                torch.arange(prefill_len, device=device_indices.device)
+                % self.dcp_size
+                == self.dcp_rank
+            )
+            device_indices = device_indices[owned]
+            prefill_len = int(device_indices.numel())
         host_indices = self.mem_pool_host.alloc_paged_token_slots(
             self.req_to_host_pool,
             self.req_to_host_pool_allocated_len,
@@ -846,8 +936,21 @@ class HiSparseCoordinator:
     def _preload_to_device_buffer(self, req: Req) -> None:
         """Preload all tokens from host pool into the device buffer."""
         n = self.host_token_len(req.kv.kv_allocated_len)
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
-        device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
+        if self.dcp_size > 1:
+            # Host rows cover only this rank's positions, densely; the device
+            # buffer is still keyed by position, so pair row i with the i-th
+            # owned position rather than with position i.
+            n_local = self.local_host_len_int(n)
+            host_indices = self.req_to_host_pool[req.req_pool_idx, :n_local]
+            owned_positions = torch.arange(
+                self.dcp_rank, n, self.dcp_size, device=self.device
+            )
+            device_locs = self.req_to_device_buffer[
+                req.req_pool_idx, owned_positions
+            ]
+        else:
+            host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
+            device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
 
         for layer_id in range(self.mem_pool_device.layer_num):
             self.mem_pool_host.load_to_device_per_layer(
@@ -1121,8 +1224,15 @@ class HiSparseCoordinator:
             if self._skip_first_backup[req_idx]:
                 self._skip_first_backup[req_idx] = False
                 continue
-            if (int(seq_lens_cpu[i]) - 1) % self.compress_ratio == 0:
-                backup_indices.append(i)
+            if (int(seq_lens_cpu[i]) - 1) % self.compress_ratio != 0:
+                continue
+            if self.dcp_size > 1:
+                # Only the owner of this compressed position backs it up; the
+                # other ranks never hold a host row for it.
+                compressed_pos = (int(seq_lens_cpu[i]) - 1) // self.compress_ratio - 1
+                if compressed_pos % self.dcp_size != self.dcp_rank:
+                    continue
+            backup_indices.append(i)
 
         if not backup_indices:
             return
@@ -1148,6 +1258,9 @@ class HiSparseCoordinator:
         for i in backup_indices:
             req_idx = int(req_pool_indices_cpu[i])
             start_pos = (int(seq_lens_cpu[i]) - 1) // self.compress_ratio - 1
+            # Host rows are dense in this rank's own position space.
+            if self.dcp_size > 1:
+                start_pos = start_pos // self.dcp_size
             host_locs = self.mem_pool_host.alloc_paged_token_slots(
                 self.req_to_host_pool,
                 self.req_to_host_pool_allocated_len,
@@ -1203,6 +1316,11 @@ class HiSparseCoordinator:
         load_to_device_per_layer and indices live in compressed space. Currently
         only used as a kernel oracle in test_hisparse_unit.py (non-dsv4 path).
 
+        Like the kernel, this takes top-k in *global* compressed-position space
+        and applies the DCP owner rule itself: positions with
+        `pos % dcp_size != dcp_rank` resolve to -1, and owned ones read host row
+        `pos // dcp_size`. `seq_lens` is the global compressed length.
+
         Args:
             req_pool_indices: Pool indices for each request.  Shape: (num_reqs,)
             seq_lens: Sequence lengths for each request.  Shape: (num_reqs,)
@@ -1229,23 +1347,32 @@ class HiSparseCoordinator:
             req_idx = int(req_pool_indices[i].item())
             selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
 
-            assert torch.all(
-                selected_tokens >= 0
-            ), f"Req {req_idx}: selected tokens contain negative positions"
-            assert torch.all(selected_tokens < seq_len), (
+            # -1 marks a short top-k; under DCP the positions this rank does
+            # not own are holes too (same rule the swap-in kernel applies).
+            # Leave those output entries at -1 and work on the rest.
+            present = selected_tokens >= 0
+            if self.dcp_size > 1:
+                present &= selected_tokens % self.dcp_size == self.dcp_rank
+            assert torch.all(selected_tokens[present] < seq_len), (
                 f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
                 f"out of range for seq_len={seq_len}"
             )
 
             if seq_len <= self.device_buffer_size:
-                device_indices = self.req_to_device_buffer[req_idx, selected_tokens]
+                device_indices = torch.where(
+                    present,
+                    self.req_to_device_buffer[
+                        req_idx, selected_tokens.clamp(min=0)
+                    ],
+                    torch.full_like(selected_tokens, -1),
+                )
             else:
-                device_indices = torch.empty(
-                    top_n, dtype=torch.int64, device=self.device
+                device_indices = torch.full(
+                    (top_n,), -1, dtype=torch.int64, device=self.device
                 )
 
-                is_latest_token = selected_tokens == (seq_len - 1)
-                needs_host_load = ~is_latest_token
+                is_latest_token = present & (selected_tokens == (seq_len - 1))
+                needs_host_load = present & ~is_latest_token
 
                 device_indices[is_latest_token] = self.req_to_device_buffer[
                     req_idx, self.device_buffer_size
@@ -1254,7 +1381,9 @@ class HiSparseCoordinator:
                 num_to_load = int(needs_host_load.sum().item())
                 if num_to_load > 0:
                     tokens_to_load = selected_tokens[needs_host_load]
-                    host_locs = self.req_to_host_pool[req_idx, tokens_to_load]
+                    host_locs = self.req_to_host_pool[
+                        req_idx, tokens_to_load // self.dcp_size
+                    ]
 
                     invalid_mask = host_locs < 0
                     if torch.any(invalid_mask):
@@ -1444,6 +1573,8 @@ class HiSparseCoordinator:
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
             skip_io=self.skip_io,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
             **plan,
         )
         return top_k_indices
@@ -1475,6 +1606,13 @@ class HiSparseCoordinator:
 
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
+
+        Positions stay *global* here, even under DCP. The device hot buffer and
+        req_device_buffer_tokens are keyed by global compressed position, so the
+        owner rule (pos % dcp == rank -> host row pos // dcp, non-owners -> loc
+        -1) is applied at the leaf, inside the swap-in kernel, which is the only
+        place that touches host rows. Narrowing the top-k here instead would
+        desynchronize it from the device buffer's key space.
         """
         if not self.enable_prefetch:
             return self._run_swap_in_kernel(
