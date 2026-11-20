@@ -159,6 +159,24 @@ def mm_runtime_reservation_gb(
     return reserved_mb / 1024
 
 
+def deepep_runtime_reservation_gb(*, a2a_backend: Any) -> float:
+    """DeepEP/RocSHMEM GPU memory allocated only after the KV pool is sized
+    (internode NVL+RDMA buffers + GDA queue pairs, created lazily at the first
+    MoE dispatch); reserve it out of the KV budget so the late allocation
+    cannot OOM on HCU. Set SGLANG_DEEPEP_KV_BUDGET_RESERVE_GB=0 to disable."""
+    is_deepep = getattr(a2a_backend, "is_deepep", None)
+    if not (is_deepep() if callable(is_deepep) else False):
+        return 0.0
+    reserved_gb = envs.SGLANG_DEEPEP_KV_BUDGET_RESERVE_GB.get()
+    if reserved_gb > 0:
+        logger.info(
+            "Reserving %.2f GB of the KV budget for post-sizing DeepEP "
+            "comm buffers (internode NVL/RDMA + GDA queue pairs).",
+            reserved_gb,
+        )
+    return float(reserved_gb)
+
+
 # base ratio of mamba pool size to max_running_requests. Under
 # SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK the decode-time skip frees one resident slot
 # per running request, so the base drops by 1 (overlap 5->4, lazy 4->3). no_buffer
@@ -2002,7 +2020,17 @@ class KVCacheConfigurator:
             is_multimodal=self.model_config.is_multimodal,
             mm_feature_transport=get_mm().mm_feature_transport,
         )
-        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        deepep_reservation_gb = deepep_runtime_reservation_gb(
+            a2a_backend=get_moe_a2a_backend(),
+        )
+        rest_memory = (
+            available_gpu_memory
+            - slack_gb
+            - mm_reservation_gb
+            - deepep_reservation_gb
+        )
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 

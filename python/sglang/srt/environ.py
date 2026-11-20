@@ -959,6 +959,11 @@ class Envs:
     SGLANG_LIGHTOP_TOPK = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
     SGLANG_HCU_MEGA_MOE_RUNTIME = EnvStr("deep_gemm")
+    # Reserve GB of the KV-cache budget for DeepEP/RocSHMEM comm buffers
+    # (NVL+RDMA buffer, GDA queue pairs), which sglang allocates lazily at the
+    # first dispatch, AFTER the KV pool is sized. Without this reservation the
+    # pool can consume that memory and the late hipMalloc fails with OOM.
+    SGLANG_DEEPEP_KV_BUDGET_RESERVE_GB = EnvInt(4)
 
     # ===================================================================
     # MUSA
