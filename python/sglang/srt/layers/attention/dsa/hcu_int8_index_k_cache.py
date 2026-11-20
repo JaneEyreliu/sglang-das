@@ -160,34 +160,51 @@ def _validate_quantize_inputs(
     return key, out_cache_loc
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "key_stride_0",
+        "k_page_stride_0",
+        "scale_page_stride_0",
+        "NUM_PHYSICAL_PAGES",
+    ]
+)
 def _quantize_and_store_index_k_int8_kernel(
     key_ptr,
     k_cache_ptr,
     scale_cache_ptr,
     loc_ptr,
-    key_stride_0: tl.constexpr,
-    k_page_stride_0: tl.constexpr,
-    scale_page_stride_0: tl.constexpr,
+    key_stride_0,
+    k_page_stride_0,
+    scale_page_stride_0,
     epsilon: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    NUM_PHYSICAL_PAGES,
 ):
+    # Keep strides and the physical-page bound runtime (mirrors the dequant
+    # kernel) so layer-split scratch/owned buffers with differing page counts
+    # reuse one specialization. Padding tokens carry loc=-1; without the guard
+    # below token_offset=-1%PAGE_SIZE=-1 produces a negative-offset OOB store
+    # that faults the HCU queue (VMFault) under DSA cache layer split.
+    key_stride_0 = tl.cast(key_stride_0, tl.int64)
+    k_page_stride_0 = tl.cast(k_page_stride_0, tl.int64)
+    scale_page_stride_0 = tl.cast(scale_page_stride_0, tl.int64)
+    num_physical_pages = tl.cast(NUM_PHYSICAL_PAGES, tl.int64)
     token_idx = tl.program_id(0)
     offsets = tl.arange(0, HEAD_DIM)
-    key = tl.load(key_ptr + token_idx * key_stride_0 + offsets).to(tl.float32)
-    scale = tl.maximum(tl.max(tl.abs(key)), epsilon) / 127.0
-    scaled = key / scale
-    rounded = tl.where(scaled >= 0.0, tl.floor(scaled + 0.5), tl.ceil(scaled - 0.5))
-    quantized = tl.clamp(rounded, -127.0, 127.0).to(tl.int8)
-
     loc = tl.load(loc_ptr + token_idx).to(tl.int64)
     page = loc // PAGE_SIZE
     token_offset = loc % PAGE_SIZE
-    k_ptr = k_cache_ptr + page * k_page_stride_0 + token_offset * HEAD_DIM + offsets
-    scale_ptr = scale_cache_ptr + page * scale_page_stride_0 + token_offset
-    tl.store(k_ptr, quantized)
-    tl.store(scale_ptr, scale)
+    if (loc >= 0) & (page < num_physical_pages):
+        key = tl.load(key_ptr + token_idx * key_stride_0 + offsets).to(tl.float32)
+        scale = tl.maximum(tl.max(tl.abs(key)), epsilon) / 127.0
+        scaled = key / scale
+        rounded = tl.where(scaled >= 0.0, tl.floor(scaled + 0.5), tl.ceil(scaled - 0.5))
+        quantized = tl.clamp(rounded, -127.0, 127.0).to(tl.int8)
+        k_ptr = k_cache_ptr + page * k_page_stride_0 + token_offset * HEAD_DIM + offsets
+        scale_ptr = scale_cache_ptr + page * scale_page_stride_0 + token_offset
+        tl.store(k_ptr, quantized)
+        tl.store(scale_ptr, scale)
 
 
 def _quantize_and_store_index_k_int8_reference(
@@ -211,8 +228,9 @@ def _quantize_and_store_index_k_int8_reference(
     ).to(torch.int8)
     pages = (out_cache_loc // INDEX_K_PAGE_SIZE).long()
     offsets = (out_cache_loc % INDEX_K_PAGE_SIZE).long()
-    int8_k[pages, offsets] = quantized
-    fp32_scales[pages, offsets] = scales
+    valid = (out_cache_loc >= 0) & (pages < int8_k.shape[0])
+    int8_k[pages[valid], offsets[valid]] = quantized[valid]
+    fp32_scales[pages[valid], offsets[valid]] = scales[valid]
 
 
 def quantize_and_store_index_k_int8(
@@ -246,6 +264,7 @@ def quantize_and_store_index_k_int8(
             epsilon=epsilon,
             HEAD_DIM=INDEX_K_HEAD_DIM,
             PAGE_SIZE=INDEX_K_PAGE_SIZE,
+            NUM_PHYSICAL_PAGES=packed_cache.shape[0],
             num_warps=4,
         )
         return
