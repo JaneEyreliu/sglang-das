@@ -1250,6 +1250,34 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 paged_block_tables = block_tables
                 paged_schedule_metadata = schedule_metadata
             active_q = paged_q.unsqueeze(1)
+            # Stale-metadata guard for speculative decode phases.  In
+            # TARGET_VERIFY / DRAFT_EXTEND_V2 every q row is one speculative
+            # token, so seqlens/block_table must carry exactly ``q_offset``
+            # rows (the lightop kernel derives batch_size from all three and
+            # asserts they agree -- paged_mqa_logits.hip:287).  If the batch
+            # was widened after metadata planning (e.g. DP-attention relay
+            # padding a locally-planned DRAFT_EXTEND_V2 batch), the metadata
+            # tensors keep the local row count while q carries the global
+            # one; fail here with an actionable message instead of the
+            # kernel's cryptic assertion.  Re-planning the final batch in
+            # ``eager_runner._execute_extend`` is the real fix; this guard is
+            # the backstop.
+            if (
+                forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            ) and (
+                paged_seqlens.shape[0] != q_offset
+                or paged_block_tables.shape[0] != q_offset
+            ):
+                raise RuntimeError(
+                    "DSA paged-MQA metadata is stale for the (padded) "
+                    f"{forward_mode} batch: q rows={q_offset}, "
+                    f"seqlens rows={paged_seqlens.shape[0]}, "
+                    f"block_table rows={paged_block_tables.shape[0]}, "
+                    f"batch_size={forward_batch.batch_size}. Attention "
+                    "metadata was planned on a smaller batch (pre-DP-pad) "
+                    "and must be re-initialized from the final batch."
+                )
             use_mask_topk = envs.SGLANG_DSA_HCU_LIGHTOP_MASK_TOPK.get()
             sparse_route = select_lightop_sparse_mqa_route(
                 enabled=(
