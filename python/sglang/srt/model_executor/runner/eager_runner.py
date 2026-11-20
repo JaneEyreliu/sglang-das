@@ -280,10 +280,23 @@ class EagerRunner(BaseRunner):
         # no static metadata load to fill the gap.  Re-plan target verify from
         # the final batch every time; eager metadata is intentionally derived
         # directly from the live ``spec_info`` tensors.
+        #
+        # DRAFT_EXTEND_V2 has the same staleness hazard, via
+        # ``prepare_for_draft_extend``: it plans DSA metadata on the local
+        # (pre-DP-pad) batch and marks it ready without replan-equivalence.
+        # With DP attention the batch is widened to the global DP batch
+        # afterwards, so the marked metadata keeps local-batch row counts
+        # (dsa_seqlens_expanded / real_page_table sized bs_local *
+        # num_draft_tokens) while q carries bs_global * num_draft_tokens
+        # rows.  The lightop paged-MQA kernel then trips
+        # ``batch_size == batch_size_ and batch_size == batch_size__``
+        # (paged_mqa_logits.hip:287).  Re-plan draft-extend-v2 from the final
+        # batch too, mirroring target verify.
         if (
             forward_batch.needs_forward_metadata_init()
             or cp_v2_active
             or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             if (
                 model_runner.ps.attn_dcp_size > 1

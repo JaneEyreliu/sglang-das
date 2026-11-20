@@ -1585,6 +1585,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     bs = self.batch_size = (
                         num_tokens // self.spec_info.num_tokens_per_req
                     )
+                    # DSA builds draft-extend cu_seqlens_q from extend_num_tokens;
+                    # leaving the local count desyncs it from the widened page table.
+                    if self.forward_mode.is_draft_extend_v2():
+                        self.extend_num_tokens = num_tokens
                 else:
                     bs = self.batch_size = num_tokens
         elif self.forward_mode.is_extend():
@@ -1687,9 +1691,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.extend_prefix_lens, bs
             )
         if self.extend_seq_lens_cpu is not None:
-            self.extend_seq_lens_cpu.extend(
-                [dummy_extend_len] * (bs - len(self.extend_seq_lens_cpu))
-            )
+            # Out-of-place: DSAMetadata.dsa_extend_seq_lens_list holds a bare
+            # reference to this list; mutating it in place desyncs q_offset
+            # from the frozen pre-pad DSA metadata tensors (issue #27091).
+            self.extend_seq_lens_cpu = self.extend_seq_lens_cpu + [
+                dummy_extend_len
+            ] * (bs - len(self.extend_seq_lens_cpu))
         if self.extend_prefix_lens_cpu is not None:
             self.extend_prefix_lens_cpu.extend(
                 [0] * (bs - len(self.extend_prefix_lens_cpu))
