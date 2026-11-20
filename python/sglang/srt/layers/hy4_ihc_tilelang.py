@@ -176,3 +176,63 @@ def try_tilelang_ihc_head(residual, head_fn, head_scale, head_base, rms_eps, hc_
         )
     _log_success("ihc_head")
     return result
+
+
+def warmup_ihc_tilelang(hidden_size: int, device) -> bool:
+    """Force JIT compilation of the iHC TileLang kernels with dummy tensors.
+
+    Intended to run BEFORE the KV-cache pool is sized (see
+    ModelRunner.alloc_memory_pool). On a cold node the lazy first-call
+    compile otherwise happens on the first real request, after the pool is
+    sized: the compile spike then competes with other lazy allocations
+    (e.g. DeepEP) for the runtime slack. Warming here makes the pool budget
+    see the post-JIT steady state and removes the first-request JIT cost.
+
+    Returns True if the kernels were exercised. Failures are the caller's
+    to tolerate (non-fatal by design: the eager fallback still works).
+    """
+    import time
+
+    if not envs.SGLANG_OPT_HY4_IHC_TILELANG.get():
+        return False
+    if not envs.SGLANG_HY4_IHC_JIT_WARMUP.get():
+        return False
+    if hidden_size <= 0 or hidden_size % 64:
+        logger.warning("HY4 iHC JIT warmup skipped: hidden_size=%s", hidden_size)
+        return False
+    if torch.version.hip is None:
+        return False
+
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    if dev.type != "cuda":
+        return False
+
+    t = 8  # token rows; kernels are shape-generic in T, D drives codegen
+    d = hidden_size
+    tic = time.perf_counter()
+    with torch.device(dev), torch.no_grad():
+        x = torch.zeros((t, 4, d), dtype=torch.bfloat16, device=dev)
+        fn8 = torch.zeros((8, 4 * d), dtype=torch.float32, device=dev)
+        scale2 = torch.ones(2, dtype=torch.float32, device=dev)
+        base8 = torch.ones(8, dtype=torch.float32, device=dev)
+        try_tilelang_ihc_pre(x, fn8, scale2, base8, 1e-6, 1e-6, 1.0)
+
+        post = torch.zeros((t, 4), dtype=torch.float32, device=dev)
+        x2 = torch.zeros((t, d), dtype=torch.bfloat16, device=dev)
+        try_tilelang_ihc_post(x2, x, post)
+
+        fn4 = torch.zeros((4, 4 * d), dtype=torch.float32, device=dev)
+        scale1 = torch.ones(1, dtype=torch.float32, device=dev)
+        base4 = torch.ones(4, dtype=torch.float32, device=dev)
+        try_tilelang_ihc_head(x, fn4, scale1, base4, 1e-6, 1e-6)
+
+        torch.cuda.synchronize()
+        # Drop compile-time transients before any pool-size measurement.
+        torch.cuda.empty_cache()
+    logger.info(
+        "HY4 iHC TileLang JIT warmup done (hidden_size=%d, device=%s) in %.2fs",
+        d,
+        dev,
+        time.perf_counter() - tic,
+    )
+    return True

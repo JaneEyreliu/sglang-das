@@ -1382,6 +1382,12 @@ class Envs:
     # across layers. Every captured forward records its own GPU producer.
     SGLANG_HY4_DCP_FUSED_KV_WRITE_LOCS = EnvBool(False)
     SGLANG_OPT_HY4_IHC_TILELANG = EnvBool(False)
+    # Warm the iHC TileLang JIT kernels with dummy tensors BEFORE the KV pool
+    # is sized. On a cold node (empty TileLang cache) the lazy first-call
+    # compile otherwise lands on the first real request, after the pool has
+    # been sized: the compile spike competes with DeepEP lazy-init for the
+    # runtime slack and the pool budget never sees the JIT residency.
+    SGLANG_HY4_IHC_JIT_WARMUP = EnvBool(True)
 
     # Overlap the HYV4 gated-MLA attention output-gate GEMM (``linear_gate`` /
     # "g_proj") with the Q/KV projection GEMMs on a dedicated side stream.

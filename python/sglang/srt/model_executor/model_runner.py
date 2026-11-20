@@ -832,6 +832,30 @@ class ModelRunner:
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
+        elif self.device == "cuda":
+            # Only the sizing call (no passed config, i.e. the target worker)
+            # needs the warmup: compile the lazy iHC TileLang JIT kernels NOW,
+            # so the KV pool budget below sees post-JIT steady-state free
+            # memory instead of a first-request compile spike on cold nodes.
+            # Non-fatal by design: the eager fallback still works if skipped.
+            try:
+                hf_config = self.model_config.hf_config if self.model_config else None
+                hidden = getattr(hf_config, "hidden_size", None)
+                if hidden:
+                    from sglang.srt.layers.hy4_ihc_tilelang import (
+                        warmup_ihc_tilelang,
+                    )
+
+                    warmup_ihc_tilelang(
+                        hidden_size=hidden,
+                        device=torch.device(f"cuda:{self.gpu_id}"),
+                    )
+            except Exception:
+                logger.warning(
+                    "HY4 iHC TileLang JIT warmup failed (non-fatal, eager "
+                    "fallback remains)",
+                    exc_info=True,
+                )
 
         self.init_kv_cache_configurator()
         result = self.kv_cache_configurator.configure(
