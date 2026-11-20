@@ -1164,10 +1164,9 @@ class HYV4Model(nn.Module):
                 proxy_tensors["topk_indices"] = topk_indices
             return PPProxyTensors(proxy_tensors)
         if forward_batch.forward_mode.is_idle():
-            # Collapse the 3D iHC stream to the 2D model output without running
-            # hc_head / norm on a zero-token batch. Zero tokens means the two
-            # layouts coincide, so no gather is needed either.
-            return hidden_states[:, 0]
+            # Idle skips hc_head / norm. Rows may be padded (T > 0), so the
+            # [:, 0] view is strided; dp_gather asserts a contiguous input.
+            return hidden_states[:, 0].contiguous()
         hidden_states = self.hc_head(hidden_states, self.norm)
         if self.dp_attn_scattered:
             # Back to TP_ATTN_FULL for the logits processor / lm_head.
