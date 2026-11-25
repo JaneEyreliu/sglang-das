@@ -1416,7 +1416,12 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                         "checkpoint_format=hy4_w4a8_v1; do not infer nibble order"
                     )
                 name = normalize_hyv4_weight_name(name)
-                if name.startswith(("model.mtp_layers.", "model.mtp.layers.")):
+                # HY4-Channel-INT4-w4a8 ships the multi-layer "DFly" drafter under
+                # model.dfly_layers.*; only the DFly speculative worker consumes it,
+                # so the target model skips it exactly like the old MTP namespace.
+                if name.startswith(
+                    ("model.mtp_layers.", "model.mtp.layers.", "model.dfly_layers.")
+                ):
                     continue
                 loaded_weight = permute_hyv4_indexer_weight(
                     name, loaded_weight, self.config

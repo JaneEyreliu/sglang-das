@@ -486,6 +486,13 @@ class DeepseekV2WeightLoaderMixin:
                                         "fused_qkv_a_proj_with_mqa",
                                     )
                                 )
+                                if param_name not in params_dict:
+                                    # Draft-only namespaces (e.g. model.dfly_layers.*)
+                                    # may exist in the checkpoint without a matching
+                                    # module in this process; drop the pair safely.
+                                    cached_a_proj.pop(q_a_proj_name, None)
+                                    cached_a_proj.pop(kv_a_proj_name, None)
+                                    continue
                                 param = params_dict[param_name]
 
                                 weight_loader = getattr(
